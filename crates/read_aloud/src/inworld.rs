@@ -126,7 +126,7 @@ fn collect_audio_content(body: &str) -> Result<Vec<f32>> {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .context("Inworld returned audioContent that is not valid base64")?;
-        samples.extend(decode_linear16(&decoded));
+        samples.extend(decode_linear16(strip_wav_header(&decoded)));
         found_any = true;
     }
 
@@ -134,6 +134,47 @@ fn collect_audio_content(body: &str) -> Result<Vec<f32>> {
         return Err(anyhow!("Inworld response contained no audio content"));
     }
     Ok(samples)
+}
+
+/// Each streamed Inworld chunk is a self-contained WAV file: a RIFF/WAVE
+/// container header followed by a `data` subchunk holding the raw LINEAR16
+/// samples. Decoding the header bytes as PCM produces an audible click at
+/// every chunk boundary, so locate and strip the header first. The `data`
+/// subchunk is not always at a fixed offset (extra subchunks, e.g. `fact`,
+/// can precede it), so this walks the chunk list using each subchunk's
+/// declared length rather than assuming a fixed 44-byte header. Chunks that
+/// are not RIFF/WAVE (i.e. already-raw PCM) are returned unchanged.
+fn strip_wav_header(bytes: &[u8]) -> &[u8] {
+    const RIFF: &[u8] = b"RIFF";
+    const WAVE: &[u8] = b"WAVE";
+    const DATA: &[u8] = b"data";
+    const RIFF_HEADER_LEN: usize = 12;
+    const SUBCHUNK_HEADER_LEN: usize = 8;
+
+    if bytes.len() < RIFF_HEADER_LEN || &bytes[0..4] != RIFF || &bytes[8..12] != WAVE {
+        return bytes;
+    }
+
+    let mut offset = RIFF_HEADER_LEN;
+    while offset + SUBCHUNK_HEADER_LEN <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let Ok(size_bytes) = <[u8; 4]>::try_from(&bytes[offset + 4..offset + 8]) else {
+            break;
+        };
+        let size = u32::from_le_bytes(size_bytes) as usize;
+        let data_start = offset + SUBCHUNK_HEADER_LEN;
+
+        if id == DATA {
+            let data_end = data_start.saturating_add(size).min(bytes.len());
+            return &bytes[data_start..data_end];
+        }
+
+        // Subchunks are padded to an even number of bytes.
+        let padded_size = size + (size % 2);
+        offset = data_start.saturating_add(padded_size);
+    }
+
+    bytes
 }
 
 /// LINEAR16 is little-endian signed 16-bit PCM. A trailing odd byte is not a
@@ -203,5 +244,83 @@ mod tests {
     #[test]
     fn errors_when_the_response_contains_no_audio() {
         assert!(collect_audio_content("{}\n").is_err());
+    }
+
+    /// Builds a minimal 44-byte canonical WAV header (RIFF + fmt + data)
+    /// around the given LINEAR16 sample bytes.
+    fn wrap_in_wav_header(sample_bytes: &[u8]) -> Vec<u8> {
+        let mut wav = Vec::new();
+        let data_len = sample_bytes.len() as u32;
+        let riff_len = 36 + data_len;
+
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_len.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 16]); // fmt payload contents are irrelevant here.
+
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(sample_bytes);
+
+        wav
+    }
+
+    #[test]
+    fn strips_a_standard_wav_header_before_decoding() {
+        // i16 little-endian: 0, 32767, -32768
+        let sample_bytes = [0x00, 0x00, 0xff, 0x7f, 0x00, 0x80];
+        let wav = wrap_in_wav_header(&sample_bytes);
+
+        let stripped = strip_wav_header(&wav);
+        assert_eq!(stripped, sample_bytes);
+
+        let samples = decode_linear16(stripped);
+        assert_eq!(samples.len(), 3);
+        assert!((samples[0] - 0.0).abs() < 1e-6);
+        assert!((samples[1] - 1.0).abs() < 1e-4);
+        assert!((samples[2] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn strips_a_wav_header_with_an_extra_subchunk_before_data() {
+        let sample_bytes = [0x00, 0x00, 0x01, 0x00];
+        let data_len = sample_bytes.len() as u32;
+
+        // An extra "fact" subchunk (as some encoders emit) sits between
+        // "fmt " and "data"; the header walker must skip over it using its
+        // declared length rather than assuming "data" starts at byte 36.
+        let extra_chunk_payload = [0xAA, 0xBB, 0xCC, 0xDD];
+        let extra_chunk_len = extra_chunk_payload.len() as u32;
+
+        let riff_len = 4 + (8 + 16) + (8 + extra_chunk_len) + (8 + data_len);
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_len.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 16]);
+
+        wav.extend_from_slice(b"fact");
+        wav.extend_from_slice(&extra_chunk_len.to_le_bytes());
+        wav.extend_from_slice(&extra_chunk_payload);
+
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&sample_bytes);
+
+        let stripped = strip_wav_header(&wav);
+        assert_eq!(stripped, sample_bytes);
+    }
+
+    #[test]
+    fn leaves_a_headerless_chunk_unchanged() {
+        let sample_bytes = [0x00, 0x00, 0x01, 0x00];
+        assert_eq!(strip_wav_header(&sample_bytes), sample_bytes);
     }
 }

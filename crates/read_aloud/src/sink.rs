@@ -43,7 +43,17 @@ impl AudioSink for RodioSink {
     }
 
     fn clear(&self) {
-        self.0.clear();
+        // `Player::clear()` sets a counter of sounds to drop, then blocks the
+        // calling thread in `sleep_until_end()` until the last appended
+        // source finishes. On the GPUI main thread that is a permanent
+        // freeze whenever nothing is ever going to finish naturally (e.g. we
+        // just want to abandon the queue on seek). `skip_one()` bumps the
+        // same drop counter without waiting, so draining the queue one
+        // `skip_one()` per queued sound achieves the same result
+        // non-blockingly; the sounds are discarded on the queue's next poll.
+        for _ in 0..self.0.len() {
+            self.0.skip_one();
+        }
         // `clear` leaves the player stopped; playback must be re-armed or the
         // next `append` is silent.
         self.0.play();
@@ -58,7 +68,16 @@ impl AudioSink for RodioSink {
     }
 
     fn stop(&self) {
-        self.0.stop();
+        // `Player::stop()` sets a `stopped` flag; a later `append()` then
+        // blocks (waiting for the flush its own doc comment describes)
+        // until the flag is cleared, which only happens on `append()`'s own
+        // call to `sleep_until_end()`. That is the same main-thread freeze
+        // hazard as `clear()`, so drain the queue with `skip_one()` (see
+        // `clear()` above) instead of setting the flag.
+        for _ in 0..self.0.len() {
+            self.0.skip_one();
+        }
+        self.0.pause();
     }
 
     fn pause(&self) {
