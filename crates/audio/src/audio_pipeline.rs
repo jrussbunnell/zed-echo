@@ -87,6 +87,22 @@ impl Audio {
         });
     }
 
+    /// Connects an independent playback queue to the shared output mixer.
+    ///
+    /// Callers that need to play arbitrary samples use this instead of
+    /// `play_sound`, which only handles the bundled `Sound` assets. Returns
+    /// `None` when no output device could be opened.
+    pub fn connect_player(cx: &mut App) -> Option<rodio::Player> {
+        let output_audio_device = AudioSettings::get_global(cx).output_audio_device.clone();
+        cx.update_default_global(|this: &mut Self, _cx| {
+            let output_mixer = this
+                .ensure_output_exists(output_audio_device)
+                .context("Could not get output mixer")
+                .log_err()?;
+            Some(rodio::Player::connect_new(output_mixer))
+        })
+    }
+
     pub fn end_call(cx: &mut App) {
         cx.update_default_global(|this: &mut Self, _cx| {
             this.output.take();
