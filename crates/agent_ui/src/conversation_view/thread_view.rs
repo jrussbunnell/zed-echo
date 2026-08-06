@@ -648,6 +648,10 @@ pub struct ThreadView {
     /// Text-to-speech for assistant prose. `None` until the API key resolves,
     /// and forever when read aloud is disabled, keyless, or has no audio device.
     read_aloud: Option<Entity<read_aloud::ReadAloud>>,
+    /// The message last handed to `read_aloud`. `ReadAloud` does not expose
+    /// what it is holding, so this is what lets `Toggle` tell "restart the
+    /// loaded message" from "load the newest one".
+    read_aloud_enqueued: Option<Entity<Markdown>>,
 }
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
@@ -1058,6 +1062,7 @@ impl ThreadView {
             thread_search_bar: None,
             thread_search_visible: false,
             read_aloud: None,
+            read_aloud_enqueued: None,
         };
 
         this.init_read_aloud(cx);
@@ -1109,9 +1114,19 @@ impl ThreadView {
 
         self._subscriptions.push(cx.subscribe(
             &self.thread,
-            |this, _thread, event: &AcpThreadEvent, cx| match event {
-                AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
-                    this.enqueue_read_aloud(false, cx);
+            |this, thread, event: &AcpThreadEvent, cx| match event {
+                AcpThreadEvent::NewEntry => this.enqueue_read_aloud(false, cx),
+                AcpThreadEvent::EntryUpdated(entry_ix) => {
+                    // Tool calls and terminals fire this continuously while
+                    // they stream; re-segmenting the whole message for each
+                    // one would be quadratic foreground work for no change.
+                    let updated_assistant_message = matches!(
+                        thread.read(cx).entries().get(*entry_ix),
+                        Some(AgentThreadEntry::AssistantMessage(_))
+                    );
+                    if updated_assistant_message {
+                        this.enqueue_read_aloud(false, cx);
+                    }
                 }
                 AcpThreadEvent::Stopped(_) => {
                     // The message is complete: let the segmenter speak the
@@ -1192,6 +1207,22 @@ impl ThreadView {
         }
     }
 
+    /// The prose of the newest assistant message, if it has any. Stops at that
+    /// message rather than searching further back: an older, already-finished
+    /// message is never what the reader should pick up next.
+    fn latest_assistant_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
+        let thread = self.thread.read(cx);
+        let message = thread.entries().iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => Some(message),
+            _ => None,
+        })?;
+        message.chunks.iter().rev().find_map(|chunk| match chunk {
+            AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
+            // Thinking is deliberately never spoken.
+            AssistantMessageChunk::Thought { .. } => None,
+        })
+    }
+
     /// Hands the latest assistant prose to the reader. Safe to call on every
     /// streaming update: `enqueue_markdown` only synthesizes text it has not
     /// already queued.
@@ -1202,23 +1233,42 @@ impl ThreadView {
         if !read_aloud::ReadAloudSettings::get_global(cx).auto_play {
             return;
         }
-
-        let Some(markdown) = self.thread.read(cx).entries().iter().rev().find_map(|entry| {
-            let AgentThreadEntry::AssistantMessage(message) = entry else {
-                return None;
-            };
-            message.chunks.iter().rev().find_map(|chunk| match chunk {
-                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
-                // Thinking is deliberately never spoken.
-                AssistantMessageChunk::Thought { .. } => None,
-            })
-        }) else {
+        let Some(markdown) = self.latest_assistant_markdown(cx) else {
             return;
         };
 
+        self.read_aloud_enqueued = Some(markdown.clone());
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, message_complete, cx);
         });
+    }
+
+    /// Starts, stops, or restarts reading aloud.
+    ///
+    /// `auto_play` gates automatic playback only, so with it off the reader has
+    /// never been handed anything and `ReadAloud::toggle` alone would have
+    /// nothing to start. In that case — and whenever a newer message has
+    /// arrived since the last one handed over — load the newest message, which
+    /// begins playback by itself. Otherwise `toggle` restarts what is loaded,
+    /// which re-enqueueing cannot do: after a stop the player's synthesis
+    /// cursor sits at the end of the utterance list.
+    fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+
+        if !read_aloud.read(cx).is_speaking()
+            && let Some(markdown) = self.latest_assistant_markdown(cx)
+            && self.read_aloud_enqueued.as_ref() != Some(&markdown)
+        {
+            self.read_aloud_enqueued = Some(markdown.clone());
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.enqueue_markdown(&markdown, true, cx);
+            });
+            return;
+        }
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
     }
 
     /// Schedule a throttled save of the thread state (draft prompt, scroll position, etc.).
@@ -6478,8 +6528,12 @@ impl ThreadView {
                                     }
 
                                     Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
+                                        self.render_speakable_markdown(
+                                            md.clone(),
+                                            style.clone(),
+                                            cx,
+                                        )
+                                        .into_any_element(),
                                     )
                                 })
                             }
@@ -11595,8 +11649,8 @@ impl ThreadView {
         cx: &App,
     ) -> MarkdownElement {
         let list_state = self.list_state.clone();
-        let element = render_agent_markdown(
-            markdown.clone(),
+        render_agent_markdown(
+            markdown,
             style,
             &self.workspace,
             &self.code_span_resolver,
@@ -11607,8 +11661,20 @@ impl ThreadView {
         // resumes following on its own once the content returns to the bottom.
         .on_mermaid_zoom(move |_window, _cx| {
             list_state.pause_following_tail();
-        });
+        })
+    }
 
+    /// `render_markdown` plus click-to-seek for reading aloud. Only assistant
+    /// prose gets this: thinking, tool input and output, terminal labels,
+    /// compaction summaries and errors all render through `render_markdown`
+    /// too, and none of them is ever spoken, so clicking them must not seek.
+    fn render_speakable_markdown(
+        &self,
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        cx: &App,
+    ) -> MarkdownElement {
+        let element = self.render_markdown(markdown.clone(), style, cx);
         let Some(read_aloud) = self.read_aloud.clone() else {
             return element;
         };
@@ -12318,9 +12384,7 @@ impl Render for ThreadView {
                 }
             }))
             .on_action(cx.listener(|this, _: &read_aloud::Toggle, _window, cx| {
-                if let Some(read_aloud) = this.read_aloud.clone() {
-                    read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
-                }
+                this.toggle_read_aloud(cx);
             }))
             .on_action(cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
                 if let Some(read_aloud) = this.read_aloud.clone() {
