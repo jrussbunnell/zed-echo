@@ -184,10 +184,16 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+audio.workspace = true
+base64.workspace = true
+futures.workspace = true
 gpui.workspace = true
+http_client.workspace = true
 log.workspace = true
 markdown.workspace = true
+rodio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 settings.workspace = true
 util.workspace = true
 
@@ -874,8 +880,7 @@ git commit -m "read_aloud: Add the TTS provider seam"
 
 **Files:**
 - Modify: `crates/audio/src/audio_pipeline.rs`
-- Modify: `crates/read_aloud/src/sink.rs` (stubbed in Task 1). Task 1 already declared `mod sink;`; do not re-declare it.
-- Modify: `crates/read_aloud/Cargo.toml` (add `audio` and `rodio`)
+- Modify: `crates/read_aloud/src/sink.rs` (stubbed in Task 1). Task 1 already declared `mod sink;` and added the `audio` and `rodio` dependencies; do not touch `read_aloud.rs` or `Cargo.toml`.
 
 **Interfaces:**
 - Consumes: `provider::Pcm` from Task 3.
@@ -996,16 +1001,7 @@ In `crates/audio/src/audio_pipeline.rs`, inside `impl Audio`, add immediately af
 
 Confirm `use anyhow::Context;` and `use util::ResultExt;` are already imported in that file — both are, at the existing `play_sound` call sites.
 
-- [ ] **Step 4: Add the dependencies**
-
-In `crates/read_aloud/Cargo.toml`, add to `[dependencies]`:
-
-```toml
-audio.workspace = true
-rodio.workspace = true
-```
-
-- [ ] **Step 5: Implement the sink seam**
+- [ ] **Step 4: Implement the sink seam**
 
 Prepend to `crates/read_aloud/src/sink.rs`:
 
@@ -1184,22 +1180,22 @@ impl AudioSink for FakeSink {
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud sink`
 
 Expected: PASS, all five tests.
 
-- [ ] **Step 7: Verify the audio crate still builds**
+- [ ] **Step 6: Verify the audio crate still builds**
 
 Run: `~/.cargo/bin/cargo build -p audio && ./script/clippy -p audio -p read_aloud`
 
 Expected: SUCCESS, no warnings.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/audio/src/audio_pipeline.rs crates/read_aloud/src/sink.rs crates/read_aloud/Cargo.toml
+git add crates/audio/src/audio_pipeline.rs crates/read_aloud/src/sink.rs
 git commit -m "read_aloud: Add an arbitrary-PCM audio seam"
 ```
 
@@ -1762,8 +1758,7 @@ git commit -m "markdown: Add a speaking highlight channel"
 The key is never read from `settings.json`. Resolution order: `INWORLD_API_KEY` environment variable, then the GPUI keychain credential store.
 
 **Files:**
-- Modify: `crates/read_aloud/src/inworld.rs` (stubbed in Task 1). Task 1 already declared `mod inworld;`; do not re-declare it.
-- Modify: `crates/read_aloud/Cargo.toml`
+- Modify: `crates/read_aloud/src/inworld.rs` (stubbed in Task 1) — **this is the only file this task touches**. Task 1 already declared `mod inworld;` and added the `base64`, `futures`, `http_client`, and `serde_json` dependencies.
 
 **Interfaces:**
 - Consumes: `provider::{Pcm, TtsProvider}` from Task 3.
@@ -1779,18 +1774,7 @@ The key is never read from `settings.json`. Resolution order: `INWORLD_API_KEY` 
   ```
   Task 8 depends on `InworldTts::new` and `resolve_api_key`.
 
-- [ ] **Step 1: Add the dependencies**
-
-In `crates/read_aloud/Cargo.toml`, add to `[dependencies]`:
-
-```toml
-base64.workspace = true
-futures.workspace = true
-http_client.workspace = true
-serde_json.workspace = true
-```
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 1: Write the failing tests**
 
 Create `crates/read_aloud/src/inworld.rs`:
 
@@ -1839,13 +1823,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud inworld`
 
 Expected: FAIL to compile — `cannot find function decode_linear16`.
 
-- [ ] **Step 4: Implement the provider**
+- [ ] **Step 3: Implement the provider**
 
 Prepend to `crates/read_aloud/src/inworld.rs`:
 
@@ -2016,22 +2000,22 @@ pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud inworld`
 
 Expected: PASS, all five tests.
 
-- [ ] **Step 6: Run clippy**
+- [ ] **Step 5: Run clippy**
 
 Run: `./script/clippy -p read_aloud`
 
 Expected: no warnings.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/read_aloud/src/inworld.rs crates/read_aloud/Cargo.toml
+git add crates/read_aloud/src/inworld.rs
 git commit -m "read_aloud: Add the Inworld TTS provider"
 ```
 
