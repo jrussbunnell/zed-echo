@@ -5959,6 +5959,7 @@ mod tests {
                 "project_search",
                 "project_symbols",
                 "projects",
+                "read_aloud",
                 "recent_projects",
                 "remote_debug",
                 "repl",

@@ -46,7 +46,7 @@ use ui::{
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, Toast, notifications::NotificationId};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -645,7 +645,14 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    /// Text-to-speech for assistant prose. `None` until the API key resolves,
+    /// and forever when read aloud is disabled, keyless, or has no audio device.
+    read_aloud: Option<Entity<read_aloud::ReadAloud>>,
 }
+
+/// Identifies the "read aloud is disabled" toast so repeat showings replace one
+/// another instead of stacking, even across thread views.
+struct ReadAloudDisabled;
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1050,8 +1057,10 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            read_aloud: None,
         };
 
+        this.init_read_aloud(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
@@ -1082,6 +1091,134 @@ impl ThreadView {
             this.send(window, cx);
         }
         this
+    }
+
+    /// Read aloud is opt-in: when it is off, nothing is subscribed, nothing is
+    /// built, and the panel behaves exactly as it does upstream. The
+    /// `ReadAloud` entity is only constructed once an API key resolves, so an
+    /// install without one never gets a provider that cannot synthesize.
+    fn init_read_aloud(&mut self, cx: &mut Context<Self>) {
+        if !read_aloud::ReadAloudSettings::get_global(cx).enabled {
+            return;
+        }
+        // Subagents get their own `ThreadView`. Only the root thread reads
+        // aloud, so multiple readers never talk over one another.
+        if self.parent_session_id.is_some() {
+            return;
+        }
+
+        self._subscriptions.push(cx.subscribe(
+            &self.thread,
+            |this, _thread, event: &AcpThreadEvent, cx| match event {
+                AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
+                    this.enqueue_read_aloud(false, cx);
+                }
+                AcpThreadEvent::Stopped(_) => {
+                    // The message is complete: let the segmenter speak the
+                    // trailing block, which it withholds while streaming.
+                    this.enqueue_read_aloud(true, cx);
+                }
+                _ => {}
+            },
+        ));
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let http_client = workspace.read(cx).client().http_client();
+
+        cx.spawn(async move |this, cx| {
+            let api_key = cx.update(|cx| read_aloud::resolve_api_key(cx)).await;
+            let api_key = match api_key {
+                Ok(api_key) => api_key,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.notify_read_aloud_disabled(
+                            format!("no Inworld API key ({error:#})"),
+                            cx,
+                        );
+                    })
+                    .log_err();
+                    return;
+                }
+            };
+
+            this.update(cx, |this, cx| {
+                let Some(player) = audio::Audio::connect_player(cx) else {
+                    this.notify_read_aloud_disabled(
+                        "no audio output device available".to_string(),
+                        cx,
+                    );
+                    return;
+                };
+
+                let settings = read_aloud::ReadAloudSettings::get_global(cx);
+                let provider = read_aloud::InworldTts::new(
+                    http_client,
+                    api_key,
+                    settings.voice_id.clone(),
+                    settings.model_id.clone(),
+                );
+                let speaking_rate = settings.speaking_rate;
+
+                this.read_aloud = Some(cx.new(|cx| {
+                    let mut read_aloud = read_aloud::ReadAloud::new(
+                        Arc::new(provider),
+                        Box::new(read_aloud::RodioSink::new(player)),
+                        cx,
+                    );
+                    read_aloud.set_speed(speaking_rate, cx);
+                    read_aloud
+                }));
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn notify_read_aloud_disabled(&self, message: String, cx: &mut Context<Self>) {
+        log::warn!("read_aloud: disabled: {message}");
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<ReadAloudDisabled>(),
+                        format!("Read aloud is disabled: {message}"),
+                    ),
+                    cx,
+                );
+            });
+        }
+    }
+
+    /// Hands the latest assistant prose to the reader. Safe to call on every
+    /// streaming update: `enqueue_markdown` only synthesizes text it has not
+    /// already queued.
+    fn enqueue_read_aloud(&mut self, message_complete: bool, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        if !read_aloud::ReadAloudSettings::get_global(cx).auto_play {
+            return;
+        }
+
+        let Some(markdown) = self.thread.read(cx).entries().iter().rev().find_map(|entry| {
+            let AgentThreadEntry::AssistantMessage(message) = entry else {
+                return None;
+            };
+            message.chunks.iter().rev().find_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
+                // Thinking is deliberately never spoken.
+                AssistantMessageChunk::Thought { .. } => None,
+            })
+        }) else {
+            return;
+        };
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, message_complete, cx);
+        });
     }
 
     /// Schedule a throttled save of the thread state (draft prompt, scroll position, etc.).
@@ -11458,8 +11595,8 @@ impl ThreadView {
         cx: &App,
     ) -> MarkdownElement {
         let list_state = self.list_state.clone();
-        render_agent_markdown(
-            markdown,
+        let element = render_agent_markdown(
+            markdown.clone(),
             style,
             &self.workspace,
             &self.code_span_resolver,
@@ -11470,6 +11607,21 @@ impl ThreadView {
         // resumes following on its own once the content returns to the bottom.
         .on_mermaid_zoom(move |_window, _cx| {
             list_state.pause_following_tail();
+        });
+
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return element;
+        };
+        element.on_source_click(move |source_index, click_count, _window, cx| {
+            // Double and triple clicks are word and line selection; leave them be.
+            if click_count > 1 {
+                return false;
+            }
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.seek_to_source_index(&markdown, source_index, cx);
+            });
+            // Returning false leaves click-drag text selection working as normal.
+            false
         })
     }
 
@@ -12163,6 +12315,16 @@ impl Render for ThreadView {
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &read_aloud::Toggle, _window, cx| {
+                if let Some(read_aloud) = this.read_aloud.clone() {
+                    read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
+                if let Some(read_aloud) = this.read_aloud.clone() {
+                    read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
                 }
             }))
             .on_action(cx.listener(
