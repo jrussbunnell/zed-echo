@@ -362,6 +362,24 @@ mod tests {
     }
 
     #[test]
+    fn passes_absurd_timestamp_values_through_unsanitized() {
+        // A hostile or corrupt response can carry timestamps far beyond what
+        // a `Duration` can hold. Parsing keeps them as plain floats — it is
+        // the aligner's job to reject them — so this pins down that the
+        // parser neither panics on nor silently rewrites such values.
+        let body = concat!(
+            "{\"result\":{\"audioContent\":\"AAA=\",\"timestampInfo\":{\"wordAlignment\":{",
+            "\"words\":[\"huge\"],",
+            "\"wordStartTimeSeconds\":[1e30],",
+            "\"wordEndTimeSeconds\":[1e30]}}}}\n",
+        );
+        let (samples, words) = collect_audio_content(body).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].start_secs, 1e30);
+    }
+
+    #[test]
     fn errors_when_the_response_contains_no_audio() {
         assert!(collect_audio_content("{}\n").is_err());
     }

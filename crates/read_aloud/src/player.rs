@@ -114,14 +114,19 @@ impl Player {
     }
 
     pub fn set_speed(&mut self, speed: f32) {
+        /// Far past any usable speaking rate; only there to bound the math.
+        const MAX_SPEED: f32 = 10.0;
         // Clamped because it scales a `Duration` in the word-position math,
-        // which panics on negative or NaN factors.
+        // which panics on negative, NaN, or overflowing factors — and
+        // `speaking_rate` arrives unvalidated from user settings. The sink
+        // gets the same clamped value so the audible speed and the highlight
+        // clock can never disagree.
         self.speed = if speed.is_finite() {
-            speed.max(0.0)
+            speed.clamp(0.0, MAX_SPEED)
         } else {
             1.0
         };
-        self.sink.set_speed(speed);
+        self.sink.set_speed(self.speed);
     }
 
     pub fn pause(&mut self) {
@@ -277,12 +282,12 @@ fn align_word_timings(utterance: &Utterance, words: &[WordTiming]) -> Vec<TimedW
     // then belong to the previous word, which keeps it lit through pauses.
     let timings: Vec<(Duration, String)> = words
         .iter()
-        .filter(|word| word.start_secs.is_finite() && word.start_secs >= 0.0)
-        .map(|word| {
-            (
-                Duration::from_secs_f32(word.start_secs),
-                normalized(&word.text),
-            )
+        .filter_map(|word| {
+            // Rejects negative, NaN, and overflowing values in one place.
+            // Timestamps come from the network, and a corrupt or hostile
+            // value must drop the word, not panic mid entity-update.
+            let start = Duration::try_from_secs_f32(word.start_secs).ok()?;
+            Some((start, normalized(&word.text)))
         })
         .filter(|(_, normalized)| !normalized.is_empty())
         .collect();
@@ -797,6 +802,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn alignment_drops_timings_with_untrustworthy_start_times() {
+        // Timestamps come off the network. Values `Duration` cannot hold —
+        // overflowing, NaN, negative — must drop the word, not panic while
+        // the synthesized audio is being accepted.
+        assert_eq!(
+            aligned_words(
+                "foo bar",
+                &[
+                    timing("foo", 0.0),
+                    timing("huge", 1e30),
+                    timing("nan", f32::NAN),
+                    timing("negative", -1.0),
+                    timing("bar", 0.2),
+                ],
+            ),
+            vec![Some("foo".to_string()), Some("bar".to_string())]
+        );
+    }
+
     #[gpui::test]
     async fn position_selects_the_current_word(cx: &mut TestAppContext) {
         let (player, provider, sink) = setup(cx);
@@ -899,6 +924,37 @@ mod tests {
         let (player, _provider, sink) = setup(cx);
         player.update(cx, |player, _cx| player.set_speed(1.25));
         assert_eq!(sink.speed(), 1.25);
+    }
+
+    #[gpui::test]
+    async fn word_position_survives_an_absurd_speaking_rate(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        provider.emit_word_timings();
+        player.update(cx, |player, cx| {
+            // `speaking_rate` arrives unvalidated from user settings; a huge
+            // value must clamp, not panic in the per-tick Duration math.
+            player.set_speed(1e30);
+            player.set_utterances(vec![utterance("One two.", 0)], cx);
+        });
+        cx.run_until_parked();
+
+        sink.set_position(Duration::from_millis(50));
+        assert_eq!(
+            player.read_with(cx, |player, _| player.current_word_source_range()),
+            Some(4..8),
+            "the clamped clock lands past every word start, lighting the last word"
+        );
+        assert_eq!(
+            sink.speed(),
+            10.0,
+            "the sink must get the same clamped value the highlight clock uses"
+        );
+
+        player.update(cx, |player, _cx| player.set_speed(f32::NAN));
+        assert_eq!(sink.speed(), 1.0, "non-finite input falls back to 1.0");
+
+        player.update(cx, |player, _cx| player.set_speed(-5.0));
+        assert_eq!(sink.speed(), 0.0, "negative input clamps to a standstill");
     }
 
     #[gpui::test]
