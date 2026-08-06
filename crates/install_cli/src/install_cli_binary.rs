@@ -144,14 +144,9 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx,
             )
         })?;
-        // Zed Echo (Dev channel) declares its own `zedecho://` scheme in
-        // Info.plist, so it never needs to contend for the real Zed's
-        // `zed://` scheme in LaunchServices.
-        let async_app: &AsyncApp = cx.deref();
-        let release_channel = async_app.update(|cx| ReleaseChannel::global(cx));
-        if release_channel != ReleaseChannel::Dev {
-            register_zed_scheme(cx).await.log_err();
-        }
+        // `register_zed_scheme` is itself a no-op on the Dev channel (Zed
+        // Echo), so no additional gating is needed here.
+        register_zed_scheme(cx).await.log_err();
         Ok(())
     })
     .detach_and_prompt_err("Cannot install the Zed CLI", window, cx, |_, _, _| None);
