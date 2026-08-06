@@ -1,7 +1,7 @@
 use crate::provider::TtsProvider;
 use crate::segmenter::Utterance;
 use crate::sink::AudioSink;
-use gpui::{Context, Entity, EventEmitter, Task};
+use gpui::{Context, EventEmitter, Task};
 use std::sync::Arc;
 use util::ResultExt as _;
 
@@ -17,8 +17,6 @@ pub struct Player {
     utterances: Vec<Utterance>,
     /// Index of the next utterance to synthesize.
     next_to_synthesize: usize,
-    /// Index of the utterance at the head of the sink's queue.
-    queue_head: usize,
     last_reported: Option<usize>,
     synthesis: Option<Task<()>>,
 }
@@ -36,7 +34,6 @@ impl Player {
             sink,
             utterances: Vec::new(),
             next_to_synthesize: 0,
-            queue_head: 0,
             last_reported: None,
             synthesis: None,
         }
@@ -56,8 +53,13 @@ impl Player {
         if index >= self.utterances.len() {
             return;
         }
+        // Drop any in-flight synthesis before touching the sink. Otherwise
+        // that task is still holding `index + 1` worth of stale target, and
+        // when it finishes it appends pre-seek audio into the post-seek
+        // queue and pulls `next_to_synthesize` back down, snapping playback
+        // back to before the seek.
+        self.synthesis = None;
         self.sink.clear();
-        self.queue_head = index;
         self.next_to_synthesize = index;
         self.last_reported = None;
         self.pump(cx);
@@ -66,7 +68,6 @@ impl Player {
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.synthesis = None;
         self.sink.stop();
-        self.queue_head = self.utterances.len();
         self.next_to_synthesize = self.utterances.len();
         self.last_reported = None;
         cx.emit(PlayerEvent::Finished);
@@ -89,26 +90,30 @@ impl Player {
         self.sink.is_paused()
     }
 
+    /// Derived, not tracked: `queued() == 0` means playback caught up to
+    /// everything synthesized so far, and how far behind `next_to_synthesize`
+    /// the queue's drained to gives the utterance actually sounding right
+    /// now. Deriving this on every read — instead of caching it — means
+    /// there is no separate field that a caller like `seek_to` could forget
+    /// to update, which is what let the queue and the reported position
+    /// drift apart before.
     pub fn speaking_index(&self) -> Option<usize> {
-        if self.sink.queued() == 0 {
+        let queued = self.sink.queued();
+        if queued == 0 {
             return None;
         }
-        (self.queue_head < self.utterances.len()).then_some(self.queue_head)
+        let head = self.next_to_synthesize.saturating_sub(queued);
+        (head < self.utterances.len()).then_some(head)
     }
 
     pub fn utterances(&self) -> &[Utterance] {
         &self.utterances
     }
 
-    /// Recomputes the speaking index from how far the sink has drained.
-    /// Called on a timer by the owning entity, and directly in tests.
+    /// Recomputes the speaking index from how far the sink has drained, and
+    /// keeps synthesis running ahead of it. Called on a timer by the owning
+    /// entity, and directly in tests.
     pub fn poll_position(&mut self, cx: &mut Context<Self>) {
-        let queued = self.sink.queued();
-        let head = self.next_to_synthesize.saturating_sub(queued);
-        if head != self.queue_head {
-            self.queue_head = head;
-        }
-
         let speaking = self.speaking_index();
         if speaking != self.last_reported {
             self.last_reported = speaking;
@@ -118,6 +123,10 @@ impl Player {
             }
             cx.notify();
         }
+        // The sink only drains as playback proceeds; nothing else prods
+        // synthesis to refill it, so without this a document longer than
+        // `PREFETCH` idles forever once the initial prefetch is consumed.
+        self.pump(cx);
     }
 
     /// Keeps one utterance synthesized ahead of the one playing.
@@ -155,8 +164,8 @@ impl Player {
                         log::warn!("read_aloud: synthesis failed, skipping: {error:#}");
                     }
                 }
+                // `poll_position` re-pumps once the position settles.
                 this.poll_position(cx);
-                this.pump(cx);
             })
             .log_err();
         }));
@@ -168,7 +177,7 @@ mod tests {
     use super::*;
     use crate::provider::FakeTts;
     use crate::sink::FakeSink;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
 
     fn utterance(text: &str, start: usize) -> Utterance {
         Utterance {
@@ -238,6 +247,79 @@ mod tests {
             provider.spoken().last().map(String::as_str),
             Some("C."),
             "seek must synthesize the target utterance"
+        );
+    }
+
+    #[gpui::test]
+    async fn seek_before_synthesis_starts_cancels_the_stale_target(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        player.update(cx, |player, cx| {
+            player.set_utterances(
+                vec![utterance("A.", 0), utterance("B.", 3), utterance("C.", 6)],
+                cx,
+            );
+            // Seek away immediately, before `cx.run_until_parked()` ever lets
+            // the synthesis task spawned by `set_utterances` run. If `seek_to`
+            // does not cancel it, it later appends "A."'s audio into the
+            // post-seek queue and rewinds `next_to_synthesize`, snapping
+            // playback back to before the seek.
+            player.seek_to(2, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(player.read_with(cx, |player, _| player.speaking_index()), Some(2));
+        assert_eq!(
+            sink.queued(),
+            1,
+            "the canceled pre-seek synthesis must not land in the post-seek queue"
+        );
+        assert_eq!(
+            provider.spoken(),
+            vec!["C."],
+            "the canceled synthesis must never even reach the provider"
+        );
+    }
+
+    #[gpui::test]
+    async fn synthesis_keeps_pace_with_a_queue_longer_than_the_prefetch(
+        cx: &mut TestAppContext,
+    ) {
+        let (player, provider, sink) = setup(cx);
+        let texts = ["One.", "Two.", "Three.", "Four.", "Five."];
+        let utterances: Vec<Utterance> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| utterance(text, index * 10))
+            .collect();
+        player.update(cx, |player, cx| {
+            player.set_utterances(utterances, cx);
+        });
+        cx.run_until_parked();
+
+        // Only the prefetch window (2) is synthesized up front; draining the
+        // sink one utterance at a time must keep pulling more synthesis in
+        // behind it, all the way to the end.
+        for _ in 0..texts.len() {
+            assert!(
+                player
+                    .read_with(cx, |player, _| player.speaking_index())
+                    .is_some(),
+                "must not report finished before the last utterance has drained"
+            );
+            sink.finish_one();
+            player.update(cx, |player, cx| player.poll_position(cx));
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            provider.spoken(),
+            texts.to_vec(),
+            "every utterance must eventually be synthesized, not just the initial prefetch"
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            None,
+            "finished only once the last utterance has drained"
         );
     }
 
