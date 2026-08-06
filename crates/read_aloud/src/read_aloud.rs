@@ -188,9 +188,6 @@ impl ReadAloud {
         source_index: usize,
         cx: &mut Context<Self>,
     ) {
-        // Clicking a sentence is a request to hear it, which overrides an
-        // earlier stop.
-        self.stopped_by_user = false;
         if self.speaking.as_ref() != Some(markdown) {
             self.enqueue_markdown(markdown, false, cx);
         }
@@ -206,6 +203,13 @@ impl ReadAloud {
             });
 
         if let Some(index) = target {
+            // Clicking a sentence is a request to hear it, which overrides an
+            // earlier stop. Only a click that lands on something speakable
+            // counts: clicking past the last utterance — a trailing code
+            // block, a table, or the tail the segmenter is still withholding —
+            // does nothing audible, and must not quietly re-arm a message the
+            // user stopped.
+            self.stopped_by_user = false;
             self.player
                 .update(cx, |player, cx| player.seek_to(index, cx));
             self.start_polling(cx);
@@ -584,6 +588,74 @@ mod tests {
         assert!(
             read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
             "toggling back on must still work after a stop that stuck"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_click_that_lands_on_nothing_speakable_does_not_lift_a_user_stop(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let source = "First one. Second one.\n\n```\nlet x = 1;\n```\n";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+
+        // Code blocks are never spoken, so a click inside one falls past the
+        // last utterance and there is nothing to seek to.
+        let dead_click = source.find("let x").expect("test source has a code block");
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.seek_to_source_index(&markdown, dead_click, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "a click with nothing to seek to must not start playback"
+        );
+
+        // The agent keeps writing. The stop must still hold.
+        markdown.update(cx, |markdown, cx| {
+            markdown.append("Third one. Fourth one.\n", cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "a click that did nothing must not have re-armed the stopped message"
+        );
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_stopped,
+            "nothing new may be synthesized while stopped"
+        );
+
+        // A click that does land on a sentence is a real request to hear it.
+        let live_click = source.find("Second one.").expect("test source has a sentence");
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.seek_to_source_index(&markdown, live_click, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "clicking an actual sentence must still start playback"
         );
     }
 
