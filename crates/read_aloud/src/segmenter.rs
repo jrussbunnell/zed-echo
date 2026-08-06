@@ -26,27 +26,69 @@ struct TextRun {
     text: String,
 }
 
-pub fn segment(parsed: &ParsedMarkdown) -> Vec<Utterance> {
+/// `message_complete` is `false` while an assistant response is still
+/// streaming in and `true` once it has finished, so the caller can decide
+/// whether the very last bit of content is allowed to be spoken even though
+/// nothing terminates it. See `flush` for how that decision is made.
+pub fn segment(parsed: &ParsedMarkdown, message_complete: bool) -> Vec<Utterance> {
     let source = parsed.source();
+    let events = parsed.events();
+    // `pulldown_cmark` always closes every tag it opens, even for a
+    // truncated document (an unclosed code fence still gets its `End` and
+    // `RootEnd`), so "the parser closed this block" is not evidence that the
+    // block is finished. What *is* evidence: whether more content was parsed
+    // after it. Streaming only ever appends to the end of the document, so
+    // once something follows a block, that block is pinned and can never
+    // change again. Only the block touching this position — the tail of the
+    // document — might still grow on the next parse.
+    let last_content_end = events
+        .iter()
+        .filter_map(|(range, event)| {
+            matches!(
+                event,
+                MarkdownEvent::Text
+                    | MarkdownEvent::Code
+                    | MarkdownEvent::SubstitutedText(_)
+                    | MarkdownEvent::SubstitutedCode(_)
+            )
+            .then_some(range.end)
+        })
+        .max();
+
     let mut utterances = Vec::new();
     let mut tag_stack: Vec<MarkdownTag> = Vec::new();
     let mut runs: Vec<TextRun> = Vec::new();
 
-    for (range, event) in parsed.events().iter() {
+    for (range, event) in events.iter() {
         match event {
             MarkdownEvent::Start(tag) => {
                 if starts_spoken_block(tag) {
-                    flush(&mut runs, &mut utterances, false);
+                    flush(
+                        &mut runs,
+                        &mut utterances,
+                        last_content_end,
+                        message_complete,
+                    );
                 }
                 tag_stack.push(tag.clone());
             }
             MarkdownEvent::End(_) => {
                 let ended = tag_stack.pop();
-                if let Some(tag) = ended.as_ref().filter(|tag| starts_spoken_block(tag)) {
-                    flush(&mut runs, &mut utterances, speaks_whole_block(tag));
+                if ended.as_ref().is_some_and(|tag| starts_spoken_block(tag)) {
+                    flush(
+                        &mut runs,
+                        &mut utterances,
+                        last_content_end,
+                        message_complete,
+                    );
                 }
             }
-            MarkdownEvent::RootEnd(_) => flush(&mut runs, &mut utterances, false),
+            MarkdownEvent::RootEnd(_) => flush(
+                &mut runs,
+                &mut utterances,
+                last_content_end,
+                message_complete,
+            ),
             MarkdownEvent::Text | MarkdownEvent::Code => {
                 if !is_muted(&tag_stack) {
                     if let Some(text) = source.get(range.clone()) {
@@ -77,8 +119,6 @@ pub fn segment(parsed: &ParsedMarkdown) -> Vec<Utterance> {
         }
     }
 
-    // Anything still buffered belongs to a root block the parser has not closed
-    // yet. Dropping it is what keeps a half-typed fence from being spoken.
     utterances
 }
 
@@ -88,16 +128,6 @@ fn starts_spoken_block(tag: &MarkdownTag) -> bool {
         tag,
         MarkdownTag::Paragraph | MarkdownTag::Heading { .. } | MarkdownTag::Item
     )
-}
-
-/// Headings and list items are single, bounded constructs: once the parser
-/// closes them there is nothing left to stream in, so their buffered text is
-/// spoken whole even without trailing punctuation (headings routinely have
-/// none). Paragraphs are the multi-sentence body of an in-progress response,
-/// so a trailing fragment with no terminator is still being typed and must
-/// wait for the next parse instead of being spoken early.
-fn speaks_whole_block(tag: &MarkdownTag) -> bool {
-    matches!(tag, MarkdownTag::Heading { .. } | MarkdownTag::Item)
 }
 
 /// True when any enclosing tag makes the text non-prose.
@@ -117,17 +147,31 @@ fn is_muted(tag_stack: &[MarkdownTag]) -> bool {
     })
 }
 
-/// Turns the buffered runs into whole sentences. When `include_trailing_fragment`
-/// is false, a trailing run of text with no sentence terminator is discarded
-/// because it may still be growing; see `speaks_whole_block`.
+/// Turns the buffered runs into whole sentences.
+///
+/// A flush is *final* when either the whole message is done, or this block's
+/// content ends before `last_content_end` — meaning more already-parsed
+/// content exists later in the document, so this block is pinned and will
+/// never be revisited. A final flush speaks every sentence, including a
+/// trailing fragment with no terminator (headings and short list items
+/// routinely have none, and there is nothing left to wait for). A
+/// non-final flush can only happen for the block sitting at the very end of
+/// the document, which might still be mid-sentence on the next parse, so its
+/// unterminated trailing fragment is withheld.
 fn flush(
     runs: &mut Vec<TextRun>,
     utterances: &mut Vec<Utterance>,
-    include_trailing_fragment: bool,
+    last_content_end: Option<usize>,
+    message_complete: bool,
 ) {
     if runs.is_empty() {
         return;
     }
+
+    let is_final = message_complete
+        || runs.last().is_some_and(|run| {
+            last_content_end.is_some_and(|last_content_end| run.source_range.end < last_content_end)
+        });
 
     let mut combined = String::new();
     // Maps each byte index in `combined` back to a source byte index.
@@ -144,7 +188,7 @@ fn flush(
     runs.clear();
 
     let mut sentences = split_sentences(&combined);
-    if include_trailing_fragment {
+    if is_final {
         let consumed_end = sentences.last().map_or(0, |sentence| sentence.end);
         if consumed_end < combined.len() {
             sentences.push(consumed_end..combined.len());
@@ -175,8 +219,9 @@ fn flush(
 
 /// Splits on `.`/`?`/`!` followed by whitespace, guarding abbreviations,
 /// decimals, ordered-list markers, and file extensions. Any trailing fragment
-/// without a terminator is left off the end — callers decide whether that
-/// fragment should still be spoken via `include_trailing_fragment`.
+/// without a terminator is left off the end — `flush` decides whether that
+/// fragment should still be spoken, based on finality rather than on this
+/// function's output alone.
 fn split_sentences(text: &str) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
@@ -252,17 +297,26 @@ mod tests {
     use gpui::{AppContext, TestAppContext};
     use markdown::Markdown;
 
-    fn utterances(source: &str, cx: &mut TestAppContext) -> Vec<Utterance> {
+    fn utterances(source: &str, message_complete: bool, cx: &mut TestAppContext) -> Vec<Utterance> {
         // `Markdown::new_text` runs the link-only parser, which never emits the
         // block structure (RootEnd, Paragraph/Heading/Item, CodeBlock, Table...)
         // the segmenter depends on. Use the full parser instead.
         let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
         cx.run_until_parked();
-        markdown.read_with(cx, |markdown, _| segment(markdown.parsed_markdown()))
+        markdown.read_with(cx, |markdown, _| {
+            segment(markdown.parsed_markdown(), message_complete)
+        })
     }
 
     fn spoken(source: &str, cx: &mut TestAppContext) -> Vec<String> {
-        utterances(source, cx)
+        utterances(source, false, cx)
+            .into_iter()
+            .map(|utterance| utterance.spoken_text)
+            .collect()
+    }
+
+    fn spoken_complete(source: &str, cx: &mut TestAppContext) -> Vec<String> {
+        utterances(source, true, cx)
             .into_iter()
             .map(|utterance| utterance.spoken_text)
             .collect()
@@ -279,7 +333,7 @@ mod tests {
     #[gpui::test]
     fn source_ranges_point_at_original_bytes(cx: &mut TestAppContext) {
         let source = "Alpha. Beta.\n";
-        let utterances = utterances(source, cx);
+        let utterances = utterances(source, false, cx);
         assert_eq!(&source[utterances[0].source_range.clone()], "Alpha.");
         assert_eq!(&source[utterances[1].source_range.clone()], "Beta.");
     }
@@ -373,5 +427,39 @@ mod tests {
     #[gpui::test]
     fn produces_nothing_for_empty_input(cx: &mut TestAppContext) {
         assert_eq!(spoken("", cx), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    fn withholds_a_half_typed_heading(cx: &mut TestAppContext) {
+        // The heading tag closes (pulldown_cmark closes every tag at EOF),
+        // but it is the last content in the document, so it might still grow
+        // into a different heading on the next parse. It must stay silent
+        // until either more content follows it or the message is complete.
+        assert_eq!(spoken("# Half typed head", cx), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    fn withholds_a_half_typed_bullet(cx: &mut TestAppContext) {
+        assert_eq!(spoken("- First bul", cx), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    fn speaks_a_finished_block_without_a_terminator_when_more_content_follows(
+        cx: &mut TestAppContext,
+    ) {
+        // The colon never terminates a sentence, but "Here is the plan:" is
+        // spoken anyway because content after it (the bullet) proves the
+        // parser has moved past it for good — finality, not punctuation,
+        // gates whether an unterminated fragment is spoken.
+        let source = "Here is the plan:\n\n- Do it.\n";
+        assert_eq!(spoken(source, cx), vec!["Here is the plan:", "Do it."]);
+    }
+
+    #[gpui::test]
+    fn speaks_the_trailing_fragment_once_the_message_is_complete(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken_complete("Complete one. Still typing", cx),
+            vec!["Complete one.", "Still typing"]
+        );
     }
 }
