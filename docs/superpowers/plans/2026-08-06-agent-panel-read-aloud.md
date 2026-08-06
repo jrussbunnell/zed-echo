@@ -891,11 +891,14 @@ git commit -m "read_aloud: Add the TTS provider seam"
       fn queued(&self) -> usize;
       fn set_speed(&self, speed: f32);
       fn stop(&self);
+      fn pause(&self);
+      fn resume(&self);
+      fn is_paused(&self) -> bool;
   }
   pub struct RodioSink(rodio::Player);
   pub struct FakeSink { /* test double */ }
   ```
-  Task 5 depends on `AudioSink` and `FakeSink`.
+  Task 5 depends on `AudioSink` and `FakeSink`. Pause holds position (the queue is untouched); stop discards it — the distinction the whole pause feature rests on.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -947,6 +950,18 @@ mod tests {
         let sink = FakeSink::new();
         sink.set_speed(1.5);
         assert_eq!(sink.speed(), 1.5);
+    }
+
+    #[test]
+    fn fake_sink_pause_holds_the_queue_and_resume_releases_it() {
+        let sink = FakeSink::new();
+        sink.append(pcm(4));
+        sink.pause();
+        assert!(sink.is_paused());
+        assert_eq!(sink.queued(), 1, "pause must not discard queued audio");
+        sink.resume();
+        assert!(!sink.is_paused());
+        assert_eq!(sink.queued(), 1);
     }
 }
 ```
@@ -1007,6 +1022,11 @@ pub trait AudioSink: 'static {
     fn queued(&self) -> usize;
     fn set_speed(&self, speed: f32);
     fn stop(&self);
+    /// Holds playback in place. The queue and position are untouched, unlike
+    /// `stop`, which discards both.
+    fn pause(&self);
+    fn resume(&self);
+    fn is_paused(&self) -> bool;
 }
 
 pub struct RodioSink(rodio::Player);
@@ -1052,6 +1072,18 @@ impl AudioSink for RodioSink {
     fn stop(&self) {
         self.0.stop();
     }
+
+    fn pause(&self) {
+        self.0.pause();
+    }
+
+    fn resume(&self) {
+        self.0.play();
+    }
+
+    fn is_paused(&self) -> bool {
+        self.0.is_paused()
+    }
 }
 
 #[derive(Default)]
@@ -1059,6 +1091,7 @@ struct FakeSinkState {
     queue: Vec<Pcm>,
     speed: f32,
     stopped: bool,
+    paused: bool,
 }
 
 #[derive(Clone)]
@@ -1073,6 +1106,7 @@ impl FakeSink {
                 queue: Vec::new(),
                 speed: 1.0,
                 stopped: false,
+                paused: false,
             })),
         }
     }
@@ -1131,6 +1165,22 @@ impl AudioSink for FakeSink {
             state.stopped = true;
         }
     }
+
+    fn pause(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.paused = true;
+        }
+    }
+
+    fn resume(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.paused = false;
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.state.lock().map(|state| state.paused).unwrap_or(false)
+    }
 }
 ```
 
@@ -1138,7 +1188,7 @@ impl AudioSink for FakeSink {
 
 Run: `~/.cargo/bin/cargo test -p read_aloud sink`
 
-Expected: PASS, all four tests.
+Expected: PASS, all five tests.
 
 - [ ] **Step 7: Verify the audio crate still builds**
 
@@ -1175,6 +1225,9 @@ Position is derived, not tracked independently: `current_index = enqueued_count 
       pub fn set_utterances(&mut self, utterances: Vec<Utterance>, cx: &mut Context<Self>);
       pub fn seek_to(&mut self, index: usize, cx: &mut Context<Self>);
       pub fn stop(&mut self, cx: &mut Context<Self>);
+      pub fn pause(&mut self);
+      pub fn resume(&mut self);
+      pub fn is_paused(&self) -> bool;
       pub fn speaking_index(&self) -> Option<usize>;
       pub fn set_speed(&mut self, speed: f32);
   }
@@ -1325,6 +1378,27 @@ mod tests {
         player.update(cx, |player, _cx| player.set_speed(1.25));
         assert_eq!(sink.speed(), 1.25);
     }
+
+    #[gpui::test]
+    async fn pause_holds_position_and_resume_continues(cx: &mut TestAppContext) {
+        let (player, _provider, sink) = setup(cx);
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("One.", 0), utterance("Two.", 5)], cx);
+        });
+        cx.run_until_parked();
+
+        player.update(cx, |player, _cx| player.pause());
+        assert!(sink.is_paused());
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0),
+            "pause must not lose the speaking position"
+        );
+
+        player.update(cx, |player, _cx| player.resume());
+        assert!(!sink.is_paused());
+        assert_eq!(player.read_with(cx, |player, _| player.speaking_index()), Some(0));
+    }
 }
 ```
 
@@ -1418,6 +1492,18 @@ impl Player {
         self.sink.set_speed(speed);
     }
 
+    pub fn pause(&mut self) {
+        self.sink.pause();
+    }
+
+    pub fn resume(&mut self) {
+        self.sink.resume();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.sink.is_paused()
+    }
+
     pub fn speaking_index(&self) -> Option<usize> {
         if self.sink.queued() == 0 {
             return None;
@@ -1500,7 +1586,7 @@ impl Player {
 
 Run: `~/.cargo/bin/cargo test -p read_aloud player`
 
-Expected: PASS, all seven tests.
+Expected: PASS, all eight tests.
 
 If `a_synthesis_failure_does_not_stall_the_queue` fails because `next_to_synthesize` did not advance past the failure, confirm the `max(index + 1)` assignment runs on **both** the `Ok` and `Err` arms — it is deliberately outside the `match`.
 
@@ -1971,10 +2057,11 @@ Chunk mapping mirrors `collect_markdowns()` in `crates/agent_ui/src/conversation
       pub fn enqueue_markdown(&mut self, markdown: &Entity<Markdown>, cx: &mut Context<Self>);
       pub fn seek_to_source_index(&mut self, markdown: &Entity<Markdown>, source_index: usize, cx: &mut Context<Self>);
       pub fn toggle(&mut self, cx: &mut Context<Self>);
+      pub fn toggle_pause(&mut self, cx: &mut Context<Self>);
       pub fn is_speaking(&self) -> bool;
   }
   ```
-  Task 9 depends on all four methods.
+  Task 9 depends on all of these. `toggle` is stop/restart (position discarded); `toggle_pause` is pause/resume (position held).
 
 This entity does **not** subscribe to `AcpThread` itself. `ThreadView` already has that subscription and calls `enqueue_markdown`, which keeps `read_aloud` free of an `acp_thread` dependency and keeps it testable with nothing but a `Markdown` entity.
 
@@ -2098,6 +2185,39 @@ mod tests {
             markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..9),
             "restart begins at the first sentence"
+        );
+    }
+
+    #[gpui::test]
+    async fn toggle_pause_holds_position_and_highlight(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new_text("First one. Second one.\n".into(), cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, cx);
+        });
+        cx.run_until_parked();
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+        assert!(sink.is_paused());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..10),
+            "pausing keeps the highlight in place"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+        assert!(!sink.is_paused());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..10)
         );
     }
 }
@@ -2228,6 +2348,18 @@ impl ReadAloud {
         }
     }
 
+    /// Pause/resume, holding queue position — the counterpart to `toggle`,
+    /// which stops and restarts from the top.
+    pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        self.player.update(cx, |player, _cx| {
+            if player.is_paused() {
+                player.resume();
+            } else {
+                player.pause();
+            }
+        });
+    }
+
     pub fn is_speaking(&self) -> bool {
         self.poll_task.is_some()
     }
@@ -2344,14 +2476,16 @@ gpui::actions!(
     read_aloud,
     [
         /// Starts or stops reading the assistant's response aloud.
-        Toggle
+        Toggle,
+        /// Pauses or resumes reading aloud, keeping the current position.
+        TogglePause
     ]
 );
 ```
 
 `agent_ui` already depends on `read_aloud` from Step 1, so it refers to this as `read_aloud::Toggle`.
 
-Ship it unbound. Do **not** add it to any file under `assets/keymaps/` — the user's keymap is symlinked to the real Zed's, and binding a key would stomp it. `agent_ui` already declares `ToggleNewThreadMenu`, `ToggleOptionsMenu`, and `ToggleProfileSelector`; a bare `Toggle` in the `read_aloud` namespace does not collide with any of them.
+Ship both unbound. Do **not** add them to any file under `assets/keymaps/` — the user's keymap is symlinked to the real Zed's, and binding a key would stomp it. `agent_ui` already declares `ToggleNewThreadMenu`, `ToggleOptionsMenu`, and `ToggleProfileSelector`; the `read_aloud` namespace does not collide with any of them.
 
 - [ ] **Step 3: Hold the entity on `ThreadView`**
 
@@ -2457,6 +2591,41 @@ Add the method to `impl ThreadView`:
 
 Constructing `ReadAloud` only after the key is in hand avoids a provider that exists but cannot synthesize. Add this at the end of `ThreadView::new`, after the struct is constructed and `cx` is a `Context<Self>`:
 
+Both failure paths surface a workspace toast as well as a log line. `Toast::new` takes a `NotificationId`; using `NotificationId::unique::<ReadAloudDisabled>()` means every showing replaces the last — the design's "notify once" for free, even across thread views.
+
+First, near the top of `thread_view.rs`'s imports, add:
+
+```rust
+use workspace::{Toast, notifications::NotificationId};
+```
+
+and a marker type next to `ThreadView`:
+
+```rust
+struct ReadAloudDisabled;
+```
+
+Add a helper to `impl ThreadView`:
+
+```rust
+    fn notify_read_aloud_disabled(&self, message: String, cx: &mut Context<Self>) {
+        log::warn!("read_aloud: disabled: {message}");
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<ReadAloudDisabled>(),
+                        format!("Read aloud is disabled: {message}"),
+                    ),
+                    cx,
+                );
+            });
+        }
+    }
+```
+
+Then the construction task:
+
 ```rust
         if read_aloud::ReadAloudSettings::get_global(cx).enabled {
             let http_client = workspace.read(cx).client().http_client();
@@ -2468,16 +2637,25 @@ Constructing `ReadAloud` only after the key is in hand avoids a provider that ex
                 let api_key = match api_key {
                     Ok(api_key) => api_key,
                     Err(error) => {
-                        // Failure mode: no API key. Inert, reported once, per view.
-                        log::warn!("read_aloud: disabled, no API key available: {error:#}");
+                        // Failure mode: no API key. Inert, notified once.
+                        this.update(cx, |this, cx| {
+                            this.notify_read_aloud_disabled(
+                                format!("no Inworld API key ({error:#})"),
+                                cx,
+                            );
+                        })
+                        .log_err();
                         return;
                     }
                 };
 
                 this.update(cx, |this, cx| {
-                    // Failure mode: no audio device. Inert, reported once.
+                    // Failure mode: no audio device. Inert, notified once.
                     let Some(player) = audio::Audio::connect_player(cx) else {
-                        log::warn!("read_aloud: disabled, no audio output device available");
+                        this.notify_read_aloud_disabled(
+                            "no audio output device available".to_string(),
+                            cx,
+                        );
                         return;
                     };
                     let settings = read_aloud::ReadAloudSettings::get_global(cx);
@@ -2519,7 +2697,7 @@ The call inside the `cx.new` closure above is therefore `read_aloud.set_speed(sp
 
 Note `resolve_api_key` is passed to `cx.update` by name — its signature is `fn(&App) -> Task<Result<String>>`, which matches `AsyncApp::update`'s closure parameter directly.
 
-- [ ] **Step 7: Handle the Toggle action**
+- [ ] **Step 7: Handle the actions**
 
 On `ThreadView`'s root element render, add:
 
@@ -2527,6 +2705,11 @@ On `ThreadView`'s root element render, add:
             .on_action(cx.listener(|this, _: &read_aloud::Toggle, _window, cx| {
                 if let Some(read_aloud) = this.read_aloud.clone() {
                     read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
+                if let Some(read_aloud) = this.read_aloud.clone() {
+                    read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
                 }
             }))
 ```
@@ -2576,7 +2759,8 @@ Verify, in order:
 4. Clicking a later sentence jumps playback there and moves the highlight.
 5. Click-dragging still selects text normally.
 6. Find-in-thread still highlights matches while audio plays.
-7. With `INWORLD_API_KEY` unset, the panel behaves exactly as stock Zed — no hangs, no errors in the UI.
+7. With `INWORLD_API_KEY` unset (and no keychain entry), a single "Read aloud is disabled" toast appears and the panel otherwise behaves as stock Zed — no hangs.
+8. `read aloud: toggle pause` from the command palette pauses in place; running it again resumes from the same sentence.
 
 - [ ] **Step 12: Commit**
 
@@ -2601,12 +2785,10 @@ Measured against the design's failure table:
 
 | Condition | Design says | This plan does | Where |
 |---|---|---|---|
-| No API key | Inert; notify once | Inert; **logged** once per view, not a UI notification | Task 9 Step 6 |
+| No API key | Inert; notify once | Inert; workspace toast + log, deduped via `NotificationId::unique::<ReadAloudDisabled>()` | Task 9 Step 6 |
 | Synthesis error | Log, skip, queue keeps moving | Exactly that | Task 5 `pump`, tested |
 | Rate limited | Back off; fall silent rather than block | 2 retries with 500ms doubling backoff, then drop the utterance | Task 7 Step 4 |
-| No audio device | Disable; notify once | Disabled; **logged** once per view, not a UI notification | Task 9 Step 6 |
-
-**Deliberate simplification, flagged for your call:** "notify once" is implemented as a `log::warn!`, not a `Workspace::show_notification` toast. A toast requires threading a `Workspace` handle into the failure path and a dedup flag to keep it from firing per thread view. Since `enabled` defaults to `false`, anyone who has turned this on knows they turned it on, and the log line is discoverable. Say the word if you want real toasts and it becomes a small addition to Task 9.
+| No audio device | Disable; notify once | Disabled; workspace toast + log, same dedup | Task 9 Step 6 |
 
 ## Known deferrals
 
