@@ -479,6 +479,7 @@ pub struct Markdown {
     context_menu_selected_markdown: Option<SharedString>,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
+    speaking_highlight: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -674,6 +675,7 @@ impl Markdown {
             context_menu_selected_markdown: None,
             search_highlights: Rc::default(),
             active_search_highlight: None,
+            speaking_highlight: None,
         };
         this.parse(cx);
         this
@@ -1100,6 +1102,19 @@ impl Markdown {
 
     pub fn active_search_highlight(&self) -> Option<usize> {
         self.active_search_highlight
+    }
+
+    /// A parallel channel to the search highlight so find-in-thread keeps
+    /// working while audio plays.
+    pub fn set_speaking_highlight(&mut self, range: Option<Range<usize>>, cx: &mut Context<Self>) {
+        if self.speaking_highlight != range {
+            self.speaking_highlight = range;
+            cx.notify();
+        }
+    }
+
+    pub fn speaking_highlight(&self) -> Option<&Range<usize>> {
+        self.speaking_highlight.as_ref()
     }
 
     fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
@@ -2358,6 +2373,9 @@ impl Element for MarkdownElement {
                         self.style.selection_background_color,
                     )
                 }),
+                speaking: markdown.speaking_highlight.clone().map(|range| {
+                    (range, colors.editor_document_highlight_read_background)
+                }),
                 next_search_highlight_ix: 0,
             }
         };
@@ -3457,6 +3475,9 @@ struct MarkdownHighlights {
     search_match_color: Hsla,
     active_search_match_color: Hsla,
     selection: Option<(Range<usize>, Hsla)>,
+    /// The range being read aloud, a channel of its own so find-in-thread keeps
+    /// working while audio plays.
+    speaking: Option<(Range<usize>, Hsla)>,
     /// Index of the first search highlight that may intersect the next line.
     next_search_highlight_ix: usize,
 }
@@ -3469,6 +3490,15 @@ impl MarkdownHighlights {
         source_range: Range<usize>,
     ) -> SmallVec<[(Range<usize>, Hsla); 1]> {
         let mut highlights = SmallVec::new();
+
+        // First, so a search match or the selection drawn over the same text
+        // still reads as itself.
+        if let Some((range, color)) = &self.speaking {
+            let clamped = range.start.max(source_range.start)..range.end.min(source_range.end);
+            if clamped.start < clamped.end {
+                highlights.push((clamped, *color));
+            }
+        }
 
         self.next_search_highlight_ix += self.search_highlights[self.next_search_highlight_ix..]
             .iter()
@@ -4832,6 +4862,28 @@ mod tests {
 
             markdown.set_active_search_highlight(Some(3), cx);
             assert_eq!(markdown.active_search_highlight(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_speaking_highlight_is_independent_of_search(cx: &mut TestAppContext) {
+        let markdown = cx.new(|cx| Markdown::new_text("one two three".into(), cx));
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_search_highlights(vec![0..3], Some(0), cx);
+            markdown.set_speaking_highlight(Some(4..7), cx);
+
+            assert_eq!(markdown.search_highlights(), &[0..3]);
+            assert_eq!(markdown.speaking_highlight(), Some(&(4..7)));
+
+            markdown.clear_search_highlights(cx);
+            assert_eq!(
+                markdown.speaking_highlight(),
+                Some(&(4..7)),
+                "clearing search must not clear the speaking highlight"
+            );
+
+            markdown.set_speaking_highlight(None, cx);
+            assert_eq!(markdown.speaking_highlight(), None);
         });
     }
 
