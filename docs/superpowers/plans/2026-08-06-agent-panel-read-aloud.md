@@ -143,11 +143,25 @@ mod tests {
 }
 ```
 
-Create `crates/read_aloud/src/segmenter.rs` with a single line so the module resolves (Task 2 replaces it wholesale):
+Create one stub file per module so that every later task owns exactly one file and none of them has to touch `read_aloud.rs` again. Each contains a single comment line:
+
+- `crates/read_aloud/src/segmenter.rs` → `// Filled in by Task 2.`
+- `crates/read_aloud/src/provider.rs` → `// Filled in by Task 3.`
+- `crates/read_aloud/src/sink.rs` → `// Filled in by Task 4.`
+- `crates/read_aloud/src/player.rs` → `// Filled in by Task 5.`
+- `crates/read_aloud/src/inworld.rs` → `// Filled in by Task 7.`
+
+And declare all five at the top of `crates/read_aloud/src/read_aloud.rs`, replacing the lone `mod segmenter;`:
 
 ```rust
-// Filled in by Task 2.
+mod inworld;
+mod player;
+mod provider;
+mod segmenter;
+mod sink;
 ```
+
+Declaring the modules up front is what lets Tasks 2, 3, 6, and 7 run concurrently without racing on `read_aloud.rs`. Later tasks add their `pub use` re-exports; none of them re-declare a module.
 
 - [ ] **Step 2: Create the manifest**
 
@@ -255,11 +269,23 @@ In `assets/settings/default.json`, add after the `"audio"` block (which starts a
   },
 ```
 
+- [ ] **Step 5b: Ungate `Markdown::parsed_markdown()`**
+
+In `crates/markdown/src/markdown.rs` at line 1030, delete the `#[cfg(any(test, feature = "test-support"))]` attribute so the accessor is available in production code:
+
+```rust
+    pub fn parsed_markdown(&self) -> &ParsedMarkdown {
+        &self.parsed_markdown
+    }
+```
+
+This lands here, in the foundation task, so that Task 6 is the only task that touches `markdown.rs` and can therefore run concurrently with Task 2.
+
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `~/.cargo/bin/cargo test -p read_aloud`
+Run: `~/.cargo/bin/cargo test -p read_aloud && ~/.cargo/bin/cargo build -p markdown`
 
-Expected: PASS — `defaults_are_inert_but_autoplay_once_enabled`.
+Expected: PASS — `defaults_are_inert_but_autoplay_once_enabled` — and the markdown crate still builds.
 
 If `content.read_aloud` does not resolve, the field in Step 4 was added to the wrong struct. It belongs on `SettingsContent`, not on a `#[serde(flatten)]` sub-struct.
 
@@ -288,9 +314,7 @@ Two rules govern what gets spoken:
 2. **Only closed root blocks.** A sentence is emitted only from a root block the parser has already closed (`MarkdownEvent::RootEnd`). This is what stops a half-typed code fence from being spoken as prose while it streams.
 
 **Files:**
-- Modify: `crates/read_aloud/src/segmenter.rs` (created empty in Task 1)
-- Modify: `crates/markdown/src/markdown.rs:1030` — remove the `#[cfg]` gate on `parsed_markdown()`
-- Modify: `crates/read_aloud/Cargo.toml` — no change needed; `markdown` is already a dependency
+- Modify: `crates/read_aloud/src/segmenter.rs` (stubbed in Task 1) — **this is the only file this task touches**
 
 **Interfaces:**
 - Consumes: `markdown::parser::{MarkdownEvent, MarkdownTag}`, `markdown::ParsedMarkdown`.
@@ -301,17 +325,7 @@ Two rules govern what gets spoken:
   ```
   Task 5 and Task 8 both depend on these exact names.
 
-- [ ] **Step 1: Ungate `parsed_markdown()`**
-
-In `crates/markdown/src/markdown.rs`, at line 1030, delete the `#[cfg(any(test, feature = "test-support"))]` attribute so the accessor is available in production:
-
-```rust
-    pub fn parsed_markdown(&self) -> &ParsedMarkdown {
-        &self.parsed_markdown
-    }
-```
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 1: Write the failing tests**
 
 Replace the contents of `crates/read_aloud/src/segmenter.rs`:
 
@@ -441,13 +455,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud segmenter`
 
 Expected: FAIL to compile — `cannot find function segment in this scope`, `cannot find type Utterance in this scope`.
 
-- [ ] **Step 4: Implement the segmenter**
+- [ ] **Step 3: Implement the segmenter**
 
 Prepend to `crates/read_aloud/src/segmenter.rs`, above the test module:
 
@@ -675,7 +689,7 @@ fn terminates_sentence(text: &str, index: usize) -> bool {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud segmenter`
 
@@ -683,22 +697,16 @@ Expected: PASS, all 13 tests.
 
 If `does_not_split_on_ordered_list_markers` fails, note that `pulldown_cmark` consumes the `1. ` marker as list structure and never emits it as `Text`, so the guard may be redundant — in that case simplify `terminates_sentence` by deleting the ordered-list branch and re-run. Keep the test either way.
 
-- [ ] **Step 6: Run clippy**
+- [ ] **Step 5: Run clippy**
 
 Run: `./script/clippy -p read_aloud`
 
 Expected: no warnings.
 
-- [ ] **Step 7: Verify the markdown crate still builds with the ungated accessor**
-
-Run: `~/.cargo/bin/cargo build -p markdown && ~/.cargo/bin/cargo test -p markdown`
-
-Expected: SUCCESS and PASS.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/read_aloud/src/segmenter.rs crates/markdown/src/markdown.rs
+git add crates/read_aloud/src/segmenter.rs
 git commit -m "read_aloud: Add the prose segmenter"
 ```
 
@@ -707,8 +715,7 @@ git commit -m "read_aloud: Add the prose segmenter"
 ### Task 3: PCM type, provider trait, and a fake
 
 **Files:**
-- Create: `crates/read_aloud/src/provider.rs`
-- Modify: `crates/read_aloud/src/read_aloud.rs` (add `mod provider;`)
+- Modify: `crates/read_aloud/src/provider.rs` (stubbed in Task 1) — **this is the only file this task touches**. Task 1 already declared `mod provider;`; do not re-declare it.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -844,8 +851,6 @@ impl TtsProvider for FakeTts {
 }
 ```
 
-Add `mod provider;` to the top of `crates/read_aloud/src/read_aloud.rs`, above `mod segmenter;`.
-
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud provider`
@@ -855,7 +860,7 @@ Expected: PASS, all three tests.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/read_aloud/src/provider.rs crates/read_aloud/src/read_aloud.rs
+git add crates/read_aloud/src/provider.rs
 git commit -m "read_aloud: Add the TTS provider seam"
 ```
 
@@ -869,8 +874,7 @@ git commit -m "read_aloud: Add the TTS provider seam"
 
 **Files:**
 - Modify: `crates/audio/src/audio_pipeline.rs`
-- Create: `crates/read_aloud/src/sink.rs`
-- Modify: `crates/read_aloud/src/read_aloud.rs` (add `mod sink;`)
+- Modify: `crates/read_aloud/src/sink.rs` (stubbed in Task 1). Task 1 already declared `mod sink;`; do not re-declare it.
 - Modify: `crates/read_aloud/Cargo.toml` (add `audio` and `rodio`)
 
 **Interfaces:**
@@ -1130,8 +1134,6 @@ impl AudioSink for FakeSink {
 }
 ```
 
-Add `mod sink;` to `crates/read_aloud/src/read_aloud.rs`.
-
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud sink`
@@ -1147,7 +1149,7 @@ Expected: SUCCESS, no warnings.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/audio/src/audio_pipeline.rs crates/read_aloud/src/sink.rs crates/read_aloud/src/read_aloud.rs crates/read_aloud/Cargo.toml
+git add crates/audio/src/audio_pipeline.rs crates/read_aloud/src/sink.rs crates/read_aloud/Cargo.toml
 git commit -m "read_aloud: Add an arbitrary-PCM audio seam"
 ```
 
@@ -1160,8 +1162,7 @@ Owns the utterance queue. Synthesizes ahead by one, advances position as the sin
 Position is derived, not tracked independently: `current_index = enqueued_count - sink.queued()`. This is the only reliable signal, because `rodio::Player` reports queue depth but emits no completion callback.
 
 **Files:**
-- Create: `crates/read_aloud/src/player.rs`
-- Modify: `crates/read_aloud/src/read_aloud.rs` (add `mod player;`)
+- Modify: `crates/read_aloud/src/player.rs` (stubbed in Task 1) — **this is the only file this task touches**. Task 1 already declared `mod player;`; do not re-declare it.
 
 **Interfaces:**
 - Consumes: `segmenter::Utterance`, `provider::{Pcm, TtsProvider, FakeTts}`, `sink::{AudioSink, FakeSink}`.
@@ -1512,7 +1513,7 @@ Expected: no warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/read_aloud/src/player.rs crates/read_aloud/src/read_aloud.rs
+git add crates/read_aloud/src/player.rs
 git commit -m "read_aloud: Add the utterance player"
 ```
 
@@ -1675,8 +1676,7 @@ git commit -m "markdown: Add a speaking highlight channel"
 The key is never read from `settings.json`. Resolution order: `INWORLD_API_KEY` environment variable, then the GPUI keychain credential store.
 
 **Files:**
-- Create: `crates/read_aloud/src/inworld.rs`
-- Modify: `crates/read_aloud/src/read_aloud.rs` (add `mod inworld;`)
+- Modify: `crates/read_aloud/src/inworld.rs` (stubbed in Task 1). Task 1 already declared `mod inworld;`; do not re-declare it.
 - Modify: `crates/read_aloud/Cargo.toml`
 
 **Interfaces:**
@@ -1930,8 +1930,6 @@ pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
 }
 ```
 
-Add `mod inworld;` to `crates/read_aloud/src/read_aloud.rs`.
-
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `~/.cargo/bin/cargo test -p read_aloud inworld`
@@ -1947,7 +1945,7 @@ Expected: no warnings.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/read_aloud/src/inworld.rs crates/read_aloud/src/read_aloud.rs crates/read_aloud/Cargo.toml
+git add crates/read_aloud/src/inworld.rs crates/read_aloud/Cargo.toml
 git commit -m "read_aloud: Add the Inworld TTS provider"
 ```
 
@@ -2113,15 +2111,9 @@ Expected: FAIL to compile — `cannot find function for_test`.
 
 - [ ] **Step 3: Implement the entity**
 
-Add to `crates/read_aloud/src/read_aloud.rs`, above the test module:
+Add to `crates/read_aloud/src/read_aloud.rs`, above the test module. The `mod` declarations already exist from Task 1 — add only the re-exports and the entity:
 
 ```rust
-mod inworld;
-mod player;
-mod provider;
-mod segmenter;
-mod sink;
-
 pub use inworld::{INWORLD_CREDENTIALS_URL, InworldTts, resolve_api_key};
 pub use player::{Player, PlayerEvent};
 pub use provider::{Pcm, TtsProvider};
