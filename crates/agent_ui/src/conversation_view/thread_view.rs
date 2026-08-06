@@ -11695,8 +11695,16 @@ impl ThreadView {
             if click_count > 1 {
                 return false;
             }
-            read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.seek_to_source_index(&markdown, source_index, cx);
+            // This handler runs inside the Markdown entity's own update (its
+            // element's mouse listener), and seeking to a not-currently-speaking
+            // message re-enqueues it, which reads that same entity — a
+            // double-lease panic if done synchronously.
+            let read_aloud = read_aloud.clone();
+            let markdown = markdown.clone();
+            cx.defer(move |cx| {
+                read_aloud.update(cx, |read_aloud, cx| {
+                    read_aloud.seek_to_source_index(&markdown, source_index, cx);
+                });
             });
             // Returning false leaves click-drag text selection working as normal.
             false
