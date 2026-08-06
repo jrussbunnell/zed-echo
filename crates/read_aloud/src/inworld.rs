@@ -1,4 +1,4 @@
-use crate::provider::{Pcm, TtsProvider};
+use crate::provider::{Pcm, TtsProvider, WordTiming};
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use futures::AsyncReadExt as _;
@@ -54,6 +54,7 @@ impl TtsProvider for InworldTts {
                     "sampleRateHertz": SAMPLE_RATE,
                 },
                 "deliveryMode": "BALANCED",
+                "timestampType": "WORD",
             });
             let body = serde_json::to_string(&body)?;
 
@@ -72,10 +73,12 @@ impl TtsProvider for InworldTts {
                 response.body_mut().read_to_string(&mut text_body).await?;
 
                 if status.is_success() {
+                    let (samples, words) = collect_audio_content(&text_body)?;
                     return Ok(Pcm {
-                        samples: collect_audio_content(&text_body)?,
+                        samples,
                         sample_rate: SAMPLE_RATE,
                         channels: 1,
+                        words,
                     });
                 }
 
@@ -103,9 +106,12 @@ impl TtsProvider for InworldTts {
 }
 
 /// Walks the streamed JSON-lines body, concatenating every `result.audioContent`
-/// chunk. Malformed lines are skipped rather than failing the whole utterance.
-fn collect_audio_content(body: &str) -> Result<Vec<f32>> {
+/// chunk and every `result.timestampInfo.wordAlignment` entry. Malformed lines
+/// are skipped rather than failing the whole utterance, and missing timestamp
+/// info degrades to an empty word list rather than an error.
+fn collect_audio_content(body: &str) -> Result<(Vec<f32>, Vec<WordTiming>)> {
     let mut samples = Vec::new();
+    let mut words = Vec::new();
     let mut found_any = false;
 
     for line in body.lines() {
@@ -116,9 +122,11 @@ fn collect_audio_content(body: &str) -> Result<Vec<f32>> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let Some(encoded) = value
-            .get("result")
-            .and_then(|result| result.get("audioContent"))
+        let Some(result) = value.get("result") else {
+            continue;
+        };
+        let Some(encoded) = result
+            .get("audioContent")
             .and_then(|content| content.as_str())
         else {
             continue;
@@ -128,12 +136,51 @@ fn collect_audio_content(body: &str) -> Result<Vec<f32>> {
             .context("Inworld returned audioContent that is not valid base64")?;
         samples.extend(decode_linear16(strip_wav_header(&decoded)));
         found_any = true;
+        collect_word_alignment(result, &mut words);
     }
 
     if !found_any {
         return Err(anyhow!("Inworld response contained no audio content"));
     }
-    Ok(samples)
+    Ok((samples, words))
+}
+
+/// Word timestamps arrive as three parallel arrays under
+/// `timestampInfo.wordAlignment`. Verified against the live API: the times of
+/// later chunks continue from where the previous chunk ended (they are
+/// relative to the whole utterance, not restarted per chunk), so entries are
+/// concatenated as-is. The token list includes whitespace-only, punctuation,
+/// and empty tokens; those are kept here and filtered by the aligner, which
+/// treats anything without an alphanumeric character as unspoken.
+fn collect_word_alignment(result: &serde_json::Value, words: &mut Vec<WordTiming>) {
+    let Some(alignment) = result
+        .get("timestampInfo")
+        .and_then(|info| info.get("wordAlignment"))
+    else {
+        return;
+    };
+    let (Some(texts), Some(starts), Some(ends)) = (
+        alignment.get("words").and_then(|value| value.as_array()),
+        alignment
+            .get("wordStartTimeSeconds")
+            .and_then(|value| value.as_array()),
+        alignment
+            .get("wordEndTimeSeconds")
+            .and_then(|value| value.as_array()),
+    ) else {
+        return;
+    };
+    for ((text, start), end) in texts.iter().zip(starts).zip(ends) {
+        let (Some(text), Some(start), Some(end)) = (text.as_str(), start.as_f64(), end.as_f64())
+        else {
+            continue;
+        };
+        words.push(WordTiming {
+            text: text.to_string(),
+            start_secs: start as f32,
+            end_secs: end as f32,
+        });
+    }
 }
 
 /// Each streamed Inworld chunk is a self-contained WAV file: a RIFF/WAVE
@@ -197,9 +244,9 @@ pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
 
     let credentials = cx.read_credentials(INWORLD_CREDENTIALS_URL);
     cx.background_spawn(async move {
-        let (_username, secret) = credentials
-            .await?
-            .context("No Inworld API key found. Set INWORLD_API_KEY or store one in the keychain.")?;
+        let (_username, secret) = credentials.await?.context(
+            "No Inworld API key found. Set INWORLD_API_KEY or store one in the keychain.",
+        )?;
         Ok(String::from_utf8(secret)?.trim().to_string())
     })
 }
@@ -230,20 +277,110 @@ mod tests {
         // "AAA=" is base64 for two zero bytes -> one zero sample.
         let body = "{\"result\":{\"audioContent\":\"AAA=\"}}\n\
                     {\"result\":{\"audioContent\":\"AAA=\"}}\n";
-        let samples = collect_audio_content(body).unwrap();
+        let (samples, words) = collect_audio_content(body).unwrap();
         assert_eq!(samples.len(), 2);
+        assert!(
+            words.is_empty(),
+            "no timestampInfo must degrade to an empty word list"
+        );
     }
 
     #[test]
     fn tolerates_blank_and_malformed_lines() {
         let body = "\n{\"result\":{\"audioContent\":\"AAA=\"}}\nnot json\n{}\n";
-        let samples = collect_audio_content(body).unwrap();
+        let (samples, _) = collect_audio_content(body).unwrap();
         assert_eq!(samples.len(), 1, "one good line still yields its audio");
+    }
+
+    #[test]
+    fn concatenates_word_alignment_across_chunks() {
+        // Shape taken from a live `timestampType: WORD` response (audio
+        // content replaced with a single zero sample): each chunk carries
+        // parallel `words`/`wordStartTimeSeconds`/`wordEndTimeSeconds`
+        // arrays, later chunks continue the earlier chunk's clock, and the
+        // token list includes whitespace and punctuation entries.
+        let body = concat!(
+            "{\"result\":{\"audioContent\":\"AAA=\",\"timestampInfo\":{\"wordAlignment\":{",
+            "\"words\":[\"Hello\"],",
+            "\"wordStartTimeSeconds\":[0],",
+            "\"wordEndTimeSeconds\":[0.31]}}}}\n",
+            "{\"result\":{\"audioContent\":\"AAA=\",\"timestampInfo\":{\"wordAlignment\":{",
+            "\"words\":[\" \",\"world\",\".\"],",
+            "\"wordStartTimeSeconds\":[0.31,0.31,0.73],",
+            "\"wordEndTimeSeconds\":[0.31,0.73,1.0]}}}}\n",
+        );
+        let (samples, words) = collect_audio_content(body).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            words,
+            vec![
+                WordTiming {
+                    text: "Hello".to_string(),
+                    start_secs: 0.0,
+                    end_secs: 0.31,
+                },
+                WordTiming {
+                    text: " ".to_string(),
+                    start_secs: 0.31,
+                    end_secs: 0.31,
+                },
+                WordTiming {
+                    text: "world".to_string(),
+                    start_secs: 0.31,
+                    end_secs: 0.73,
+                },
+                WordTiming {
+                    text: ".".to_string(),
+                    start_secs: 0.73,
+                    end_secs: 1.0,
+                },
+            ],
+            "times must be kept utterance-relative exactly as the API sent them"
+        );
+    }
+
+    #[test]
+    fn tolerates_malformed_word_alignment() {
+        // Mismatched array lengths zip down to the shortest; non-string and
+        // non-numeric entries are skipped without dropping the audio.
+        let body = concat!(
+            "{\"result\":{\"audioContent\":\"AAA=\",\"timestampInfo\":{\"wordAlignment\":{",
+            "\"words\":[\"one\",2,\"three\"],",
+            "\"wordStartTimeSeconds\":[0,0.1],",
+            "\"wordEndTimeSeconds\":[0.1,0.2,0.3]}}}}\n",
+        );
+        let (samples, words) = collect_audio_content(body).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            words,
+            vec![WordTiming {
+                text: "one".to_string(),
+                start_secs: 0.0,
+                end_secs: 0.1,
+            }]
+        );
     }
 
     #[test]
     fn errors_when_the_response_contains_no_audio() {
         assert!(collect_audio_content("{}\n").is_err());
+    }
+
+    #[test]
+    fn word_timings_survive_wav_header_stripping() {
+        // A chunk whose audio is a full WAV container and whose alignment is
+        // present must yield both the samples and the timings.
+        let sample_bytes = [0x00, 0x00, 0xff, 0x7f];
+        let wav = wrap_in_wav_header(&sample_bytes);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let body = format!(
+            "{{\"result\":{{\"audioContent\":\"{encoded}\",\"timestampInfo\":{{\"wordAlignment\":{{\
+             \"words\":[\"hey\"],\"wordStartTimeSeconds\":[0],\"wordEndTimeSeconds\":[0.5]}}}}}}}}\n"
+        );
+        let (samples, words) = collect_audio_content(&body).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "hey");
     }
 
     /// Builds a minimal 44-byte canonical WAV header (RIFF + fmt + data)

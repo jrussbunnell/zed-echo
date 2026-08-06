@@ -12,6 +12,24 @@ pub struct Utterance {
     /// though `spoken_text` has had markup stripped.
     pub source_range: Range<usize>,
     pub spoken_text: String,
+    /// For each byte of `spoken_text`, the source byte it came from. Spoken
+    /// text is derived from the source but not identical (markup stripped,
+    /// substituted text), so word-level highlighting needs this to map a
+    /// range of `spoken_text` back to a highlightable source range.
+    pub(crate) spoken_origins: Vec<usize>,
+}
+
+impl Utterance {
+    /// Maps a byte range of `spoken_text` back to a byte range in the
+    /// original markdown source.
+    pub fn source_range_for_spoken(&self, spoken: Range<usize>) -> Option<Range<usize>> {
+        if spoken.start >= spoken.end {
+            return None;
+        }
+        let &start = self.spoken_origins.get(spoken.start)?;
+        let &last = self.spoken_origins.get(spoken.end - 1)?;
+        Some(start..last + 1)
+    }
 }
 
 /// Abbreviations that end in a period but do not end a sentence.
@@ -210,9 +228,13 @@ fn flush(
         let source_end = origins
             .get(end_index.saturating_sub(1))
             .map_or(source_start, |last| last + 1);
+        let Some(spoken_origins) = origins.get(start_index..end_index) else {
+            continue;
+        };
         utterances.push(Utterance {
             source_range: source_start..source_end,
             spoken_text: text.to_string(),
+            spoken_origins: spoken_origins.to_vec(),
         });
     }
 }
@@ -372,6 +394,64 @@ mod tests {
             spoken(source, cx),
             vec!["Use bold and code and a link here."]
         );
+    }
+
+    #[gpui::test]
+    fn spoken_ranges_map_back_to_source_through_markup(cx: &mut TestAppContext) {
+        let source = "Use **bold** and `code` and [a link](https://example.com) here.\n";
+        let utterances = utterances(source, false, cx);
+        let utterance = &utterances[0];
+        assert_eq!(utterance.spoken_text, "Use bold and code and a link here.");
+
+        for word in ["Use", "bold", "code", "a link", "here."] {
+            let spoken_start = utterance
+                .spoken_text
+                .find(word)
+                .expect("word is in the spoken text");
+            let source_range = utterance
+                .source_range_for_spoken(spoken_start..spoken_start + word.len())
+                .expect("word maps back to the source");
+            assert_eq!(
+                &source[source_range], word,
+                "spoken '{word}' must map to the same text in the source"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn spoken_ranges_map_back_to_source_after_a_muted_block(cx: &mut TestAppContext) {
+        let source = "Before it.\n\n```rust\nlet x = 1;\n```\n\nAfter it.\n";
+        let utterances = utterances(source, false, cx);
+        let utterance = &utterances[1];
+        assert_eq!(utterance.spoken_text, "After it.");
+
+        let spoken_start = utterance.spoken_text.find("After").expect("word exists");
+        let source_range = utterance
+            .source_range_for_spoken(spoken_start..spoken_start + "After".len())
+            .expect("word maps back to the source");
+        assert_eq!(&source[source_range], "After");
+    }
+
+    #[gpui::test]
+    fn spoken_ranges_map_back_to_source_across_a_soft_break(cx: &mut TestAppContext) {
+        let source = "First part\nsecond part.\n";
+        let utterances = utterances(source, false, cx);
+        let utterance = &utterances[0];
+        assert_eq!(utterance.spoken_text, "First part second part.");
+
+        let spoken_start = utterance.spoken_text.find("second").expect("word exists");
+        let source_range = utterance
+            .source_range_for_spoken(spoken_start..spoken_start + "second".len())
+            .expect("word maps back to the source");
+        assert_eq!(&source[source_range], "second");
+    }
+
+    #[gpui::test]
+    fn an_empty_or_out_of_bounds_spoken_range_maps_to_nothing(cx: &mut TestAppContext) {
+        let utterances = utterances("Alpha.\n", false, cx);
+        let utterance = &utterances[0];
+        assert_eq!(utterance.source_range_for_spoken(2..2), None);
+        assert_eq!(utterance.source_range_for_spoken(0..999), None);
     }
 
     #[gpui::test]

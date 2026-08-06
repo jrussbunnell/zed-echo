@@ -1,5 +1,6 @@
 use crate::provider::Pcm;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Playback seam. `RodioSink` is the real one; `FakeSink` keeps the player's
 /// tests free of any dependency on a sound card.
@@ -15,6 +16,12 @@ pub trait AudioSink: 'static {
     fn pause(&self);
     fn resume(&self);
     fn is_paused(&self) -> bool;
+    /// Playback position within the utterance currently sounding — not
+    /// cumulative across the queue: rodio restarts it for each appended
+    /// source and zeroes it on skip. Reported in the sped-up output
+    /// timeline; multiply by the playback speed to get a position on the
+    /// original recording's clock.
+    fn position(&self) -> Duration;
 }
 
 pub struct RodioSink(rodio::Player);
@@ -91,6 +98,12 @@ impl AudioSink for RodioSink {
     fn is_paused(&self) -> bool {
         self.0.is_paused()
     }
+
+    fn position(&self) -> Duration {
+        // Non-blocking: `get_pos` is a mutex read of a value the audio
+        // thread refreshes every 5ms.
+        self.0.get_pos()
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +112,7 @@ struct FakeSinkState {
     speed: f32,
     stopped: bool,
     paused: bool,
+    position: Duration,
 }
 
 #[derive(Clone)]
@@ -114,16 +128,26 @@ impl FakeSink {
                 speed: 1.0,
                 stopped: false,
                 paused: false,
+                position: Duration::ZERO,
             })),
         }
     }
 
-    /// Simulates the head of the queue finishing playback.
+    /// Simulates the head of the queue finishing playback. The position
+    /// restarts at zero for the next source, as rodio's does.
     pub fn finish_one(&self) {
         if let Ok(mut state) = self.state.lock() {
             if !state.queue.is_empty() {
                 state.queue.remove(0);
             }
+            state.position = Duration::ZERO;
+        }
+    }
+
+    /// Simulates playback progressing within the current head of the queue.
+    pub fn set_position(&self, position: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            state.position = position;
         }
     }
 
@@ -132,7 +156,10 @@ impl FakeSink {
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.state.lock().map(|state| state.stopped).unwrap_or(false)
+        self.state
+            .lock()
+            .map(|state| state.stopped)
+            .unwrap_or(false)
     }
 }
 
@@ -153,11 +180,15 @@ impl AudioSink for FakeSink {
     fn clear(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.queue.clear();
+            state.position = Duration::ZERO;
         }
     }
 
     fn queued(&self) -> usize {
-        self.state.lock().map(|state| state.queue.len()).unwrap_or(0)
+        self.state
+            .lock()
+            .map(|state| state.queue.len())
+            .unwrap_or(0)
     }
 
     fn set_speed(&self, speed: f32) {
@@ -170,6 +201,7 @@ impl AudioSink for FakeSink {
         if let Ok(mut state) = self.state.lock() {
             state.queue.clear();
             state.stopped = true;
+            state.position = Duration::ZERO;
         }
     }
 
@@ -188,6 +220,13 @@ impl AudioSink for FakeSink {
     fn is_paused(&self) -> bool {
         self.state.lock().map(|state| state.paused).unwrap_or(false)
     }
+
+    fn position(&self) -> Duration {
+        self.state
+            .lock()
+            .map(|state| state.position)
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +238,7 @@ mod tests {
             samples: vec![0.0; sample_count],
             sample_rate: 22050,
             channels: 1,
+            words: Vec::new(),
         }
     }
 
@@ -228,6 +268,20 @@ mod tests {
         assert_eq!(sink.queued(), 1);
         sink.finish_one();
         assert_eq!(sink.queued(), 0);
+    }
+
+    #[test]
+    fn fake_sink_position_is_settable_and_resets_when_a_source_ends() {
+        let sink = FakeSink::new();
+        sink.append(pcm(4));
+        sink.set_position(Duration::from_millis(250));
+        assert_eq!(sink.position(), Duration::from_millis(250));
+        sink.finish_one();
+        assert_eq!(
+            sink.position(),
+            Duration::ZERO,
+            "the next source starts its own clock, as rodio's does"
+        );
     }
 
     #[test]

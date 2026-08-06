@@ -6,7 +6,7 @@ mod sink;
 
 pub use inworld::{INWORLD_CREDENTIALS_URL, InworldTts, resolve_api_key};
 pub use player::{Player, PlayerEvent};
-pub use provider::{Pcm, TtsProvider};
+pub use provider::{Pcm, TtsProvider, WordTiming};
 pub use segmenter::{Utterance, segment};
 pub use sink::{AudioSink, RodioSink};
 
@@ -22,6 +22,7 @@ pub use sink::FakeSink;
 use gpui::{AppContext as _, Context, Entity, Subscription, Task};
 use markdown::Markdown;
 use settings::{RegisterSetting, Settings};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,9 +70,11 @@ pub fn init(cx: &mut gpui::App) {
     ReadAloudSettings::register(cx);
 }
 
-/// How often the player's queue depth is sampled to advance the highlight.
-/// rodio reports depth but emits no completion callback, so this is polled.
-const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the player's position is sampled to advance the highlights.
+/// rodio reports position but emits no completion callback, so this is
+/// polled — fast enough that the word highlight tracks speech smoothly
+/// (spoken words last a few hundred milliseconds each).
+const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
 pub struct ReadAloud {
     player: Entity<Player>,
@@ -271,10 +274,15 @@ impl ReadAloud {
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let Ok(still_playing) = this.update(cx, |this, cx| {
-                    this.player.update(cx, |player, cx| {
+                    let (still_playing, word_range) = this.player.update(cx, |player, cx| {
                         player.poll_position(cx);
-                        player.speaking_index().is_some()
-                    })
+                        (
+                            player.speaking_index().is_some(),
+                            player.current_word_source_range(),
+                        )
+                    });
+                    this.highlight_word(word_range, cx);
+                    still_playing
                 }) else {
                     return;
                 };
@@ -299,14 +307,33 @@ impl ReadAloud {
                 .map(|utterance| utterance.source_range.clone())
         });
         markdown.update(cx, |markdown, cx| {
+            let sentence_gone = range.is_none();
             markdown.set_speaking_highlight(range, cx);
+            // Playback finishing must not strand a lit word; while a sentence
+            // is still speaking, the word layer is driven by the poll loop.
+            if sentence_gone {
+                markdown.set_speaking_word_highlight(None, cx);
+            }
         });
+    }
+
+    /// Word-level companion to `highlight_utterance`, driven every poll tick
+    /// rather than on utterance changes. The markdown entity only notifies
+    /// when the range actually changes, so ticking this at the poll rate is
+    /// cheap while the same word keeps sounding.
+    fn highlight_word(&mut self, range: Option<Range<usize>>, cx: &mut Context<Self>) {
+        if let Some(markdown) = self.speaking.clone() {
+            markdown.update(cx, |markdown, cx| {
+                markdown.set_speaking_word_highlight(range, cx);
+            });
+        }
     }
 
     fn clear_highlight(&mut self, cx: &mut Context<Self>) {
         if let Some(markdown) = self.speaking.clone() {
             markdown.update(cx, |markdown, cx| {
                 markdown.set_speaking_highlight(None, cx);
+                markdown.set_speaking_word_highlight(None, cx);
             });
         }
     }
@@ -471,6 +498,61 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn word_highlight_tracks_the_playback_position(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        provider.emit_word_timings();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("Alpha beta.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown
+                .speaking_word_highlight()
+                .cloned()),
+            Some(0..5),
+            "at position zero the first word is lit"
+        );
+
+        // FakeTts words are 100ms apart; 150ms is inside the second word.
+        sink.set_position(Duration::from_millis(150));
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown
+                .speaking_word_highlight()
+                .cloned()),
+            Some(6..11),
+            "the pill moves to 'beta.' as playback advances"
+        );
+
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown
+                .speaking_word_highlight()
+                .cloned()),
+            None,
+            "finishing playback must not strand a lit word"
+        );
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            None
+        );
+    }
+
+    #[gpui::test]
     async fn clicking_a_sentence_seeks_to_it(cx: &mut TestAppContext) {
         let provider = FakeTts::new();
         let sink = FakeSink::new();
@@ -535,9 +617,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_user_stop_survives_more_of_the_same_message_streaming_in(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_user_stop_survives_more_of_the_same_message_streaming_in(cx: &mut TestAppContext) {
         let provider = FakeTts::new();
         let sink = FakeSink::new();
         let markdown = cx.new(|cx| Markdown::new("First one.\n".into(), None, None, cx));
@@ -648,7 +728,9 @@ mod tests {
         );
 
         // A click that does land on a sentence is a real request to hear it.
-        let live_click = source.find("Second one.").expect("test source has a sentence");
+        let live_click = source
+            .find("Second one.")
+            .expect("test source has a sentence");
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.seek_to_source_index(&markdown, live_click, cx);
         });

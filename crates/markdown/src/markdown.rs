@@ -39,6 +39,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad, relative,
+    size,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -480,6 +481,7 @@ pub struct Markdown {
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
     speaking_highlight: Option<Range<usize>>,
+    speaking_word_highlight: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -676,6 +678,7 @@ impl Markdown {
             search_highlights: Rc::default(),
             active_search_highlight: None,
             speaking_highlight: None,
+            speaking_word_highlight: None,
         };
         this.parse(cx);
         this
@@ -1115,6 +1118,24 @@ impl Markdown {
 
     pub fn speaking_highlight(&self) -> Option<&Range<usize>> {
         self.speaking_highlight.as_ref()
+    }
+
+    /// The word currently being spoken, drawn as a pill on top of the
+    /// sentence wash. `None` whenever word timings are unavailable; the
+    /// sentence highlight alone then carries the position.
+    pub fn set_speaking_word_highlight(
+        &mut self,
+        range: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.speaking_word_highlight != range {
+            self.speaking_word_highlight = range;
+            cx.notify();
+        }
+    }
+
+    pub fn speaking_word_highlight(&self) -> Option<&Range<usize>> {
+        self.speaking_word_highlight.as_ref()
     }
 
     fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
@@ -2035,6 +2056,43 @@ impl MarkdownElement {
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
         builder.pop_div();
         builder.pop_div();
+    }
+
+    /// Draws the word being spoken as a rounded pill.
+    ///
+    /// Quads of its own rather than a background color in
+    /// [`MarkdownHighlights`], which the sentence wash uses: that channel paints
+    /// square text-run backgrounds, and this needs rounded corners and a little
+    /// air around the word to read as a pill riding on top of the wash.
+    fn paint_speaking_word_highlight(
+        &self,
+        rendered_text: &RenderedText,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(range) = self.markdown.read(cx).speaking_word_highlight.clone() else {
+            return;
+        };
+        // Accent-derived so it clearly outranks the sentence wash in both light
+        // and dark themes; translucent so the glyphs stay legible.
+        let color = cx.theme().colors().text_accent.opacity(0.3);
+        for bounds in rendered_text.bounds_for_source_range(range) {
+            // Inflated so the pill hugs the word with a little air around it
+            // instead of tracing the bare text-line rect. The word can span
+            // layout lines on a wrap, producing one pill per line.
+            let bounds = Bounds {
+                origin: point(bounds.origin.x - px(1.), bounds.origin.y - px(1.5)),
+                size: size(bounds.size.width + px(2.), bounds.size.height + px(3.)),
+            };
+            window.paint_quad(quad(
+                bounds,
+                px(3.),
+                color,
+                Edges::default(),
+                Hsla::transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
     }
 
     fn paint_mouse_listeners(
@@ -3146,6 +3204,10 @@ impl Element for MarkdownElement {
         });
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
+        // The pill goes under the glyphs — the text layout's bounds are already
+        // resolved by prepaint, so painting from them before the element itself
+        // is safe.
+        self.paint_speaking_word_highlight(&rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
     }
 }
@@ -4394,7 +4456,9 @@ struct RenderedFootnoteRef {
 }
 
 impl RenderedText {
-    #[cfg(test)]
+    // Upstream keeps this for tests only, having moved highlighting into layout.
+    // The read-aloud word pill still needs laid-out bounds to paint rounded
+    // quads from, which that channel cannot express.
     fn bounds_for_source_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         let mut all_bounds = Vec::new();
         for line in self.lines.iter() {
@@ -4884,6 +4948,25 @@ mod tests {
 
             markdown.set_speaking_highlight(None, cx);
             assert_eq!(markdown.speaking_highlight(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_speaking_word_highlight_is_independent_of_the_sentence(cx: &mut TestAppContext) {
+        let markdown = cx.new(|cx| Markdown::new_text("one two three".into(), cx));
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_speaking_highlight(Some(0..13), cx);
+            markdown.set_speaking_word_highlight(Some(4..7), cx);
+            assert_eq!(markdown.speaking_highlight(), Some(&(0..13)));
+            assert_eq!(markdown.speaking_word_highlight(), Some(&(4..7)));
+
+            markdown.set_speaking_word_highlight(None, cx);
+            assert_eq!(
+                markdown.speaking_word_highlight(),
+                None,
+                "losing word timings must not disturb the sentence wash"
+            );
+            assert_eq!(markdown.speaking_highlight(), Some(&(0..13)));
         });
     }
 
