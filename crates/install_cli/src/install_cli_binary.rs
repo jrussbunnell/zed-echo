@@ -25,23 +25,30 @@ const CANT_INSTALL_DOCS_URL: &str = "https://zed.dev/docs/macos#cant-install-cli
 /// commonly because the user is not an admin.
 async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
-    let link_path = Path::new("/usr/local/bin/zed");
-    let bin_dir_path = link_path.parent().unwrap();
+    // This fork (Zed Echo) reuses the Dev release channel, so install the
+    // CLI as `zedecho` there instead of clobbering the real Zed's `zed`
+    // symlink.
+    let link_name = match cx.update(|cx| ReleaseChannel::global(cx)) {
+        ReleaseChannel::Dev => "zedecho",
+        _ => "zed",
+    };
+    let bin_dir_path = Path::new("/usr/local/bin");
+    let link_path = bin_dir_path.join(link_name);
 
     // Don't re-create symlink if it points to the same CLI binary.
-    if smol::fs::read_link(link_path).await.ok().as_ref() == Some(&cli_path) {
-        return Ok(Some(link_path.into()));
+    if smol::fs::read_link(&link_path).await.ok().as_ref() == Some(&cli_path) {
+        return Ok(Some(link_path));
     }
 
     // If the symlink is not there or is outdated, first try replacing it
     // without escalating.
-    smol::fs::remove_file(link_path).await.log_err();
-    if smol::fs::unix::symlink(&cli_path, link_path)
+    smol::fs::remove_file(&link_path).await.log_err();
+    if smol::fs::unix::symlink(&cli_path, &link_path)
         .await
         .log_err()
         .is_some()
     {
-        return Ok(Some(link_path.into()));
+        return Ok(Some(link_path));
     }
 
     // The symlink could not be created without escalating, so use osascript
@@ -63,7 +70,7 @@ async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
         .await?;
 
     if output.status.success() {
-        return Ok(Some(link_path.into()));
+        return Ok(Some(link_path));
     }
 
     // osascript reports "User canceled." (error -128) when the administrator
@@ -137,7 +144,14 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx,
             )
         })?;
-        register_zed_scheme(cx).await.log_err();
+        // Zed Echo (Dev channel) declares its own `zedecho://` scheme in
+        // Info.plist, so it never needs to contend for the real Zed's
+        // `zed://` scheme in LaunchServices.
+        let async_app: &AsyncApp = cx.deref();
+        let release_channel = async_app.update(|cx| ReleaseChannel::global(cx));
+        if release_channel != ReleaseChannel::Dev {
+            register_zed_scheme(cx).await.log_err();
+        }
         Ok(())
     })
     .detach_and_prompt_err("Cannot install the Zed CLI", window, cx, |_, _, _| None);
