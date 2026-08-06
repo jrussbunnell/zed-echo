@@ -128,7 +128,8 @@ impl ReadAloud {
         message_complete: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.speaking.as_ref() != Some(markdown) {
+        let switched_entity = self.speaking.as_ref() != Some(markdown);
+        if switched_entity {
             self.clear_highlight(cx);
             self.speaking = Some(markdown.clone());
         }
@@ -136,6 +137,22 @@ impl ReadAloud {
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player.update(cx, |player, cx| {
             player.set_utterances(utterances, cx);
+            if switched_entity {
+                // `set_utterances` alone is not enough on a switch: it only
+                // clamps `next_to_synthesize` down when it exceeds the new
+                // utterance count, so if the new message happens to have at
+                // least as many utterances as the old one had already
+                // reached, `pump` thinks synthesis is caught up and the new
+                // message is never synthesized while the old message's
+                // audio keeps playing from the sink. `seek_to(0, ..)` clears
+                // the sink (dropping the old message's queued audio),
+                // cancels any in-flight synthesis for the old message, and
+                // restarts `next_to_synthesize` from the top of the new one.
+                // A plain `stop` before `set_utterances` does not work
+                // either — `set_utterances` would just clamp the resulting
+                // `next_to_synthesize` right back down to the new length.
+                player.seek_to(0, cx);
+            }
         });
         self.start_polling(cx);
     }
@@ -169,9 +186,11 @@ impl ReadAloud {
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
         if self.is_speaking() {
+            // `stop` emits `Finished`, and this entity's own subscription to
+            // the player already clears the highlight in response — no need
+            // to do it again here.
             self.player.update(cx, |player, cx| player.stop(cx));
             self.poll_task = None;
-            self.clear_highlight(cx);
             // `self.speaking` is deliberately retained so toggling back on has
             // a message to restart.
         } else if self.speaking.is_some() {
@@ -297,6 +316,53 @@ mod tests {
             markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..10),
             "the first sentence should be highlighted"
+        );
+    }
+
+    #[gpui::test]
+    async fn enqueuing_a_different_entity_speaks_it_and_never_highlights_the_old_one(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a =
+            cx.new(|cx| Markdown::new("One. Two. Three. Four. Five.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha. Beta.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+
+        // Switch to a different entity while `markdown_a` is still mid-queue
+        // (the prefetch window only synthesizes 2 of its 5 utterances).
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            provider
+                .spoken()
+                .ends_with(&["Alpha.".to_string(), "Beta.".to_string()]),
+            "the new message must still be synthesized after switching entities, got {:?}",
+            provider.spoken()
+        );
+        assert_eq!(
+            markdown_a.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            None,
+            "the old message must never be highlighted after switching away from it"
+        );
+        assert_eq!(
+            markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..6),
+            "the new message's first sentence should be highlighted"
         );
     }
 
