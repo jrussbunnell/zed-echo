@@ -15115,6 +15115,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "read_aloud"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audio",
+ "base64 0.22.1",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "markdown",
+ "rodio",
+ "serde",
+ "serde_json",
+ "settings",
+ "util",
+]
+
+[[package]]
 name = "recent_projects"
 version = "0.1.0"
 dependencies = [

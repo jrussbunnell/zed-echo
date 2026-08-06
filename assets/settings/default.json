@@ -591,6 +591,14 @@
     // Any unrecognized input device will fall back to system default.
     "experimental.input_audio_device": null,
   },
+  "read_aloud": {
+    "enabled": false,
+    "auto_play": true,
+    "provider": "inworld",
+    "voice_id": "Dennis",
+    "model_id": "inworld-tts-2",
+    "speaking_rate": 1.0
+  },
   // Scrollbar related settings
   "scrollbar": {
     // When to show the scrollbar in the editor.

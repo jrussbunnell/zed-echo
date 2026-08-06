@@ -206,6 +206,9 @@ pub struct SettingsContent {
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
 
+    /// Configuration for reading agent responses aloud.
+    pub read_aloud: Option<ReadAloudSettingsContent>,
+
     /// Whether or not to automatically check for updates.
     ///
     /// Default: true
@@ -572,6 +575,36 @@ impl From<Option<String>> for AudioOutputDeviceName {
     fn from(value: Option<String>) -> Self {
         Self(value)
     }
+}
+
+/// Configuration for reading agent responses aloud.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ReadAloudSettingsContent {
+    /// Whether to read assistant responses aloud.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Whether to begin speaking automatically as a response streams in.
+    ///
+    /// Default: true
+    pub auto_play: Option<bool>,
+    /// Which text-to-speech provider to use.
+    ///
+    /// Default: inworld
+    pub provider: Option<String>,
+    /// The provider voice identifier.
+    ///
+    /// Default: Dennis
+    pub voice_id: Option<String>,
+    /// The provider model identifier.
+    ///
+    /// Default: inworld-tts-2
+    pub model_id: Option<String>,
+    /// Playback rate multiplier.
+    ///
+    /// Default: 1.0
+    pub speaking_rate: Option<f32>,
 }
 
 /// Control what info is collected by Zed.
