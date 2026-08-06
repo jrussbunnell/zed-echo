@@ -327,8 +327,9 @@ Two rules govern what gets spoken:
 - Produces:
   ```rust
   pub struct Utterance { pub source_range: Range<usize>, pub spoken_text: String }
-  pub fn segment(parsed: &ParsedMarkdown) -> Vec<Utterance>
+  pub fn segment(parsed: &ParsedMarkdown, message_complete: bool) -> Vec<Utterance>
   ```
+  Finality rule (amended after review): a flushed block is FINAL — emit every sentence including an unterminated tail — iff more parsed content follows it in the source, or `message_complete` is true. Only the document's trailing block is non-final; there, only terminated sentences are emitted. This exists because pulldown_cmark emits balanced End/RootEnd events even for truncated input, so block-closure alone is not a completion signal.
   Task 5 and Task 8 both depend on these exact names.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2038,7 +2039,7 @@ Chunk mapping mirrors `collect_markdowns()` in `crates/agent_ui/src/conversation
   pub struct ReadAloud { .. }
   impl ReadAloud {
       pub fn new(provider: Arc<dyn TtsProvider>, sink: Box<dyn AudioSink>, cx: &mut Context<Self>) -> Self;
-      pub fn enqueue_markdown(&mut self, markdown: &Entity<Markdown>, cx: &mut Context<Self>);
+      pub fn enqueue_markdown(&mut self, markdown: &Entity<Markdown>, message_complete: bool, cx: &mut Context<Self>);
       pub fn seek_to_source_index(&mut self, markdown: &Entity<Markdown>, source_index: usize, cx: &mut Context<Self>);
       pub fn toggle(&mut self, cx: &mut Context<Self>);
       pub fn toggle_pause(&mut self, cx: &mut Context<Self>);
@@ -2089,7 +2090,7 @@ mod tests {
         });
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
         });
         cx.run_until_parked();
 
@@ -2114,7 +2115,7 @@ mod tests {
             |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
         });
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
         });
         cx.run_until_parked();
 
@@ -2144,7 +2145,7 @@ mod tests {
             |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
         });
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
         });
         cx.run_until_parked();
         assert!(read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
@@ -2185,7 +2186,7 @@ mod tests {
             |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
         });
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
         });
         cx.run_until_parked();
 
@@ -2282,13 +2283,18 @@ impl ReadAloud {
     /// Segments a markdown entity and hands the utterances to the player.
     /// Safe to call repeatedly as content streams in — the player only
     /// synthesizes what it has not already queued.
-    pub fn enqueue_markdown(&mut self, markdown: &Entity<Markdown>, cx: &mut Context<Self>) {
+    pub fn enqueue_markdown(
+        &mut self,
+        markdown: &Entity<Markdown>,
+        message_complete: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.speaking.as_ref() != Some(markdown) {
             self.clear_highlight(cx);
             self.speaking = Some(markdown.clone());
         }
 
-        let utterances = segment(markdown.read(cx).parsed_markdown());
+        let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player.update(cx, |player, cx| {
             player.set_utterances(utterances, cx);
         });
@@ -2302,7 +2308,7 @@ impl ReadAloud {
         cx: &mut Context<Self>,
     ) {
         if self.speaking.as_ref() != Some(markdown) {
-            self.enqueue_markdown(markdown, cx);
+            self.enqueue_markdown(markdown, false, cx);
         }
 
         let target = self.player.read(cx).utterances().iter().position(|utterance| {
@@ -2537,14 +2543,19 @@ Find `ThreadView`'s existing `cx.subscribe(&thread, ...)` handler and add to its
 
 ```rust
             AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
-                this.enqueue_read_aloud(cx);
+                this.enqueue_read_aloud(false, cx);
+            }
+            AcpThreadEvent::Stopped(_) => {
+                // The message is complete: let the segmenter speak the trailing
+                // block, which it withholds while streaming.
+                this.enqueue_read_aloud(true, cx);
             }
 ```
 
 Add the method to `impl ThreadView`:
 
 ```rust
-    fn enqueue_read_aloud(&mut self, cx: &mut Context<Self>) {
+    fn enqueue_read_aloud(&mut self, message_complete: bool, cx: &mut Context<Self>) {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
@@ -2566,7 +2577,7 @@ Add the method to `impl ThreadView`:
         };
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
         });
     }
 ```
