@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+pub const APP_NAME: &str = "ZedEcho";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -598,6 +598,31 @@ fn cursor_user_data_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     add_vscode_user_data_paths(&mut paths, "Cursor");
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_name_is_forked() {
+        assert_eq!(APP_NAME, "ZedEcho");
+        assert_eq!(APP_NAME_LOWERCASE, "zedecho");
+    }
+
+    #[test]
+    fn user_data_paths_do_not_collide_with_upstream_zed() {
+        let config = config_dir();
+        let data = data_dir();
+        assert!(
+            config.ends_with("zedecho"),
+            "config_dir must not be shared with the real Zed, got {config:?}"
+        );
+        assert!(
+            data.ends_with("ZedEcho"),
+            "data_dir must not be shared with the real Zed, got {data:?}"
+        );
+    }
 }
 
 fn add_vscode_user_data_paths(paths: &mut Vec<PathBuf>, product_name: &str) {
