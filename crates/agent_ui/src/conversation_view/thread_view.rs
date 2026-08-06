@@ -648,10 +648,6 @@ pub struct ThreadView {
     /// Text-to-speech for assistant prose. `None` until the API key resolves,
     /// and forever when read aloud is disabled, keyless, or has no audio device.
     read_aloud: Option<Entity<read_aloud::ReadAloud>>,
-    /// The message last handed to `read_aloud`. `ReadAloud` does not expose
-    /// what it is holding, so this is what lets `Toggle` tell "restart the
-    /// loaded message" from "load the newest one".
-    read_aloud_enqueued: Option<Entity<Markdown>>,
 }
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
@@ -1062,7 +1058,6 @@ impl ThreadView {
             thread_search_bar: None,
             thread_search_visible: false,
             read_aloud: None,
-            read_aloud_enqueued: None,
         };
 
         this.init_read_aloud(cx);
@@ -1237,7 +1232,6 @@ impl ThreadView {
             return;
         };
 
-        self.read_aloud_enqueued = Some(markdown.clone());
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, message_complete, cx);
         });
@@ -1245,30 +1239,48 @@ impl ThreadView {
 
     /// Starts, stops, or restarts reading aloud.
     ///
-    /// `auto_play` gates automatic playback only, so with it off the reader has
-    /// never been handed anything and `ReadAloud::toggle` alone would have
-    /// nothing to start. In that case — and whenever a newer message has
-    /// arrived since the last one handed over — load the newest message, which
-    /// begins playback by itself. Otherwise `toggle` restarts what is loaded,
-    /// which re-enqueueing cannot do: after a stop the player's synthesis
-    /// cursor sits at the end of the utterance list.
-    fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
+    /// `auto_play` gates automatic playback only and is deliberately not
+    /// consulted here: asking for this explicitly always reads the newest
+    /// message.
+    pub(super) fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
 
-        if !read_aloud.read(cx).is_speaking()
-            && let Some(markdown) = self.latest_assistant_markdown(cx)
-            && self.read_aloud_enqueued.as_ref() != Some(&markdown)
-        {
-            self.read_aloud_enqueued = Some(markdown.clone());
-            read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.enqueue_markdown(&markdown, true, cx);
-            });
+        if read_aloud.read(cx).is_speaking() {
+            read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
             return;
         }
 
-        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        let Some(markdown) = self.latest_assistant_markdown(cx) else {
+            // Nothing to read; `toggle` still restarts whatever is loaded.
+            read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+            return;
+        };
+
+        let already_loaded = read_aloud.read(cx).speaking() == Some(&markdown);
+        let message_complete = self.thread.read(cx).status() != ThreadStatus::Generating;
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            if already_loaded {
+                // Rewind first: a stopped player parks its synthesis cursor at
+                // the end of the utterance list, so re-enqueueing on its own
+                // would speak nothing. `toggle` also lifts the user-stop latch,
+                // without which the enqueue below would be ignored.
+                read_aloud.toggle(cx);
+            }
+            // Re-segment even when this message is the one already loaded. With
+            // `auto_play` off nothing else ever refreshes the utterance list,
+            // and the first load can easily have landed while the message had
+            // no complete sentence in it yet — leaving `toggle` alone with
+            // nothing to restart, forever.
+            read_aloud.enqueue_markdown(&markdown, message_complete, cx);
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
+        self.read_aloud = Some(read_aloud);
     }
 
     /// Schedule a throttled save of the thread state (draft prompt, scroll position, etc.).

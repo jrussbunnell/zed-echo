@@ -139,6 +139,7 @@ language_model = { workspace = true, "features" = ["test-support"] }
 node_runtime = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
+read_aloud = { workspace = true, features = ["test-support"] }
 remote = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 remote_server = { workspace = true, features = ["test-support"] }

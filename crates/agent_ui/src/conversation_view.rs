@@ -7447,6 +7447,132 @@ pub(crate) mod tests {
         });
     }
 
+    /// `ThreadView` never enqueues on its own here — the read-aloud
+    /// subscription is only installed when the feature is enabled, which it is
+    /// not in tests — so this is also the `auto_play: false` path: the first
+    /// `Toggle` has to find and load the newest message itself.
+    #[gpui::test]
+    async fn test_read_aloud_toggle_speaks_stops_and_restarts(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First one. Second one.".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Say two sentences", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let provider = read_aloud::FakeTts::new();
+        let sink = read_aloud::FakeSink::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| read_aloud::ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        thread_view.update(cx, |view, _cx| {
+            view.set_read_aloud_for_test(reader.clone());
+        });
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken(),
+            vec!["First one.", "Second one."],
+            "the first toggle must find and speak the newest assistant message"
+        );
+        assert!(reader.read_with(cx, |reader, _| reader.is_speaking()));
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        assert!(
+            !reader.read_with(cx, |reader, _| reader.is_speaking()),
+            "the second toggle must stop"
+        );
+        assert!(sink.is_stopped());
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        assert!(
+            reader.read_with(cx, |reader, _| reader.is_speaking()),
+            "the third toggle must restart, not latch off"
+        );
+        assert!(
+            provider.spoken().len() > 2,
+            "restarting re-synthesizes from the top, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// Guards the latch this had at first: `toggle` alone only rewinds the
+    /// utterance list the reader already holds, so with nothing re-segmenting
+    /// it, anything that arrived after the last load would never be spoken.
+    #[gpui::test]
+    async fn test_read_aloud_toggle_picks_up_text_that_arrived_while_stopped(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First one.".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Say something", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let provider = read_aloud::FakeTts::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            |cx| {
+                read_aloud::ReadAloud::for_test(
+                    Arc::new(provider),
+                    Box::new(read_aloud::FakeSink::new()),
+                    cx,
+                )
+            }
+        });
+        thread_view.update(cx, |view, _cx| {
+            view.set_read_aloud_for_test(reader.clone());
+        });
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+
+        let markdown = reader
+            .read_with(cx, |reader, _| reader.speaking().cloned())
+            .expect("the reader should be holding the assistant message");
+        markdown.update(cx, |markdown, cx| markdown.append(" Second one.", cx));
+        cx.run_until_parked();
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+
+        assert!(
+            provider.spoken().contains(&"Second one.".to_string()),
+            "toggling back on must re-segment, not just rewind, got {:?}",
+            provider.spoken()
+        );
+    }
+
     #[gpui::test]
     async fn test_thread_search_dismiss_clears_highlights(cx: &mut TestAppContext) {
         init_test(cx);

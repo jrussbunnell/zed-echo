@@ -78,6 +78,12 @@ pub struct ReadAloud {
     /// The markdown entity currently being spoken, and the utterances derived
     /// from it. Kept together so the highlight can be cleared on switch.
     speaking: Option<Entity<Markdown>>,
+    /// Set when the user stops playback with `toggle`, cleared by anything that
+    /// starts it again. Without it a stop does not stick while a message is
+    /// still streaming: the next `enqueue_markdown` grows the utterance list
+    /// past the cursor `stop` parked at the old end, and the player starts
+    /// speaking again without being asked.
+    stopped_by_user: bool,
     poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -114,6 +120,7 @@ impl ReadAloud {
         Self {
             player,
             speaking: None,
+            stopped_by_user: false,
             poll_task: None,
             _subscriptions: vec![subscription],
         }
@@ -132,6 +139,11 @@ impl ReadAloud {
         if switched_entity {
             self.clear_highlight(cx);
             self.speaking = Some(markdown.clone());
+            self.stopped_by_user = false;
+        } else if self.stopped_by_user {
+            // The user stopped this message. More of it arriving is not a
+            // reason to start speaking again; only `toggle` or a seek is.
+            return;
         }
 
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
@@ -176,6 +188,9 @@ impl ReadAloud {
         source_index: usize,
         cx: &mut Context<Self>,
     ) {
+        // Clicking a sentence is a request to hear it, which overrides an
+        // earlier stop.
+        self.stopped_by_user = false;
         if self.speaking.as_ref() != Some(markdown) {
             self.enqueue_markdown(markdown, false, cx);
         }
@@ -204,12 +219,14 @@ impl ReadAloud {
             // to do it again here.
             self.player.update(cx, |player, cx| player.stop(cx));
             self.poll_task = None;
+            self.stopped_by_user = true;
             // `self.speaking` is deliberately retained so toggling back on has
             // a message to restart.
         } else if self.speaking.is_some() {
             // Restart from the top. `stop` discarded the queue position, and
             // resuming mid-sentence would need an offset into audio the sink
             // no longer holds.
+            self.stopped_by_user = false;
             self.player.update(cx, |player, cx| player.seek_to(0, cx));
             self.start_polling(cx);
         }
@@ -234,6 +251,13 @@ impl ReadAloud {
 
     pub fn is_speaking(&self) -> bool {
         self.poll_task.is_some()
+    }
+
+    /// The message the reader is holding, whether or not it is sounding right
+    /// now. Callers use this to tell "restart what is loaded" from "load
+    /// something else".
+    pub fn speaking(&self) -> Option<&Entity<Markdown>> {
+        self.speaking.as_ref()
     }
 
     fn start_polling(&mut self, cx: &mut Context<Self>) {
@@ -503,6 +527,63 @@ mod tests {
             markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..9),
             "restart begins at the first sentence"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_user_stop_survives_more_of_the_same_message_streaming_in(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("First one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert!(read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+
+        // The agent is still writing, so the same message keeps arriving.
+        markdown.update(cx, |markdown, cx| {
+            markdown.append("Second one. Third one.\n", cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "a stop must not be undone by the rest of the message streaming in"
+        );
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_stopped,
+            "nothing new may be synthesized while stopped"
+        );
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            None,
+            "and nothing may be highlighted"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        assert!(
+            read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "toggling back on must still work after a stop that stuck"
         );
     }
 
