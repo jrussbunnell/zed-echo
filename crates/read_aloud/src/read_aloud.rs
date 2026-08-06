@@ -144,14 +144,27 @@ impl ReadAloud {
                 // least as many utterances as the old one had already
                 // reached, `pump` thinks synthesis is caught up and the new
                 // message is never synthesized while the old message's
-                // audio keeps playing from the sink. `seek_to(0, ..)` clears
-                // the sink (dropping the old message's queued audio),
-                // cancels any in-flight synthesis for the old message, and
-                // restarts `next_to_synthesize` from the top of the new one.
+                // audio keeps playing from the sink. `reset` clears the sink
+                // (dropping the old message's queued audio), cancels any
+                // in-flight synthesis for the old message, and restarts
+                // `next_to_synthesize` from the top of the new one.
+                //
+                // `seek_to(0, ..)` cannot be used here: it early-returns
+                // whenever the target index is out of range, which is
+                // exactly the state of the very first chunk of a new
+                // streaming message — the segmenter withholds an
+                // unterminated trailing fragment, so a fresh entity often
+                // starts out with zero utterances. `seek_to` would then
+                // leave the old message's stale audio sitting in the sink
+                // until the new message finally produces its first
+                // utterance. `reset` has no such guard: it always clears the
+                // sink and always pumps, whether or not there is anything to
+                // synthesize yet.
+                //
                 // A plain `stop` before `set_utterances` does not work
                 // either — `set_utterances` would just clamp the resulting
                 // `next_to_synthesize` right back down to the new length.
-                player.seek_to(0, cx);
+                player.reset(cx);
             }
         });
         self.start_polling(cx);
@@ -363,6 +376,69 @@ mod tests {
             markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..6),
             "the new message's first sentence should be highlighted"
+        );
+    }
+
+    #[gpui::test]
+    async fn switching_to_an_entity_with_no_utterances_yet_still_drops_the_old_queue(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a =
+            cx.new(|cx| Markdown::new("One. Two. Three. Four. Five.\n".into(), None, None, cx));
+        // `markdown_b` starts mid-sentence, with no terminator yet — the
+        // segmenter withholds an unterminated trailing fragment, so this is
+        // the normal state of the very first chunk of a new streaming
+        // message: zero utterances.
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        assert!(sink.queued() > 0, "setup: A should have queued audio");
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        assert_eq!(
+            sink.queued(),
+            0,
+            "the old message's stale audio must be dropped even though the new \
+             message has nothing to speak yet"
+        );
+
+        // "Alpha." finishes streaming in.
+        markdown_b.update(cx, |markdown, cx| {
+            markdown.append(". Beta.\n", cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            provider
+                .spoken()
+                .ends_with(&["Alpha.".to_string(), "Beta.".to_string()]),
+            "the new message must be synthesized promptly once it has content, \
+             with no need to wait for a drain, got {:?}",
+            provider.spoken()
+        );
+        assert_eq!(
+            markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..6),
+            "Speaking(0) must be re-emitted for the new message even though its \
+             index collides with the position last reported for the old one"
         );
     }
 

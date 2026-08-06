@@ -65,6 +65,23 @@ impl Player {
         self.pump(cx);
     }
 
+    /// Cancels in-flight synthesis, drops whatever audio is queued, and
+    /// restarts synthesis from the top of the current utterance list —
+    /// including when that list is currently empty (unlike `seek_to`, which
+    /// early-returns if the target index is out of range and so cannot be
+    /// used to discard stale audio while the new content has nothing to
+    /// speak yet). Emits no event: `last_reported` becomes `None`, so the
+    /// next `poll_position` naturally emits `Speaking`/`Finished` for
+    /// whatever the recomputed position turns out to be, even if that
+    /// position happens to be the same index as before the reset.
+    pub fn reset(&mut self, cx: &mut Context<Self>) {
+        self.synthesis = None;
+        self.sink.clear();
+        self.next_to_synthesize = 0;
+        self.last_reported = None;
+        self.pump(cx);
+    }
+
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.synthesis = None;
         self.sink.stop();
@@ -352,6 +369,71 @@ mod tests {
         player.update(cx, |player, cx| player.stop(cx));
         assert!(sink.is_stopped());
         assert_eq!(player.read_with(cx, |player, _| player.speaking_index()), None);
+    }
+
+    #[gpui::test]
+    async fn reset_drops_the_queue_and_restarts_synthesis_from_the_top(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        player.update(cx, |player, cx| {
+            player.set_utterances(
+                vec![utterance("A.", 0), utterance("B.", 3), utterance("C.", 6)],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sink.queued(),
+            2,
+            "prefetch should have queued the first two"
+        );
+
+        player.update(cx, |player, cx| player.reset(cx));
+        assert_eq!(
+            sink.queued(),
+            0,
+            "reset must drop whatever was already queued, unlike seek_to which \
+             only clears the sink when the target index is in range"
+        );
+
+        cx.run_until_parked();
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0),
+            "reset must restart synthesis from the first utterance"
+        );
+        assert_eq!(
+            provider.spoken(),
+            vec!["A.", "B.", "A.", "B."],
+            "reset must resynthesize from the top rather than resume mid-queue"
+        );
+    }
+
+    #[gpui::test]
+    async fn reset_clears_the_queue_even_with_nothing_left_to_synthesize(cx: &mut TestAppContext) {
+        let (player, _provider, sink) = setup(cx);
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("A.", 0)], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sink.queued(), 1);
+
+        // Unlike `seek_to(0, ..)`, which early-returns when the target index
+        // is out of range and so cannot be used to discard stale audio when
+        // there is nothing new to speak yet, `reset` must still clear the
+        // sink even though the new utterance list is empty.
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![], cx);
+            player.reset(cx);
+        });
+        assert_eq!(
+            sink.queued(),
+            0,
+            "reset must drop stale audio unconditionally"
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            None
+        );
     }
 
     #[gpui::test]
