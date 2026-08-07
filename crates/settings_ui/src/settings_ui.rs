@@ -2042,7 +2042,7 @@ impl SettingsWindow {
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
             theme_studio_search,
-            theme_studio_collapsed_groups: HashSet::default(),
+            theme_studio_collapsed_groups: pages::theme_studio_default_collapsed_groups(),
             theme_studio_editing_row: None,
             theme_studio_color_error: None,
             theme_studio_reset_all_confirming: false,
@@ -5363,7 +5363,7 @@ pub mod test {
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
                 theme_studio_search: cx.new(|cx| Editor::single_line(window, cx)),
-                theme_studio_collapsed_groups: HashSet::default(),
+                theme_studio_collapsed_groups: pages::theme_studio_default_collapsed_groups(),
                 theme_studio_editing_row: None,
                 theme_studio_color_error: None,
                 theme_studio_reset_all_confirming: false,
@@ -5507,7 +5507,7 @@ pub mod test {
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
             theme_studio_search: cx.new(|cx| Editor::single_line(window, cx)),
-            theme_studio_collapsed_groups: HashSet::default(),
+            theme_studio_collapsed_groups: pages::theme_studio_default_collapsed_groups(),
             theme_studio_editing_row: None,
             theme_studio_color_error: None,
             theme_studio_reset_all_confirming: false,
@@ -6460,6 +6460,12 @@ pub mod test {
             settings_window.navigate_to_sub_page(THEME_STUDIO_SETTINGS_PATH, window, cx)
         });
         assert!(navigated, "the Theme Studio sub-page should be registered");
+
+        // Most groups start collapsed; expand them all so every row builder runs.
+        settings_window.update(cx, |settings_window, cx| {
+            settings_window.theme_studio_collapsed_groups.clear();
+            cx.notify();
+        });
 
         cx.simulate_resize(gpui::size(px(1200.), px(900.)));
         cx.run_until_parked();

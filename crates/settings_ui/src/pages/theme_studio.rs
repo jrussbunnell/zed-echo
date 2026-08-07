@@ -8,12 +8,12 @@
 
 use std::rc::Rc;
 
-use collections::HashSet;
 use gpui::{Hsla, ReadGlobal as _, Rgba, ScrollHandle, prelude::*};
 use settings::{
     FontStyleContent, FontWeightContent, HighlightStyleContent, Settings as _, ThemeColor,
     ThemeStyleContent,
 };
+use std::collections::HashSet;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
 use ui::{Divider, Tooltip, prelude::*};
@@ -277,6 +277,9 @@ pub(crate) fn all_color_tokens() -> impl Iterator<Item = &'static ColorToken> {
 }
 
 /// Display groups, in the order they appear on the page.
+///
+/// `players` and `accents` are arrays rather than named tokens and are not
+/// editable here yet, so they have no group.
 pub(crate) const TOKEN_GROUPS: &[&str] = &[
     "Editor",
     "Syntax",
@@ -289,9 +292,19 @@ pub(crate) const TOKEN_GROUPS: &[&str] = &[
     "Status & Diagnostics",
     "Version Control",
     "Vim & Helix",
-    "Players",
     "Other",
 ];
+
+/// Groups that start collapsed. The page has over two hundred rows in total,
+/// so only the group users reach for most is open on arrival; searching
+/// expands whatever matches regardless.
+pub(crate) fn default_collapsed_groups() -> HashSet<&'static str> {
+    TOKEN_GROUPS
+        .iter()
+        .copied()
+        .filter(|group| *group != "Editor")
+        .collect()
+}
 
 /// Assigns a token to a display group from its JSON key, so the grouping stays
 /// correct as tokens are added upstream instead of needing a parallel table.
@@ -775,6 +788,7 @@ fn render_color_row(
                     this.theme_studio_editing_row = Some(row_id.clone());
                 }
                 this.theme_studio_color_error = None;
+                this.theme_studio_reset_all_confirming = false;
                 cx.notify();
             }
         }))
@@ -933,7 +947,7 @@ pub(crate) fn syntax_token_names(
     overrides: Option<&ThemeStyleContent>,
     query: &str,
 ) -> Vec<SharedString> {
-    let mut names = HashSet::default();
+    let mut names = HashSet::new();
     let syntax = theme.syntax();
     // `SyntaxTheme` exposes no iterator over its capture names, so walk the
     // highlight indices, which are dense from zero.
@@ -1603,7 +1617,7 @@ mod tests {
 
     #[test]
     fn every_color_token_has_a_unique_key() {
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new();
         for token in all_color_tokens() {
             assert!(
                 seen.insert(token.key),
