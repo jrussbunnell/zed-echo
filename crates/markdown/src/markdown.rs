@@ -33,13 +33,13 @@ use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    AnyElement, App, Background, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase,
+    Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla,
+    Image, ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Point, Rems, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad, relative,
-    size,
+    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, linear_color_stop,
+    linear_gradient, point, quad, rgb, size,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -122,6 +122,10 @@ pub struct MarkdownStyle {
     pub heading: StyleRefinement,
     pub heading_level_styles: Option<HeadingLevelStyles>,
     pub heading_border_color: Option<Hsla>,
+    /// Line height for paragraphs and list items, overriding the default
+    /// `rems(1.3)`. The agent panel raises it so the read-aloud word pill's
+    /// vertical inflate has air between lines.
+    pub paragraph_line_height: Option<Rems>,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
@@ -147,6 +151,7 @@ impl Default for MarkdownStyle {
             heading: Default::default(),
             heading_level_styles: None,
             heading_border_color: None,
+            paragraph_line_height: None,
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
@@ -1846,8 +1851,9 @@ impl MarkdownElement {
         text_align_override: Option<TextAlign>,
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
+        let line_height = self.style.paragraph_line_height.unwrap_or(rems(1.3));
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
+            el.mb_2().line_height(line_height)
         });
 
         paragraph = match align {
@@ -2074,10 +2080,11 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
     ) {
+        let line_height = self.style.paragraph_line_height.unwrap_or(rems(1.3));
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1().gap_1().line_height(line_height)
                 })
                 .h_flex()
                 .items_start()
@@ -2096,11 +2103,13 @@ impl MarkdownElement {
 
     /// Three layers, painted beneath the text: a faint band on the speakable
     /// sentence under the pointer (showing where a click would seek), a
-    /// stronger accent wash across the whole sentence being spoken, and a
-    /// prominent accent pill on the single word currently sounding. Later
-    /// layers paint on top of earlier ones, and the karaoke effect comes from
-    /// the pill hopping word to word as playback advances. All three derive
-    /// from the same accent token so they read as one family.
+    /// stronger wash across the whole sentence being spoken, and a prominent
+    /// gradient pill on the single word currently sounding. Later layers
+    /// paint on top of earlier ones, and the karaoke effect comes from the
+    /// pill hopping word to word as playback advances. The palette is a
+    /// fixed purple→pink brand pair (user-directed, deliberately not a theme
+    /// token); only the pill's alpha adapts to the theme's appearance so the
+    /// glyphs on top stay legible.
     fn paint_speaking_highlight(
         &self,
         rendered_text: &RenderedText,
@@ -2114,13 +2123,15 @@ impl MarkdownElement {
         if sentence.is_none() && word.is_none() && hover.is_none() {
             return;
         }
-        let accent = cx.theme().colors().text_accent;
+        let purple: Hsla = rgb(0xA855F7).into();
+        let pink: Hsla = rgb(0xEC4899).into();
 
         if let Some(range) = hover {
             paint_highlight_band(
                 rendered_text,
                 range,
-                accent.opacity(0.16),
+                purple.opacity(0.15).into(),
+                None,
                 px(3.),
                 px(2.),
                 window,
@@ -2131,7 +2142,8 @@ impl MarkdownElement {
             paint_highlight_band(
                 rendered_text,
                 range,
-                accent.opacity(0.26),
+                purple.opacity(0.25).into(),
+                None,
                 px(3.),
                 px(2.),
                 window,
@@ -2139,19 +2151,29 @@ impl MarkdownElement {
         }
 
         if let Some(range) = word {
-            let color = if cx.theme().appearance.is_light() {
-                // Dark glyphs sit on top, so the pill must stay a light
-                // tint: the same accent, at low alpha over a light surface.
-                accent.opacity(0.25)
+            let alpha = if cx.theme().appearance.is_light() {
+                // Dark glyphs on a light surface only need a tint.
+                0.3
             } else {
-                // A strong, saturated fill. `text_accent` is a *text* color —
-                // light in dark themes — and near-white glyphs would wash out
-                // against it at full strength, so the lightness is capped
-                // (and the saturation floored) to keep the accent's hue while
-                // the pill stays dark enough for light glyphs to read.
-                gpui::hsla(accent.h, accent.s.max(0.5), accent.l.min(0.45), 0.78)
+                // Light glyphs need the fill strong enough to read as a
+                // pill without drowning them.
+                0.7
             };
-            paint_highlight_band(rendered_text, range, color, px(4.), px(3.), window);
+            let fill = linear_gradient(
+                90.,
+                linear_color_stop(purple.opacity(alpha), 0.),
+                linear_color_stop(pink.opacity(alpha), 1.),
+            );
+            let outline = purple.opacity((alpha + 0.15).min(1.));
+            paint_highlight_band(
+                rendered_text,
+                range,
+                fill,
+                Some(outline),
+                px(4.),
+                px(3.),
+                window,
+            );
         }
     }
 
@@ -3292,11 +3314,13 @@ impl Element for MarkdownElement {
 
 /// Paints one rounded band per layout line covered by `range`, inflated past
 /// the bare text-line rect so the band hugs the text with a little air around
-/// it. A range that wraps produces one band per line.
+/// it. A range that wraps produces one band per line. `outline` adds a 1px
+/// border in the given color.
 fn paint_highlight_band(
     rendered_text: &RenderedText,
     range: Range<usize>,
-    color: Hsla,
+    background: Background,
+    outline: Option<Hsla>,
     inflate_x: Pixels,
     inflate_y: Pixels,
     window: &mut Window,
@@ -3312,9 +3336,13 @@ fn paint_highlight_band(
         window.paint_quad(quad(
             bounds,
             px(6.),
-            color,
-            Edges::default(),
-            Hsla::transparent_black(),
+            background,
+            if outline.is_some() {
+                Edges::all(px(1.))
+            } else {
+                Edges::default()
+            },
+            outline.unwrap_or(Hsla::transparent_black()),
             BorderStyle::default(),
         ));
     }
