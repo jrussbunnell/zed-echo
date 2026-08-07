@@ -11,12 +11,15 @@ use std::rc::Rc;
 use gpui::{Hsla, ReadGlobal as _, Rgba, ScrollHandle, prelude::*};
 use settings::{
     FontStyleContent, FontWeightContent, HighlightStyleContent, Settings as _, ThemeColor,
-    ThemeStyleContent,
+    ThemeStyleContent, WindowBlurMaterialContent,
 };
 use std::collections::HashSet;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
-use ui::{Divider, PopoverMenu, Tooltip, prelude::*};
+use ui::{
+    ContextMenu, Divider, DropdownMenu, DropdownStyle, IconPosition, PopoverMenu, Tooltip,
+    prelude::*,
+};
 use util::ResultExt as _;
 
 use crate::components::{SettingsInputField, SettingsSectionHeader};
@@ -538,6 +541,7 @@ pub(crate) fn render_theme_studio_page(
             overrides.as_ref(),
             cx,
         ))
+        .child(render_window_appearance_section(window, cx))
         .child(render_search_bar(settings_window, cx))
         .children(render_token_groups(
             settings_window,
@@ -629,6 +633,142 @@ fn render_header(
                 ),
         )
         .child(Divider::horizontal())
+}
+
+/// The `window_blur_material` values offered by the picker, in menu order,
+/// paired with the label shown for each.
+///
+/// These are the values written verbatim into the user's settings file, so
+/// `window_blur_materials_match_the_settings_enum_spellings` pins them to the
+/// enum's serde spellings.
+pub(crate) const WINDOW_BLUR_MATERIALS: [(WindowBlurMaterialContent, &str); 9] = [
+    (WindowBlurMaterialContent::Default, "Default (HUD window)"),
+    (WindowBlurMaterialContent::HudWindow, "HUD window"),
+    (WindowBlurMaterialContent::FullScreenUi, "Full screen UI"),
+    (WindowBlurMaterialContent::Menu, "Menu"),
+    (
+        WindowBlurMaterialContent::UnderWindowBackground,
+        "Under window background",
+    ),
+    (WindowBlurMaterialContent::Sidebar, "Sidebar"),
+    (WindowBlurMaterialContent::Selection, "Selection (legacy)"),
+    (WindowBlurMaterialContent::GlassEffect, "Glass effect"),
+    (
+        WindowBlurMaterialContent::WindowServer,
+        "Window server blur",
+    ),
+];
+
+pub(crate) fn window_blur_material_label(value: WindowBlurMaterialContent) -> &'static str {
+    WINDOW_BLUR_MATERIALS
+        .iter()
+        .find(|(candidate, _)| *candidate == value)
+        .map_or("Default (HUD window)", |(_, label)| *label)
+}
+
+fn write_window_blur_material(
+    value: Option<WindowBlurMaterialContent>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    update_settings_file(
+        SettingsUiFile::User,
+        Some("window_blur_material"),
+        window,
+        cx,
+        move |settings_content, _| {
+            settings_content.theme.window_blur_material = value;
+        },
+    )
+    .log_err();
+}
+
+/// Window-level appearance controls, which apply to the window itself rather
+/// than to any one theme token.
+fn render_window_appearance_section(
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let layers = setting_layers(
+        |settings_content| settings_content.theme.window_blur_material.as_ref(),
+        cx,
+    );
+    let is_set = layers.user.is_some();
+    let current = layers.resolved.unwrap_or_default();
+    let current_label = window_blur_material_label(current);
+
+    // Keyed on the selection so the menu is rebuilt with the new check mark
+    // when the value changes, but not on every unrelated re-render of the page.
+    let menu = window.use_keyed_state(
+        SharedString::from(format!("window-blur-material-menu-{current_label}")),
+        cx,
+        |window, cx| {
+            ContextMenu::new(window, cx, move |mut menu, _, _| {
+                for (value, label) in WINDOW_BLUR_MATERIALS {
+                    menu = menu.toggleable_entry(
+                        label,
+                        value == current,
+                        IconPosition::End,
+                        None,
+                        move |window, cx| write_window_blur_material(Some(value), window, cx),
+                    );
+                }
+                menu
+            })
+        },
+    );
+
+    v_flex()
+        .gap_1()
+        .child(SettingsSectionHeader::new("Window Appearance").no_padding(true))
+        .child(
+            h_flex()
+                .w_full()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(Label::new("Window Blur Material").size(LabelSize::Small))
+                        .child(
+                            Label::new(
+                                "macOS only. Applies to themes whose window background \
+                                 appearance is blurred.",
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            DropdownMenu::new("window-blur-material-dropdown", current_label, menu)
+                                .aria_label("Window Blur Material")
+                                .aria_description(
+                                    "Which macOS blur material frosts the window background",
+                                )
+                                .style(DropdownStyle::Outlined)
+                                .trigger_size(ButtonSize::Medium)
+                                .tab_index(0),
+                        )
+                        .when(is_set, |this| {
+                            this.child(
+                                IconButton::new("reset-window-blur-material", IconName::RotateCcw)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .aria_label("Reset to default blur material")
+                                    .tooltip(Tooltip::text("Reset to default blur material"))
+                                    .on_click(|_, window, cx| {
+                                        write_window_blur_material(None, window, cx)
+                                    }),
+                            )
+                        }),
+                ),
+        )
 }
 
 fn render_search_bar(
@@ -2172,6 +2312,161 @@ mod tests {
             highlight.color = Some(ThemeColor::from("#00FF00"));
         });
         assert_eq!(override_count(Some(&style)), 3);
+    }
+
+    /// The nine values `window_blur_material` accepts, in the order the picker
+    /// offers them.
+    const BLUR_MATERIAL_SPELLINGS: [&str; 9] = [
+        "default",
+        "hud_window",
+        "full_screen_ui",
+        "menu",
+        "under_window_background",
+        "sidebar",
+        "selection",
+        "glass_effect",
+        "window_server",
+    ];
+
+    /// The picker writes these values verbatim into the user's real
+    /// settings.json, so a table that drifts from the enum's serde spellings
+    /// would write a value the settings parser rejects and the control would
+    /// silently do nothing. Both directions are checked, as for color tokens.
+    #[test]
+    fn window_blur_materials_match_the_settings_enum_spellings() {
+        let serialized: Vec<String> = WINDOW_BLUR_MATERIALS
+            .iter()
+            .map(|(value, _)| {
+                serde_json::to_value(value)
+                    .expect("the blur material serializes")
+                    .as_str()
+                    .expect("the blur material serializes to a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(serialized, BLUR_MATERIAL_SPELLINGS);
+
+        for (spelling, (value, _)) in BLUR_MATERIAL_SPELLINGS
+            .iter()
+            .zip(WINDOW_BLUR_MATERIALS.iter())
+        {
+            let parsed: WindowBlurMaterialContent =
+                serde_json::from_value(serde_json::json!(spelling))
+                    .expect("the spelling deserializes");
+            assert_eq!(parsed, *value, "{spelling} should read back as itself");
+        }
+    }
+
+    #[test]
+    fn window_blur_material_labels_are_unique_and_resolvable() {
+        let mut labels = HashSet::new();
+        let mut values: Vec<WindowBlurMaterialContent> = Vec::new();
+        for (value, label) in WINDOW_BLUR_MATERIALS {
+            assert!(!label.is_empty());
+            assert!(
+                labels.insert(label),
+                "duplicate blur material label: {label}"
+            );
+            assert!(
+                !values.contains(&value),
+                "duplicate blur material value: {label}"
+            );
+            values.push(value);
+            assert_eq!(window_blur_material_label(value), label);
+        }
+    }
+
+    /// The whole `window_blur_material` key must land at the top level of the
+    /// user's settings file, and clearing it must remove the key rather than
+    /// write the default back in as an override.
+    #[gpui::test]
+    fn setting_the_blur_material_targets_only_that_key(cx: &mut App) {
+        let store = settings::SettingsStore::new(cx, &settings::default_settings());
+        let existing = concat!(
+            "{\n",
+            "  \"theme\": \"One Dark\",\n",
+            "  \"buffer_font_size\": 15\n",
+            "}\n",
+        );
+
+        let updated = store
+            .new_text_for_update(existing.to_string(), |settings| {
+                settings.theme.window_blur_material = Some(WindowBlurMaterialContent::GlassEffect);
+            })
+            .expect("the settings file updates");
+
+        let value: serde_json::Value =
+            settings::parse_json_with_comments(&updated).expect("the result is valid JSON");
+        assert_eq!(
+            value["window_blur_material"],
+            serde_json::json!("glass_effect")
+        );
+        assert_eq!(
+            value["theme"],
+            serde_json::json!("One Dark"),
+            "unrelated keys survive, got:\n{updated}"
+        );
+        assert_eq!(value["buffer_font_size"], serde_json::json!(15));
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(3),
+            "exactly one key should have been added, got:\n{updated}"
+        );
+
+        let cleared = store
+            .new_text_for_update(updated, |settings| {
+                settings.theme.window_blur_material = None;
+            })
+            .expect("the settings file updates");
+        let value: serde_json::Value =
+            settings::parse_json_with_comments(&cleared).expect("the result is valid JSON");
+        assert!(
+            value["window_blur_material"].is_null(),
+            "resetting should remove the key, got:\n{cleared}"
+        );
+        assert_eq!(value["buffer_font_size"], serde_json::json!(15));
+    }
+
+    /// `default.json` ships `window_blur_material`, so the same
+    /// defaults-are-not-customizations trap the pill colors hit applies here:
+    /// an unset value must not render as customized or offer a reset.
+    #[gpui::test]
+    fn an_unset_blur_material_is_not_reported_as_customized(cx: &mut App) {
+        let mut store = settings::SettingsStore::new(cx, &settings::default_settings());
+        store
+            .set_user_settings("{}", cx)
+            .expect("empty user settings parse");
+        cx.set_global(store);
+
+        fn blur_material(
+            settings_content: &settings::SettingsContent,
+        ) -> Option<&WindowBlurMaterialContent> {
+            settings_content.theme.window_blur_material.as_ref()
+        }
+
+        let layers = setting_layers(blur_material, cx);
+        assert_eq!(
+            layers.resolved,
+            Some(WindowBlurMaterialContent::Default),
+            "premise of this test: default.json ships window_blur_material"
+        );
+        assert_eq!(
+            layers.user, None,
+            "a user who never set the blur material has no override"
+        );
+
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(r#"{ "window_blur_material": "glass_effect" }"#, cx)
+                .expect("user settings parse");
+        });
+
+        let layers = setting_layers(blur_material, cx);
+        assert_eq!(
+            layers.user,
+            Some(WindowBlurMaterialContent::GlassEffect),
+            "a value the user did set is reported as an override"
+        );
     }
 
     #[test]
