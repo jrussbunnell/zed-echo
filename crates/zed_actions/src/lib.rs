@@ -41,6 +41,9 @@ actions!(
         /// Opens the settings editor.
         #[action(deprecated_aliases = ["zed_actions::OpenSettingsEditor"])]
         OpenSettings,
+        /// Opens Theme Studio, where the active theme's colors, fonts, and the
+        /// agent panel's content styling can be customized.
+        OpenThemeStudio,
         /// Opens the settings JSON file.
         #[action(deprecated_aliases = ["zed_actions::OpenSettings"])]
         OpenSettingsFile,
@@ -173,6 +176,9 @@ pub const AGENT_SKILLS_SETTINGS_PATH: &str = "agent.skills";
 /// `OpenSettingsAt` path of the agent sandbox permissions page in the settings
 /// UI.
 pub const AGENT_SANDBOX_SETTINGS_PATH: &str = "agent.sandbox_permissions";
+
+/// `OpenSettingsAt` path of the Theme Studio page in the settings UI.
+pub const THEME_STUDIO_SETTINGS_PATH: &str = "theme_overrides";
 
 #[derive(PartialEq, Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
