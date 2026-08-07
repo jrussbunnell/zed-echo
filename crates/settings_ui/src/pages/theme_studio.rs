@@ -16,7 +16,7 @@ use settings::{
 use std::collections::HashSet;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
-use ui::{Divider, Tooltip, prelude::*};
+use ui::{Divider, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 use crate::components::{SettingsInputField, SettingsSectionHeader};
@@ -1221,70 +1221,37 @@ pub(crate) const AGENT_PANEL_GROUPS: [(&str, &str); 5] = [
 
 macro_rules! agent_panel_style_items {
     ($group:ident, $title:literal, $json_prefix:literal) => {
-        [
-            SettingsPageItem::SettingItem(SettingItem {
-                title: concat!($title, " Font Family"),
-                description: "Falls back to the panel's default font when unset.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some(concat!(
-                        "agent_panel_styling.",
-                        $json_prefix,
-                        ".font_family"
-                    )),
-                    pick: |settings_content| {
-                        settings_content
-                            .agent_panel_styling
-                            .as_ref()?
-                            .$group
-                            .as_ref()?
-                            .font_family
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .agent_panel_styling
-                            .get_or_insert_default()
-                            .$group
-                            .get_or_insert_default()
-                            .font_family = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
+        [SettingsPageItem::SettingItem(SettingItem {
+            title: concat!($title, " Font Size"),
+            description: "Size in pixels. Values outside 8–32 are ignored.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some(concat!("agent_panel_styling.", $json_prefix, ".font_size")),
+                pick: |settings_content| {
+                    settings_content
+                        .agent_panel_styling
+                        .as_ref()?
+                        .$group
+                        .as_ref()?
+                        .font_size
+                        .as_ref()
+                },
+                write: |settings_content, value, _| {
+                    settings_content
+                        .agent_panel_styling
+                        .get_or_insert_default()
+                        .$group
+                        .get_or_insert_default()
+                        .font_size = value;
+                },
             }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: concat!($title, " Font Size"),
-                description: "Size in pixels. Values outside 8–32 are ignored.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some(concat!("agent_panel_styling.", $json_prefix, ".font_size")),
-                    pick: |settings_content| {
-                        settings_content
-                            .agent_panel_styling
-                            .as_ref()?
-                            .$group
-                            .as_ref()?
-                            .font_size
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .agent_panel_styling
-                            .get_or_insert_default()
-                            .$group
-                            .get_or_insert_default()
-                            .font_size = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-        ]
+            metadata: None,
+            files: USER,
+        })]
     };
 }
 
-fn agent_panel_font_items(group: &str) -> [SettingsPageItem; 2] {
+fn agent_panel_font_items(group: &str) -> [SettingsPageItem; 1] {
     match group {
         "assistant_prose" => {
             agent_panel_style_items!(assistant_prose, "Assistant Prose", "assistant_prose")
@@ -1296,17 +1263,17 @@ fn agent_panel_font_items(group: &str) -> [SettingsPageItem; 2] {
     }
 }
 
-/// Reads and writes for the two color fields of one agent-panel group. Kept as
+/// Reads and writes for one string field of one agent-panel group. Kept as
 /// function pointers so the group can be selected at runtime while the settings
 /// path stays static.
-struct AgentPanelColorAccess {
+struct AgentPanelStringAccess {
     read: fn(&settings::SettingsContent) -> Option<&String>,
     write: fn(&mut settings::SettingsContent, Option<String>),
 }
 
-macro_rules! agent_panel_color_access {
+macro_rules! agent_panel_string_access {
     ($group:ident, $field:ident) => {
-        AgentPanelColorAccess {
+        AgentPanelStringAccess {
             read: |settings_content| {
                 settings_content
                     .agent_panel_styling
@@ -1328,19 +1295,131 @@ macro_rules! agent_panel_color_access {
     };
 }
 
-fn agent_panel_color_access(group: &str, is_background: bool) -> AgentPanelColorAccess {
+fn agent_panel_color_access(group: &str, is_background: bool) -> AgentPanelStringAccess {
     match (group, is_background) {
-        ("assistant_prose", false) => agent_panel_color_access!(assistant_prose, text_color),
-        ("assistant_prose", true) => agent_panel_color_access!(assistant_prose, background),
-        ("thinking", false) => agent_panel_color_access!(thinking, text_color),
-        ("thinking", true) => agent_panel_color_access!(thinking, background),
-        ("tool_output", false) => agent_panel_color_access!(tool_output, text_color),
-        ("tool_output", true) => agent_panel_color_access!(tool_output, background),
-        ("user_message", false) => agent_panel_color_access!(user_message, text_color),
-        ("user_message", true) => agent_panel_color_access!(user_message, background),
-        (_, false) => agent_panel_color_access!(code_blocks, text_color),
-        (_, true) => agent_panel_color_access!(code_blocks, background),
+        ("assistant_prose", false) => agent_panel_string_access!(assistant_prose, text_color),
+        ("assistant_prose", true) => agent_panel_string_access!(assistant_prose, background),
+        ("thinking", false) => agent_panel_string_access!(thinking, text_color),
+        ("thinking", true) => agent_panel_string_access!(thinking, background),
+        ("tool_output", false) => agent_panel_string_access!(tool_output, text_color),
+        ("tool_output", true) => agent_panel_string_access!(tool_output, background),
+        ("user_message", false) => agent_panel_string_access!(user_message, text_color),
+        ("user_message", true) => agent_panel_string_access!(user_message, background),
+        (_, false) => agent_panel_string_access!(code_blocks, text_color),
+        (_, true) => agent_panel_string_access!(code_blocks, background),
     }
+}
+
+fn agent_panel_font_family_access(group: &str) -> AgentPanelStringAccess {
+    match group {
+        "assistant_prose" => agent_panel_string_access!(assistant_prose, font_family),
+        "thinking" => agent_panel_string_access!(thinking, font_family),
+        "tool_output" => agent_panel_string_access!(tool_output, font_family),
+        "user_message" => agent_panel_string_access!(user_message, font_family),
+        _ => agent_panel_string_access!(code_blocks, font_family),
+    }
+}
+
+/// A font-family row for one of the fork's `Option<String>` font settings.
+///
+/// The built-in `FontFamilyName` renderer cannot be reused because these fields
+/// are plain strings, but the picker itself is the same one, so the family list
+/// still comes from the cache the settings window prefetches off the main
+/// thread.
+fn render_font_family_row(
+    row_id: SharedString,
+    label: SharedString,
+    access: AgentPanelStringAccess,
+    cx: &mut App,
+) -> AnyElement {
+    let read = access.read;
+    let write = access.write;
+    let current = settings::SettingsStore::global(cx)
+        .get_value_from_file(SettingsUiFile::User.to_settings(), read)
+        .1
+        .cloned();
+    let is_set = current.is_some();
+    let current_font = SharedString::from(current.unwrap_or_default());
+    let handle = ui::PopoverMenuHandle::default();
+
+    h_flex()
+        .id(SharedString::from(format!("row-{row_id}")))
+        .w_full()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .justify_between()
+        .child(Label::new(label.clone()).size(LabelSize::Small))
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    PopoverMenu::new(SharedString::from(format!("font-picker-{row_id}")))
+                        .trigger(crate::wire_picker_trigger_a11y(
+                            crate::render_picker_trigger_button(
+                                SharedString::from(format!("font-trigger-{row_id}")),
+                                if current_font.is_empty() {
+                                    "Default".into()
+                                } else {
+                                    current_font.clone()
+                                },
+                            )
+                            .aria_label(label),
+                            handle.clone(),
+                        ))
+                        .menu({
+                            move |window, cx| {
+                                let current_font = current_font.clone();
+                                Some(cx.new(move |cx| {
+                                    crate::components::font_picker(
+                                        current_font,
+                                        move |font_name, window, cx| {
+                                            let font_name = font_name.to_string();
+                                            update_settings_file(
+                                                SettingsUiFile::User,
+                                                Some("agent_panel_styling"),
+                                                window,
+                                                cx,
+                                                move |settings_content, _| {
+                                                    write(settings_content, Some(font_name));
+                                                },
+                                            )
+                                            .log_err();
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                }))
+                            }
+                        })
+                        .anchor(gpui::Anchor::TopLeft)
+                        .with_handle(handle),
+                )
+                .when(is_set, |this| {
+                    this.child(
+                        IconButton::new(
+                            SharedString::from(format!("reset-{row_id}")),
+                            IconName::RotateCcw,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .aria_label("Reset to default font")
+                        .tooltip(Tooltip::text("Reset to default font"))
+                        .on_click(move |_, window, cx| {
+                            update_settings_file(
+                                SettingsUiFile::User,
+                                Some("agent_panel_styling"),
+                                window,
+                                cx,
+                                move |settings_content, _| write(settings_content, None),
+                            )
+                            .log_err();
+                        }),
+                    )
+                }),
+        )
+        .into_any_element()
 }
 
 fn render_agent_panel_section(
@@ -1355,6 +1434,12 @@ fn render_agent_panel_section(
                 .size(LabelSize::Small)
                 .into_any_element(),
         );
+        children.push(render_font_family_row(
+            SharedString::from(format!("agent:{group}:font_family")),
+            "Font Family".into(),
+            agent_panel_font_family_access(group),
+            cx,
+        ));
         children.extend(render_setting_items(
             settings_window,
             agent_panel_font_items(group),
@@ -1385,7 +1470,7 @@ fn render_settings_color_row(
     settings_window: &SettingsWindow,
     row_id: EditingRowId,
     label: SharedString,
-    access: AgentPanelColorAccess,
+    access: AgentPanelStringAccess,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let read = access.read;
