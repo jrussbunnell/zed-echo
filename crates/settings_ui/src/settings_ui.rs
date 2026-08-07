@@ -49,7 +49,7 @@ use workspace::{
 };
 use zed_actions::{
     AGENT_SKILLS_SETTINGS_PATH, OpenProjectSettings, OpenSettings, OpenSettingsAt,
-    OpenSettingsAtTarget, OpenSettingsPage,
+    OpenSettingsAtTarget, OpenSettingsPage, OpenThemeStudio, THEME_STUDIO_SETTINGS_PATH,
 };
 
 use crate::components::{
@@ -436,6 +436,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| {
         open_settings_editor(None, None, None, cx);
     });
+    cx.on_action(|_: &OpenThemeStudio, cx| {
+        open_settings_editor(Some(THEME_STUDIO_SETTINGS_PATH), None, None, cx);
+    });
     cx.on_action(|_: &zed_actions::assistant::OpenSkillCreator, cx| {
         open_skill_creator(pages::SkillCreatorOpenMode::Form, None, cx);
     });
@@ -467,6 +470,10 @@ pub fn init(cx: &mut App) {
             .register_action(|_, _: &OpenSettings, window, cx| {
                 let window_handle = window.window_handle().downcast::<MultiWorkspace>();
                 open_settings_editor(None, None, window_handle, cx);
+            })
+            .register_action(|_, _: &OpenThemeStudio, window, cx| {
+                let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+                open_settings_editor(Some(THEME_STUDIO_SETTINGS_PATH), None, window_handle, cx);
             })
             .register_action(|workspace, _: &OpenProjectSettings, window, cx| {
                 let window_handle = window.window_handle().downcast::<MultiWorkspace>();
@@ -987,6 +994,19 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    /// Live filter query for the Theme Studio sub-page's token list.
+    pub(crate) theme_studio_search: Entity<Editor>,
+    /// Theme Studio groups the user has collapsed, by group name.
+    pub(crate) theme_studio_collapsed_groups: HashSet<&'static str>,
+    /// The one Theme Studio row that is expanded for editing. Only one row is
+    /// expanded at a time so the page holds a single text editor rather than
+    /// one per token.
+    pub(crate) theme_studio_editing_row: Option<SharedString>,
+    /// Validation message for the currently expanded Theme Studio color field.
+    pub(crate) theme_studio_color_error: Option<SharedString>,
+    /// Whether "Reset All" in Theme Studio has been clicked once and is
+    /// awaiting confirmation.
+    pub(crate) theme_studio_reset_all_confirming: bool,
 }
 
 struct SearchDocument {
@@ -1788,6 +1808,18 @@ impl SettingsWindow {
         })
         .detach();
 
+        let theme_studio_search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter tokens…", window, cx);
+            editor
+        });
+        cx.subscribe(&theme_studio_search, |_, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::Edited { .. }) {
+                cx.notify();
+            }
+        })
+        .detach();
+
         let mut ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
         cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
             this.fetch_files(window, cx);
@@ -2009,6 +2041,11 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            theme_studio_search,
+            theme_studio_collapsed_groups: HashSet::default(),
+            theme_studio_editing_row: None,
+            theme_studio_color_error: None,
+            theme_studio_reset_all_confirming: false,
         };
 
         this.fetch_files(window, cx);
@@ -5325,6 +5362,11 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                theme_studio_search: cx.new(|cx| Editor::single_line(window, cx)),
+                theme_studio_collapsed_groups: HashSet::default(),
+                theme_studio_editing_row: None,
+                theme_studio_color_error: None,
+                theme_studio_reset_all_confirming: false,
             }
         }
     }
@@ -5464,6 +5506,11 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            theme_studio_search: cx.new(|cx| Editor::single_line(window, cx)),
+            theme_studio_collapsed_groups: HashSet::default(),
+            theme_studio_editing_row: None,
+            theme_studio_color_error: None,
+            theme_studio_reset_all_confirming: false,
         };
 
         settings_window.build_filter_table();
