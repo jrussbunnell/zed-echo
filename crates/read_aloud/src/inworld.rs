@@ -1,12 +1,13 @@
-use crate::provider::{Pcm, TtsProvider, WordTiming};
+use crate::provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use futures::AsyncReadExt as _;
-use gpui::{App, AppContext as _, Task};
+use gpui::{App, AppContext as _, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const INWORLD_API_URL: &str = "https://api.inworld.ai/tts/v1/voice:stream";
+pub const INWORLD_VOICES_URL: &str = "https://api.inworld.ai/tts/v1/voices";
 pub const INWORLD_CREDENTIALS_URL: &str = "https://api.inworld.ai";
 const INWORLD_API_KEY_VAR: &str = "INWORLD_API_KEY";
 const SAMPLE_RATE: u32 = 22050;
@@ -16,6 +17,13 @@ const RATE_LIMIT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::fro
 pub struct InworldTts {
     client: Arc<dyn HttpClient>,
     api_key: String,
+    /// Read at each synthesize call rather than captured at construction, so
+    /// a settings change speaks in the new voice from the next request on —
+    /// already-synthesized audio keeps the voice it was made with.
+    voice: Mutex<VoiceSelection>,
+}
+
+struct VoiceSelection {
     voice_id: String,
     model_id: String,
 }
@@ -30,8 +38,20 @@ impl InworldTts {
         Self {
             client,
             api_key,
-            voice_id,
-            model_id,
+            voice: Mutex::new(VoiceSelection { voice_id, model_id }),
+        }
+    }
+
+    /// Applies to the next synthesis request. Poisoning is unreachable in
+    /// practice (nothing panics while holding the lock), but a poisoned
+    /// selection keeps its old voice rather than crashing the reader.
+    pub fn set_voice(&self, voice_id: String, model_id: String) {
+        match self.voice.lock() {
+            Ok(mut voice) => {
+                voice.voice_id = voice_id;
+                voice.model_id = model_id;
+            }
+            Err(error) => log::error!("read_aloud: voice selection poisoned: {error}"),
         }
     }
 }
@@ -40,8 +60,12 @@ impl TtsProvider for InworldTts {
     fn synthesize(&self, text: String, cx: &App) -> Task<Result<Pcm>> {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
-        let voice_id = self.voice_id.clone();
-        let model_id = self.model_id.clone();
+        let (voice_id, model_id) = match self.voice.lock() {
+            Ok(voice) => (voice.voice_id.clone(), voice.model_id.clone()),
+            Err(error) => {
+                return Task::ready(Err(anyhow!("voice selection poisoned: {error}")));
+            }
+        };
 
         let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
@@ -103,6 +127,92 @@ impl TtsProvider for InworldTts {
             Err(anyhow!("Inworld TTS exhausted rate-limit retries"))
         })
     }
+}
+
+/// Fetches the provider's voice catalog. English voices only, sorted by
+/// display name: the full catalog is 250+ voices across a dozen languages,
+/// and a context menu of Russian narrators is no help for English prose.
+pub fn fetch_voices(
+    client: Arc<dyn HttpClient>,
+    api_key: String,
+    cx: &App,
+) -> Task<Result<Vec<TtsVoice>>> {
+    cx.background_spawn(async move {
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(INWORLD_VOICES_URL)
+            .header("Authorization", format!("Basic {}", api_key.trim()))
+            .body(AsyncBody::empty())?;
+        let mut response = client.send(request).await?;
+        let status = response.status();
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Inworld voice list returned {status}: {}",
+                body.trim()
+            ));
+        }
+        parse_voice_list(&body)
+    })
+}
+
+/// Response shape verified against the live API (2026-08):
+/// `{"voices": [{"voiceId", "displayName", "languages": ["en", ...], ...}]}`.
+/// An empty result is an error rather than an empty menu, so callers fall
+/// back to the curated list.
+fn parse_voice_list(body: &str) -> Result<Vec<TtsVoice>> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("Inworld voice list was not valid JSON")?;
+    let voices = value
+        .get("voices")
+        .and_then(|voices| voices.as_array())
+        .context("Inworld voice list had no `voices` array")?;
+    let mut parsed: Vec<TtsVoice> = voices
+        .iter()
+        .filter_map(|voice| {
+            let id = voice.get("voiceId")?.as_str()?;
+            let speaks_english = voice
+                .get("languages")
+                .and_then(|languages| languages.as_array())
+                .is_some_and(|languages| {
+                    languages
+                        .iter()
+                        .any(|language| language.as_str() == Some("en"))
+                });
+            if !speaks_english {
+                return None;
+            }
+            let name = voice
+                .get("displayName")
+                .and_then(|name| name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id);
+            Some(TtsVoice {
+                id: SharedString::from(id.to_string()),
+                name: SharedString::from(name.to_string()),
+            })
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Err(anyhow!("Inworld voice list contained no English voices"));
+    }
+    parsed.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(parsed)
+}
+
+/// A hand-curated slice of real Inworld voices for when the catalog fetch
+/// fails. Every id verified against the live API.
+pub fn fallback_voices() -> Vec<TtsVoice> {
+    [
+        "Ashley", "Clive", "Dennis", "Duncan", "Mark", "Olivia", "Sarah", "Timothy",
+    ]
+    .into_iter()
+    .map(|name| TtsVoice {
+        id: name.into(),
+        name: name.into(),
+    })
+    .collect()
 }
 
 /// Walks the streamed JSON-lines body, concatenating every `result.audioContent`
@@ -254,6 +364,116 @@ pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    /// A fake Inworld endpoint that records every request body it is sent
+    /// and answers with one valid single-chunk synthesis response.
+    fn recording_client() -> (Arc<dyn HttpClient>, Arc<Mutex<Vec<String>>>) {
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+        let client = http_client::FakeHttpClient::create({
+            let bodies = bodies.clone();
+            move |mut request| {
+                let bodies = bodies.clone();
+                async move {
+                    let mut body = String::new();
+                    request.body_mut().read_to_string(&mut body).await?;
+                    bodies.lock().expect("test lock").push(body);
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(
+                            "{\"result\":{\"audioContent\":\"AAA=\"}}\n".to_string(),
+                        ))?)
+                }
+            }
+        });
+        (client, bodies)
+    }
+
+    #[gpui::test]
+    async fn a_voice_change_applies_to_the_next_synthesis_request(cx: &mut TestAppContext) {
+        let (client, bodies) = recording_client();
+        let tts = InworldTts::new(
+            client,
+            "key".to_string(),
+            "Dennis".to_string(),
+            "inworld-tts-2".to_string(),
+        );
+
+        cx.update(|cx| tts.synthesize("First.".to_string(), cx))
+            .await
+            .unwrap();
+        tts.set_voice("Clive".to_string(), "inworld-tts-2".to_string());
+        cx.update(|cx| tts.synthesize("Second.".to_string(), cx))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().expect("test lock");
+        let requests: Vec<serde_json::Value> = bodies
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("request body is JSON"))
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["voiceId"], "Dennis");
+        assert_eq!(
+            requests[1]["voiceId"], "Clive",
+            "the voice read at call time, not construction time"
+        );
+        assert_eq!(requests[1]["modelId"], "inworld-tts-2");
+    }
+
+    #[test]
+    fn parses_the_voice_list_and_keeps_only_english_voices() {
+        // Shape from a live `GET /tts/v1/voices` call (2026-08), trimmed to
+        // the fields the parser reads.
+        let body = concat!(
+            "{\"voices\":[",
+            "{\"languages\":[\"ru\"],\"voiceId\":\"Nikolai\",\"displayName\":\"Nikolai\",",
+            "\"description\":\"redacted\",\"tags\":[\"deep\"],\"isCustom\":false},",
+            "{\"languages\":[\"en\"],\"voiceId\":\"Duncan\",\"displayName\":\"Duncan\",",
+            "\"description\":\"redacted\",\"tags\":[],\"isCustom\":false},",
+            "{\"languages\":[\"en\"],\"voiceId\":\"Ashley\",\"displayName\":\"\",",
+            "\"description\":\"redacted\",\"tags\":[],\"isCustom\":false}",
+            "]}"
+        );
+        let voices = parse_voice_list(body).unwrap();
+        assert_eq!(
+            voices,
+            vec![
+                TtsVoice {
+                    id: "Ashley".into(),
+                    name: "Ashley".into(),
+                },
+                TtsVoice {
+                    id: "Duncan".into(),
+                    name: "Duncan".into(),
+                },
+            ],
+            "non-English voices are dropped, an empty display name falls back \
+             to the id, and the list is sorted by name"
+        );
+    }
+
+    #[test]
+    fn a_useless_voice_list_is_an_error_not_an_empty_menu() {
+        assert!(parse_voice_list("not json").is_err());
+        assert!(parse_voice_list("{}").is_err());
+        assert!(
+            parse_voice_list("{\"voices\":[{\"languages\":[\"ru\"],\"voiceId\":\"Nikolai\"}]}")
+                .is_err(),
+            "a list with no English voices must trigger the fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_voices_include_the_documented_defaults() {
+        let fallback = fallback_voices();
+        for expected in ["Dennis", "Clive", "Ashley"] {
+            assert!(
+                fallback.iter().any(|voice| voice.id.as_ref() == expected),
+                "fallback list must include {expected}"
+            );
+        }
+    }
 
     #[test]
     fn decodes_linear16_to_normalized_floats() {

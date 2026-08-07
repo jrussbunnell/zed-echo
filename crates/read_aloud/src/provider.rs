@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use gpui::{App, AppContext as _, Task};
+use gpui::{App, AppContext as _, SharedString, Task};
 use std::sync::{Arc, Mutex};
 
 /// Raw uncompressed audio. Interleaved if `channels > 1`.
@@ -24,6 +24,16 @@ pub struct WordTiming {
 /// One seam so no TTS vendor is welded into the editor.
 pub trait TtsProvider: Send + Sync + 'static {
     fn synthesize(&self, text: String, cx: &App) -> Task<Result<Pcm>>;
+}
+
+/// A selectable voice, as offered by a provider's catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtsVoice {
+    /// The identifier passed to synthesis (`read_aloud.voice_id`).
+    pub id: SharedString,
+    /// What the voice menu shows; falls back to the id when the provider has
+    /// no separate display name.
+    pub name: SharedString,
 }
 
 #[derive(Default)]

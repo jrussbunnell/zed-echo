@@ -605,6 +605,20 @@ pub struct ReadAloudSettingsContent {
     ///
     /// Default: 1.0
     pub speaking_rate: Option<f32>,
+    /// Colors for the read-aloud word highlight, as one or two hex strings
+    /// ("#RGB" or "#RRGGBB"). One color paints a solid pill; two paint a
+    /// gradient from the first to the second. The sentence wash, hover band,
+    /// and pill outline all derive from the first color.
+    ///
+    /// Default: a purple-to-pink gradient ("#A855F7", "#EC4899")
+    pub pill_colors: Option<Vec<String>>,
+    /// Whether clicking a sentence in assistant prose seeks read-aloud
+    /// playback to it. When false, sentence clicks (and their hover
+    /// affordance) are disabled; the speaker buttons, mini player, and
+    /// auto-play are unaffected.
+    ///
+    /// Default: true
+    pub click_to_seek: Option<bool>,
 }
 
 /// Control what info is collected by Zed.

@@ -597,7 +597,15 @@
     "provider": "inworld",
     "voice_id": "Dennis",
     "model_id": "inworld-tts-2",
-    "speaking_rate": 1.0
+    "speaking_rate": 1.0,
+    // One or two hex colors ("#RGB" or "#RRGGBB") for the word highlight:
+    // one paints a solid pill, two paint a gradient. The sentence wash,
+    // hover band, and pill outline derive from the first color.
+    "pill_colors": ["#A855F7", "#EC4899"],
+    // Whether clicking a sentence seeks playback to it. When false,
+    // sentence clicks and their hover affordance are disabled; the speaker
+    // buttons, mini player, and auto-play are unaffected.
+    "click_to_seek": true
   },
   // Scrollbar related settings
   "scrollbar": {

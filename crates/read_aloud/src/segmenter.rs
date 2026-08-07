@@ -271,15 +271,23 @@ const MAX_SUBSTITUTE_RUNS: usize = 4;
 
 /// The alphanumeric word runs of a code fragment, in order and capped — the
 /// part of it a human would actually say: "Vec String" for `Vec<String>`,
-/// "HOME" for `$HOME`. `None` when nothing sayable survives (pure symbols,
-/// hash-like or unpronounceably long runs).
+/// "UI Design" for `UIDesign`, "HOME" for `$HOME`. `None` when nothing
+/// sayable survives (pure symbols, hash-like or unpronounceably long runs).
 fn spoken_word_runs(code: &str) -> Option<String> {
     /// Runs this long are identifiers nobody says aloud, like hashes.
     const MAX_RUN_LENGTH: usize = 20;
 
+    // The hash check runs on the whole run *before* the camel split: a hex
+    // sha splits into short speakable-looking pieces at its letter↔digit
+    // boundaries ("aa370aca7c" → "aa 370 aca 7 c"), so splitting first would
+    // un-silence every hash. The length filter, by contrast, runs on the
+    // sub-runs — that is the whole point of the split: a long camelCase name
+    // is speakable word by word even though the run as a whole is not.
     let runs: Vec<&str> = code
         .split(|character: char| !character.is_alphanumeric())
-        .filter(|run| !run.is_empty() && run.len() < MAX_RUN_LENGTH && !is_hash_like(run))
+        .filter(|run| !run.is_empty() && !is_hash_like(run))
+        .flat_map(split_camel_case)
+        .filter(|run| run.len() < MAX_RUN_LENGTH && !is_hash_like(run))
         .take(MAX_SUBSTITUTE_RUNS)
         .collect();
     if runs.is_empty() {
@@ -287,6 +295,33 @@ fn spoken_word_runs(code: &str) -> Option<String> {
     } else {
         Some(runs.join(" "))
     }
+}
+
+/// Splits one alphanumeric run at word boundaries a reader would hear:
+/// lower→UPPER transitions, the last capital of a capital run when lowercase
+/// follows (`XMLHttp` → "XML", "Http"), and letter↔digit boundaries
+/// (`JSON5` → "JSON", "5"). A run with no such boundary comes back whole.
+fn split_camel_case(run: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut piece_start = 0;
+    let characters: Vec<(usize, char)> = run.char_indices().collect();
+    for window_index in 1..characters.len() {
+        let (index, current) = characters[window_index];
+        let (_, previous) = characters[window_index - 1];
+        let next = characters.get(window_index + 1).map(|(_, next)| *next);
+        let boundary = (previous.is_lowercase() && current.is_uppercase())
+            || (previous.is_uppercase()
+                && current.is_uppercase()
+                && next.is_some_and(|next| next.is_lowercase()))
+            || (previous.is_alphabetic() && current.is_numeric())
+            || (previous.is_numeric() && current.is_alphabetic());
+        if boundary {
+            pieces.push(&run[piece_start..index]);
+            piece_start = index;
+        }
+    }
+    pieces.push(&run[piece_start..]);
+    pieces
 }
 
 /// A path speaks its final component's name — "player" for
@@ -812,6 +847,45 @@ mod tests {
             spoken("Use `->>=` here.\n", cx),
             vec!["Use here."],
             "pure symbols still go silent — there is nothing to say"
+        );
+    }
+
+    #[gpui::test]
+    fn speaks_long_camel_case_identifiers_word_by_word(cx: &mut TestAppContext) {
+        // The user-reported skip: a 29-character camelCase identifier used to
+        // die at the run-length filter, silencing it and breaking the
+        // sentence flow. Splitting at case boundaries speaks it as words.
+        assert_eq!(
+            spoken("Set `UIDesignRequiresCompatibility` to opt in.\n", cx),
+            vec!["Set UI Design Requires Compatibility to opt in."]
+        );
+    }
+
+    #[gpui::test]
+    fn splits_consecutive_capitals_and_digit_boundaries(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken("Use `new XMLHttpRequest()` here.\n", cx),
+            vec!["Use new XML Http Request here."],
+            "a capital run keeps its last capital with the following word"
+        );
+        assert_eq!(
+            spoken("Call `parseJSON5Fast()` next.\n", cx),
+            vec!["Call parse JSON 5 Fast next."],
+            "letter-digit boundaries split in both directions"
+        );
+    }
+
+    #[gpui::test]
+    fn a_full_sha_stays_silent_despite_camel_splitting(cx: &mut TestAppContext) {
+        // A 40-hex sha has letter↔digit boundaries everywhere; the hash
+        // filter must run on the whole token before the split, or the split
+        // would turn it into short speakable-looking pieces.
+        assert_eq!(
+            spoken(
+                "See `e5b3a1c94d2f70e6a8b1c2d3e4f5061728394a5b` too.\n",
+                cx
+            ),
+            vec!["See too."]
         );
     }
 

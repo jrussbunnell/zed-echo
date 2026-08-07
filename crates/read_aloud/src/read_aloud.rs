@@ -4,9 +4,11 @@ mod provider;
 mod segmenter;
 mod sink;
 
-pub use inworld::{INWORLD_CREDENTIALS_URL, InworldTts, resolve_api_key};
+pub use inworld::{
+    INWORLD_CREDENTIALS_URL, InworldTts, fallback_voices, fetch_voices, resolve_api_key,
+};
 pub use player::{Player, PlayerEvent};
-pub use provider::{Pcm, TtsProvider, WordTiming};
+pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
 pub use segmenter::{Utterance, segment};
 pub use sink::{AudioSink, RodioSink};
 
@@ -19,7 +21,7 @@ pub use provider::FakeTts;
 #[cfg(any(test, feature = "test-support"))]
 pub use sink::FakeSink;
 
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, Hsla, SharedString, Subscription, Task};
 use markdown::Markdown;
 use settings::{RegisterSetting, Settings};
 use std::ops::Range;
@@ -44,6 +46,10 @@ pub struct ReadAloudSettings {
     pub voice_id: String,
     pub model_id: String,
     pub speaking_rate: f32,
+    /// Resolved from `read_aloud.pill_colors`; `None` means the built-in
+    /// purple→pink default. `(start, end)` — equal for a solid color.
+    pub pill_colors: Option<(Hsla, Hsla)>,
+    pub click_to_seek: bool,
 }
 
 impl Settings for ReadAloudSettings {
@@ -62,8 +68,81 @@ impl Settings for ReadAloudSettings {
                 .and_then(|s| s.model_id.clone())
                 .unwrap_or_else(|| "inworld-tts-2".to_string()),
             speaking_rate: read_aloud.and_then(|s| s.speaking_rate).unwrap_or(1.0),
+            pill_colors: read_aloud
+                .and_then(|s| s.pill_colors.as_deref())
+                .and_then(resolve_pill_colors),
+            click_to_seek: read_aloud.and_then(|s| s.click_to_seek).unwrap_or(true),
         }
     }
+}
+
+/// One color → solid (both stops equal); two → gradient start and end.
+/// Anything else — empty, more than two, or an unparsable entry — falls back
+/// to the default palette, warning with the offending value. Resolution only
+/// runs when settings (re)load, so the warning fires once per bad edit, not
+/// in any hot path.
+pub fn resolve_pill_colors(colors: &[String]) -> Option<(Hsla, Hsla)> {
+    if colors.is_empty() || colors.len() > 2 {
+        log::warn!(
+            "read_aloud: pill_colors takes one or two colors, got {}; using the default palette",
+            colors.len()
+        );
+        return None;
+    }
+    let mut parsed = Vec::with_capacity(colors.len());
+    for color in colors {
+        match parse_hex_color(color) {
+            Some(parsed_color) => parsed.push(parsed_color),
+            None => {
+                log::warn!(
+                    "read_aloud: pill_colors entry {color:?} is not a valid hex color; \
+                     using the default palette"
+                );
+                return None;
+            }
+        }
+    }
+    match parsed.as_slice() {
+        [only] => Some((*only, *only)),
+        [first, second] => Some((*first, *second)),
+        _ => None,
+    }
+}
+
+/// `#RGB`, `#RRGGBB`, or `#RRGGBBAA`, case-insensitive, `#` optional. An
+/// alpha component is accepted but ignored: the highlight layers apply their
+/// own alphas so glyphs stay legible in both appearances.
+fn parse_hex_color(text: &str) -> Option<Hsla> {
+    let hex = text.trim().trim_start_matches('#');
+    if !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (red, green, blue) = match hex.len() {
+        3 => {
+            let value = u16::from_str_radix(hex, 16).ok()?;
+            let expand = |nibble: u16| (nibble * 17) as u8;
+            (
+                expand((value >> 8) & 0xF),
+                expand((value >> 4) & 0xF),
+                expand(value & 0xF),
+            )
+        }
+        6 | 8 => (
+            u8::from_str_radix(hex.get(0..2)?, 16).ok()?,
+            u8::from_str_radix(hex.get(2..4)?, 16).ok()?,
+            u8::from_str_radix(hex.get(4..6)?, 16).ok()?,
+        ),
+        _ => return None,
+    };
+    Some(
+        gpui::Rgba {
+            r: f32::from(red) / 255.,
+            g: f32::from(green) / 255.,
+            b: f32::from(blue) / 255.,
+            a: 1.,
+        }
+        .into(),
+    )
 }
 
 pub fn init(cx: &mut gpui::App) {
@@ -125,6 +204,11 @@ pub struct ReadAloud {
     /// the moment its parse lands; nothing else re-runs segmentation after
     /// the turn's final thread event.
     speaking_parse_observation: Option<Subscription>,
+    /// Mirrors `read_aloud.click_to_seek`. While false the speaking entity is
+    /// handed no speakable ranges, so the markdown element shows no seek
+    /// affordance (hover band, pointer cursor) — the owning view also skips
+    /// wiring the click handler itself.
+    click_to_seek: bool,
     poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -169,6 +253,7 @@ impl ReadAloud {
             message_complete: false,
             pending_completion: false,
             speaking_parse_observation: None,
+            click_to_seek: true,
             poll_task: None,
             _subscriptions: vec![subscription, player_observation],
         }
@@ -450,20 +535,36 @@ impl ReadAloud {
 
     /// Mirrors the current utterance ranges into the speaking entity so its
     /// element can preview (hover) and advertise (cursor) click-to-seek.
+    /// With `click_to_seek` off nothing is mirrored: a disabled action gets
+    /// no affordance.
     fn push_speakable_ranges(&self, cx: &mut Context<Self>) {
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
-        let ranges: Vec<Range<usize>> = self
-            .player
-            .read(cx)
-            .utterances()
-            .iter()
-            .map(|utterance| utterance.source_range.clone())
-            .collect();
+        let ranges: Vec<Range<usize>> = if self.click_to_seek {
+            self.player
+                .read(cx)
+                .utterances()
+                .iter()
+                .map(|utterance| utterance.source_range.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         markdown.update(cx, |markdown, cx| {
             markdown.set_speakable_ranges(ranges, cx);
         });
+    }
+
+    /// Applies a `read_aloud.click_to_seek` change live: the speaking
+    /// entity's mirrored ranges are re-pushed (emptied when disabling) so the
+    /// hover affordance follows the setting without a restart.
+    pub fn set_click_to_seek(&mut self, click_to_seek: bool, cx: &mut Context<Self>) {
+        if self.click_to_seek == click_to_seek {
+            return;
+        }
+        self.click_to_seek = click_to_seek;
+        self.push_speakable_ranges(cx);
     }
 
     /// `message_complete` carries the caller's knowledge of whether this
@@ -737,6 +838,97 @@ mod tests {
         assert_eq!(settings.voice_id, "Dennis");
         assert_eq!(settings.model_id, "inworld-tts-2");
         assert_eq!(settings.speaking_rate, 1.0);
+        assert_eq!(settings.pill_colors, None, "absent means the default palette");
+        assert!(settings.click_to_seek, "sentence clicks seek by default");
+    }
+
+    #[test]
+    fn pill_colors_parse_valid_hex_forms() {
+        let solid = resolve_pill_colors(&["#A855F7".to_string()]).expect("one color is valid");
+        assert_eq!(solid.0, solid.1, "one color paints a solid pill");
+
+        let gradient = resolve_pill_colors(&["#A855F7".to_string(), "#EC4899".to_string()])
+            .expect("two colors are valid");
+        assert_ne!(gradient.0, gradient.1);
+
+        let shorthand = resolve_pill_colors(&["#F0A".to_string()]).expect("#RGB is valid");
+        let longhand = resolve_pill_colors(&["#FF00AA".to_string()]).expect("#RRGGBB is valid");
+        assert_eq!(shorthand, longhand, "#RGB expands each nibble");
+
+        assert_eq!(
+            resolve_pill_colors(&["a855f7".to_string()]),
+            resolve_pill_colors(&["#A855F7".to_string()]),
+            "the leading # is optional and hex is case-insensitive"
+        );
+        assert_eq!(
+            resolve_pill_colors(&["#A855F7FF".to_string()]),
+            resolve_pill_colors(&["#A855F7".to_string()]),
+            "an alpha component is accepted but ignored"
+        );
+    }
+
+    #[test]
+    fn pill_colors_fall_back_to_the_default_on_bad_input() {
+        assert_eq!(resolve_pill_colors(&[]), None, "empty array");
+        assert_eq!(
+            resolve_pill_colors(&[
+                "#111111".to_string(),
+                "#222222".to_string(),
+                "#333333".to_string()
+            ]),
+            None,
+            "more than two colors"
+        );
+        assert_eq!(
+            resolve_pill_colors(&["not a color".to_string()]),
+            None,
+            "non-hex text"
+        );
+        assert_eq!(
+            resolve_pill_colors(&["#AB".to_string()]),
+            None,
+            "wrong length"
+        );
+        assert_eq!(
+            resolve_pill_colors(&["#A855F7".to_string(), "#XYZXYZ".to_string()]),
+            None,
+            "one bad entry rejects the whole pair"
+        );
+    }
+
+    #[gpui::test]
+    async fn click_to_seek_gates_the_speakable_ranges(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !markdown.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
+            "setup: the speaking entity advertises its sentences"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_click_to_seek(false, cx);
+        });
+        assert!(
+            markdown.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
+            "disabling click-to-seek clears the affordance immediately"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_click_to_seek(true, cx);
+        });
+        assert!(
+            !markdown.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
+            "re-enabling restores the affordance without a new enqueue"
+        );
     }
 
     #[gpui::test]
