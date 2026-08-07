@@ -6393,6 +6393,95 @@ pub mod test {
         });
     }
 
+    /// Renders every Theme Studio row for real, which the page's pure-logic
+    /// tests cannot do: it is what catches duplicate element ids and any
+    /// re-entrant entity access in the row builders.
+    #[gpui::test]
+    async fn test_theme_studio_page_renders(cx: &mut gpui::TestAppContext) {
+        use project::Project;
+
+        cx.update(|cx| {
+            register_settings(cx);
+        });
+
+        let app_state = cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            app_state
+        });
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/project", serde_json::json!({ "main.rs": "fn main() {}" }))
+            .await;
+
+        let project = cx.update(|cx| {
+            Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            )
+        });
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree("/project", true, cx)
+            })
+            .await
+            .expect("Failed to create worktree");
+
+        let (_multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| {
+                Workspace::new(
+                    Default::default(),
+                    project.clone(),
+                    app_state.clone(),
+                    window,
+                    cx,
+                )
+            });
+            MultiWorkspace::new(workspace, window, cx)
+        });
+        let workspace_handle = cx.window_handle().downcast::<MultiWorkspace>().unwrap();
+
+        cx.run_until_parked();
+
+        let (settings_window, cx) = cx
+            .add_window_view(|window, cx| SettingsWindow::new(Some(workspace_handle), window, cx));
+
+        cx.run_until_parked();
+
+        let navigated = settings_window.update_in(cx, |settings_window, window, cx| {
+            settings_window.navigate_to_sub_page(THEME_STUDIO_SETTINGS_PATH, window, cx)
+        });
+        assert!(navigated, "the Theme Studio sub-page should be registered");
+
+        cx.simulate_resize(gpui::size(px(1200.), px(900.)));
+        cx.run_until_parked();
+
+        settings_window.read_with(cx, |settings_window, _| {
+            let titles: Vec<_> = settings_window
+                .sub_page_stack
+                .iter()
+                .map(|sub_page| sub_page.link.title.to_string())
+                .collect();
+            assert_eq!(titles, ["Theme Studio"]);
+        });
+
+        // Expanding a row swaps in the hex editor, a distinct render path.
+        settings_window.update(cx, |settings_window, cx| {
+            settings_window.theme_studio_editing_row = Some("token:editor.background".into());
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(1200.), px(900.)));
+        cx.run_until_parked();
+    }
+
     #[gpui::test]
     async fn test_open_skill_creator_action_opens_settings_window_at_sub_page(
         cx: &mut gpui::TestAppContext,
