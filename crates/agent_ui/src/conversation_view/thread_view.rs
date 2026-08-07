@@ -1171,7 +1171,7 @@ impl ThreadView {
                 );
                 let speaking_rate = settings.speaking_rate;
 
-                this.read_aloud = Some(cx.new(|cx| {
+                let read_aloud = cx.new(|cx| {
                     let mut read_aloud = read_aloud::ReadAloud::new(
                         Arc::new(provider),
                         Box::new(read_aloud::RodioSink::new(player)),
@@ -1179,7 +1179,13 @@ impl ThreadView {
                     );
                     read_aloud.set_speed(speaking_rate, cx);
                     read_aloud
-                }));
+                });
+                // The mini player renders off this entity's state; it already
+                // notifies on every playback transition, so observing it is
+                // what keeps the controls current without another timer.
+                this._subscriptions
+                    .push(cx.observe(&read_aloud, |_, _, cx| cx.notify()));
+                this.read_aloud = Some(read_aloud);
                 cx.notify();
             })
             .log_err();
@@ -1207,10 +1213,14 @@ impl ThreadView {
     /// message is never what the reader should pick up next.
     fn latest_assistant_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
         let thread = self.thread.read(cx);
-        let message = thread.entries().iter().rev().find_map(|entry| match entry {
-            AgentThreadEntry::AssistantMessage(message) => Some(message),
-            _ => None,
-        })?;
+        let message = thread
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::AssistantMessage(message) => Some(message),
+                _ => None,
+            })?;
         message.chunks.iter().rev().find_map(|chunk| match chunk {
             AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
             // Thinking is deliberately never spoken.
@@ -1281,6 +1291,109 @@ impl ThreadView {
     #[cfg(test)]
     pub(super) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
         self.read_aloud = Some(read_aloud);
+    }
+
+    /// Floating playback controls for read aloud, docked just above the
+    /// composer and hidden whenever the player has nothing going on. Every
+    /// button routes through the same code paths as the `read_aloud::Toggle`
+    /// and `read_aloud::TogglePause` actions, so behavior stays identical to
+    /// the keyboard.
+    fn render_read_aloud_mini_player(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let read_aloud = self.read_aloud.as_ref()?;
+        let state = read_aloud.read(cx).playback_state(cx)?;
+        let at_start = state.utterance_index == 0;
+        let at_end = state.utterance_index + 1 >= state.utterance_count;
+        let counter = format!("{}/{}", state.utterance_index + 1, state.utterance_count);
+        let play_pause_icon = if state.paused {
+            IconName::PlayFilled
+        } else {
+            IconName::DebugPause
+        };
+
+        Some(
+            // A zero-height anchor: the pill floats above the composer
+            // without shifting the layout when it appears.
+            div()
+                .relative()
+                .w_full()
+                .h_0()
+                .child(
+                    h_flex()
+                        .absolute()
+                        .bottom_2()
+                        .left_0()
+                        .right_0()
+                        .justify_center()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .py_1()
+                                .px_2()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().elevated_surface_background)
+                                .shadow_md()
+                                .child(
+                                    IconButton::new("read-aloud-previous", IconName::ChevronLeft)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(at_start)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(read_aloud) = this.read_aloud.clone() {
+                                                read_aloud.update(cx, |read_aloud, cx| {
+                                                    read_aloud.previous_sentence(cx)
+                                                });
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("read-aloud-play-pause", play_pause_icon)
+                                        .icon_size(IconSize::Small)
+                                        .style(ui::ButtonStyle::Filled)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(read_aloud) = this.read_aloud.clone() {
+                                                read_aloud.update(cx, |read_aloud, cx| {
+                                                    read_aloud.toggle_pause(cx)
+                                                });
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("read-aloud-next", IconName::ChevronRight)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(at_end)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(read_aloud) = this.read_aloud.clone() {
+                                                read_aloud.update(cx, |read_aloud, cx| {
+                                                    read_aloud.next_sentence(cx)
+                                                });
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    div().max_w(rems(16.)).child(
+                                        Label::new(state.sentence_text)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                                )
+                                .child(
+                                    Label::new(counter)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    IconButton::new("read-aloud-stop", IconName::Close)
+                                        .icon_size(IconSize::Small)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_read_aloud(cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Schedule a throttled save of the thread state (draft prompt, scroll position, etc.).
@@ -12406,11 +12519,13 @@ impl Render for ThreadView {
             .on_action(cx.listener(|this, _: &read_aloud::Toggle, _window, cx| {
                 this.toggle_read_aloud(cx);
             }))
-            .on_action(cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
-                if let Some(read_aloud) = this.read_aloud.clone() {
-                    read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
-                }
-            }))
+            .on_action(
+                cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
+                    if let Some(read_aloud) = this.read_aloud.clone() {
+                        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+                    }
+                }),
+            )
             .on_action(cx.listener(
                 |this, _: &super::thread_search_bar::DismissThreadSearch, window, cx| {
                     this.close_thread_search(window, cx);
@@ -12732,6 +12847,7 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
+            .children(self.render_read_aloud_mini_player(cx))
             .child(self.render_message_editor(window, cx))
     }
 }
