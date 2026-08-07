@@ -648,6 +648,11 @@ pub struct ThreadView {
     /// Text-to-speech for assistant prose. `None` until the API key resolves,
     /// and forever when read aloud is disabled, keyless, or has no audio device.
     read_aloud: Option<Entity<read_aloud::ReadAloud>>,
+    /// Entry count when the read-aloud subscription was installed. Entries
+    /// below it are restored history or previous turns — auto-play only ever
+    /// speaks prose that starts streaming while this view is live, so those
+    /// are never enqueued (explicit clicks and buttons still play them).
+    read_aloud_watermark: usize,
 }
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
@@ -1058,6 +1063,7 @@ impl ThreadView {
             thread_search_bar: None,
             thread_search_visible: false,
             read_aloud: None,
+            read_aloud_watermark: 0,
         };
 
         this.init_read_aloud(cx);
@@ -1107,40 +1113,7 @@ impl ThreadView {
             return;
         }
 
-        self._subscriptions.push(cx.subscribe(
-            &self.thread,
-            |this, thread, event: &AcpThreadEvent, cx| match event {
-                AcpThreadEvent::NewEntry => this.enqueue_read_aloud(false, cx),
-                AcpThreadEvent::EntryUpdated(entry_ix) => {
-                    // Tool calls and terminals fire this continuously while
-                    // they stream; re-segmenting the whole message for each
-                    // one would be quadratic foreground work for no change.
-                    let updated_assistant_message = matches!(
-                        thread.read(cx).entries().get(*entry_ix),
-                        Some(AgentThreadEntry::AssistantMessage(_))
-                    );
-                    if updated_assistant_message {
-                        this.enqueue_read_aloud(false, cx);
-                    }
-                }
-                AcpThreadEvent::Stopped(_) => {
-                    // The message is complete: let the segmenter speak the
-                    // trailing block, which it withholds while streaming.
-                    this.enqueue_read_aloud(true, cx);
-                    // The enqueue above is gated on `auto_play`; completeness
-                    // must reach the reader regardless, or a message played
-                    // explicitly during the turn stays flagged incomplete
-                    // forever — leaving the mini player visible after its
-                    // audio drains, with its withheld tail unspoken.
-                    if let Some(read_aloud) = this.read_aloud.clone() {
-                        read_aloud.update(cx, |read_aloud, cx| {
-                            read_aloud.mark_tracked_message_complete(cx);
-                        });
-                    }
-                }
-                _ => {}
-            },
-        ));
+        self.subscribe_read_aloud(cx);
 
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -1203,6 +1176,50 @@ impl ThreadView {
         .detach();
     }
 
+    /// Installs the auto-play subscription, with the watermark that scopes
+    /// auto-play to this view's lifetime: entries that already exist were
+    /// read (or declined) in a previous life of the session, and `NewEntry`
+    /// fires for the user's own reply too — without the watermark, that
+    /// reply would enqueue the newest assistant markdown, which at that
+    /// moment is the *previous* turn's message.
+    fn subscribe_read_aloud(&mut self, cx: &mut Context<Self>) {
+        self.read_aloud_watermark = self.thread.read(cx).entries().len();
+        self._subscriptions.push(cx.subscribe(
+            &self.thread,
+            |this, thread, event: &AcpThreadEvent, cx| match event {
+                AcpThreadEvent::NewEntry => this.enqueue_read_aloud(false, cx),
+                AcpThreadEvent::EntryUpdated(entry_ix) => {
+                    // Tool calls and terminals fire this continuously while
+                    // they stream; re-segmenting the whole message for each
+                    // one would be quadratic foreground work for no change.
+                    let updated_assistant_message = matches!(
+                        thread.read(cx).entries().get(*entry_ix),
+                        Some(AgentThreadEntry::AssistantMessage(_))
+                    );
+                    if updated_assistant_message {
+                        this.enqueue_read_aloud(false, cx);
+                    }
+                }
+                AcpThreadEvent::Stopped(_) => {
+                    // The message is complete: let the segmenter speak the
+                    // trailing block, which it withholds while streaming.
+                    this.enqueue_read_aloud(true, cx);
+                    // The enqueue above is gated on `auto_play`; completeness
+                    // must reach the reader regardless, or a message played
+                    // explicitly during the turn stays flagged incomplete
+                    // forever — leaving the mini player visible after its
+                    // audio drains, with its withheld tail unspoken.
+                    if let Some(read_aloud) = this.read_aloud.clone() {
+                        read_aloud.update(cx, |read_aloud, cx| {
+                            read_aloud.mark_tracked_message_complete(cx);
+                        });
+                    }
+                }
+                _ => {}
+            },
+        ));
+    }
+
     fn notify_read_aloud_disabled(&self, message: String, cx: &mut Context<Self>) {
         log::warn!("read_aloud: disabled: {message}");
         if let Some(workspace) = self.workspace.upgrade() {
@@ -1222,29 +1239,33 @@ impl ThreadView {
     /// message rather than searching further back: an older, already-finished
     /// message is never what the reader should pick up next.
     fn latest_assistant_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
-        Self::latest_assistant_markdown_in(&self.thread, cx)
+        Self::latest_assistant_markdown_in(&self.thread, cx).map(|(_, markdown)| markdown)
     }
 
     /// Associated form of [`Self::latest_assistant_markdown`] for callbacks
-    /// that hold the thread but not the view.
+    /// that hold the thread but not the view, paired with the message's
+    /// entry index (which the auto-play watermark compares against).
     fn latest_assistant_markdown_in(
         thread: &Entity<AcpThread>,
         cx: &App,
-    ) -> Option<Entity<Markdown>> {
+    ) -> Option<(usize, Entity<Markdown>)> {
         let thread = thread.read(cx);
-        let message = thread
-            .entries()
+        let (entry_index, message) = thread.entries().iter().enumerate().rev().find_map(
+            |(entry_index, entry)| match entry {
+                AgentThreadEntry::AssistantMessage(message) => Some((entry_index, message)),
+                _ => None,
+            },
+        )?;
+        message
+            .chunks
             .iter()
             .rev()
-            .find_map(|entry| match entry {
-                AgentThreadEntry::AssistantMessage(message) => Some(message),
-                _ => None,
-            })?;
-        message.chunks.iter().rev().find_map(|chunk| match chunk {
-            AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
-            // Thinking is deliberately never spoken.
-            AssistantMessageChunk::Thought { .. } => None,
-        })
+            .find_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
+                // Thinking is deliberately never spoken.
+                AssistantMessageChunk::Thought { .. } => None,
+            })
+            .map(|markdown| (entry_index, markdown))
     }
 
     /// Hands the latest assistant prose to the reader. Safe to call on every
@@ -1257,9 +1278,17 @@ impl ThreadView {
         if !read_aloud::ReadAloudSettings::get_global(cx).auto_play {
             return;
         }
-        let Some(markdown) = self.latest_assistant_markdown(cx) else {
+        let Some((entry_index, markdown)) = Self::latest_assistant_markdown_in(&self.thread, cx)
+        else {
             return;
         };
+        if entry_index < self.read_aloud_watermark {
+            // Restored history and previous turns are never auto-played;
+            // only prose that starts streaming while this view is live is.
+            // In particular, the user's own reply arrives as a `NewEntry`
+            // whose newest assistant markdown is still the old turn's.
+            return;
+        }
 
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, message_complete, cx);
@@ -1327,6 +1356,14 @@ impl ThreadView {
     #[cfg(test)]
     pub(super) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
         self.read_aloud = Some(read_aloud);
+    }
+
+    /// Installs the real auto-play subscription (with its watermark), which
+    /// `set_read_aloud_for_test` deliberately does not — most tests drive the
+    /// reader explicitly and must not receive auto-play enqueues.
+    #[cfg(test)]
+    pub(super) fn subscribe_read_aloud_for_test(&mut self, cx: &mut Context<Self>) {
+        self.subscribe_read_aloud(cx);
     }
 
     /// Floating playback controls for read aloud, docked just above the
@@ -6755,7 +6792,11 @@ impl ThreadView {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
 
-                let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                // Air for the read-aloud word pill's vertical inflate.
+                // Always on — applying it only during playback would reflow
+                // the whole message the moment speech starts.
+                style.paragraph_line_height = Some(rems(1.45));
                 let message_body = v_flex()
                     .w_full()
                     .gap_3()
@@ -11981,7 +12022,8 @@ impl ThreadView {
                 // and must be flagged so, or the player never hides after
                 // it finishes (no later enqueue corrects the flag).
                 let message_complete = thread.read(cx).status() != ThreadStatus::Generating
-                    || Self::latest_assistant_markdown_in(&thread, cx).as_ref() != Some(&markdown);
+                    || Self::latest_assistant_markdown_in(&thread, cx)
+                        .is_none_or(|(_, latest)| latest != markdown);
                 read_aloud.update(cx, |read_aloud, cx| {
                     read_aloud.seek_to_source_index(&markdown, source_index, message_complete, cx);
                 });

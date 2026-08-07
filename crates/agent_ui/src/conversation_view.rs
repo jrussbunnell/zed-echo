@@ -6595,6 +6595,7 @@ pub(crate) mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             agent_panel::init(cx);
+            read_aloud::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             prompt_store::init(cx)
         });
@@ -7674,6 +7675,81 @@ pub(crate) mod tests {
             reader.read_with(cx, |reader, _| reader.speaking().cloned()),
             Some(older_markdown),
             "the tracked message is unchanged by the stop"
+        );
+    }
+
+    /// Regression: returning to a session and replying used to speak the
+    /// PREVIOUS turn's assistant message — `NewEntry` fires for the user's
+    /// own reply, and the auto-play enqueue targeted the newest assistant
+    /// markdown, which at that moment is the old message. Auto-play must
+    /// only ever speak prose that starts streaming while the view is live.
+    #[gpui::test]
+    async fn test_read_aloud_reopening_a_session_does_not_auto_play_history(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Old answer one.".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("First ask", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // The reader attaches to a view over existing history — the shape of
+        // a reopened session, where the subscription (and its watermark) is
+        // installed after the old turn already exists.
+        let provider = read_aloud::FakeTts::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            |cx| {
+                read_aloud::ReadAloud::for_test(
+                    Arc::new(provider),
+                    Box::new(read_aloud::FakeSink::new()),
+                    cx,
+                )
+            }
+        });
+        thread_view.update(cx, |view, cx| {
+            view.set_read_aloud_for_test(reader.clone());
+            view.subscribe_read_aloud_for_test(cx);
+        });
+
+        // The user replies. The old message must stay silent; the new
+        // turn's prose auto-plays once it streams.
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("New answer one.".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second ask", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            !provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Old answer")),
+            "replying must not speak the previous turn's message, got {:?}",
+            provider.spoken()
+        );
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("New answer")),
+            "the new turn's prose still auto-plays, got {:?}",
+            provider.spoken()
         );
     }
 
