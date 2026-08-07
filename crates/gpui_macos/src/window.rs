@@ -3417,15 +3417,17 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 /// process-wide [`WindowBlurMaterial`] selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum BlurMechanism {
-    VisualEffect {
-        material: NSVisualEffectMaterial,
-        /// Hide the material's desktop tinting and strip its saturation filter, which is
-        /// what `BlurredView` does. Only the legacy `Selection` material asks for this: the
-        /// other materials were picked for how they look with their own tinting intact, and
-        /// the layer surgery would risk removing the layer that carries the frost on the
-        /// Liquid Glass AppKit.
-        remove_material_tinting: bool,
-    },
+    /// A stock `NSVisualEffectView` using `material`, with the material's own tinting left
+    /// alone — the configuration every frosting material was validated in.
+    VisualEffect { material: NSVisualEffectMaterial },
+    /// The legacy `BlurredView` subclass: the `selection` material with its desktop tinting
+    /// hidden and its saturation filter stripped.
+    ///
+    /// The material is part of the subclass rather than a parameter, so the layer surgery
+    /// cannot be requested for any other material. Pairing it with a material it was never
+    /// validated against risks hiding the layer that carries the frost on the Liquid Glass
+    /// AppKit, which is the failure this whole path exists to avoid.
+    DeTintedSelection,
     /// `NSGlassEffectView`, present from macOS 26 on.
     GlassEffect,
     /// The window server's own blur, applied to the window rather than through a view.
@@ -3438,7 +3440,6 @@ enum BlurMechanism {
 /// old and the new AppKit.
 const DEFAULT_BLUR_MECHANISM: BlurMechanism = BlurMechanism::VisualEffect {
     material: NSVisualEffectMaterial::HudWindow,
-    remove_material_tinting: false,
 };
 
 const WINDOW_SERVER_BLUR_RADIUS: c_int = 30;
@@ -3479,10 +3480,7 @@ fn blur_material_from_code(code: u8) -> WindowBlurMaterial {
 }
 
 fn resolve_blur_mechanism() -> BlurMechanism {
-    let stock_visual_effect = |material| BlurMechanism::VisualEffect {
-        material,
-        remove_material_tinting: false,
-    };
+    let stock_visual_effect = |material| BlurMechanism::VisualEffect { material };
 
     match blur_material_from_code(WINDOW_BLUR_MATERIAL.load(Ordering::Relaxed)) {
         WindowBlurMaterial::Default | WindowBlurMaterial::HudWindow => DEFAULT_BLUR_MECHANISM,
@@ -3494,10 +3492,7 @@ fn resolve_blur_mechanism() -> BlurMechanism {
             stock_visual_effect(NSVisualEffectMaterial::UnderWindowBackground)
         }
         WindowBlurMaterial::Sidebar => stock_visual_effect(NSVisualEffectMaterial::Sidebar),
-        WindowBlurMaterial::Selection => BlurMechanism::VisualEffect {
-            material: NSVisualEffectMaterial::Selection,
-            remove_material_tinting: true,
-        },
+        WindowBlurMaterial::Selection => BlurMechanism::DeTintedSelection,
         WindowBlurMaterial::GlassEffect => {
             if glass_effect_view_class().is_some() {
                 BlurMechanism::GlassEffect
@@ -3584,15 +3579,13 @@ unsafe fn install_blur(window_state: &mut MacWindowState, mechanism: BlurMechani
         let frame = NSView::bounds(content_view);
 
         let blur_view: id = match mechanism {
-            BlurMechanism::VisualEffect {
-                remove_material_tinting: true,
-                ..
-            } => {
-                // `BlurredView` sets its own material and performs the layer surgery.
+            BlurMechanism::DeTintedSelection => {
+                // `BlurredView` sets the `selection` material itself and performs the layer
+                // surgery in its `updateLayer`.
                 let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
                 NSView::initWithFrame_(view, frame)
             }
-            BlurMechanism::VisualEffect { material, .. } => {
+            BlurMechanism::VisualEffect { material } => {
                 let view: id = msg_send![class!(NSVisualEffectView), alloc];
                 let view = NSView::initWithFrame_(view, frame);
                 if !view.is_null() {
@@ -3876,6 +3869,65 @@ mod tests {
 
     #[test]
     fn unknown_blur_material_codes_fall_back_to_the_default() {
-        assert_eq!(blur_material_from_code(u8::MAX), WindowBlurMaterial::Default);
+        assert_eq!(
+            blur_material_from_code(u8::MAX),
+            WindowBlurMaterial::Default
+        );
+    }
+
+    // Every selected material must survive the trip to the effect view. The layer surgery
+    // belongs to `DeTintedSelection` alone, which carries no material of its own, so a
+    // material can never be silently swapped for `selection` on the way through.
+    // `GlassEffect` and `WindowServer` are left out: they resolve against what the running
+    // macOS provides.
+    #[test]
+    fn resolved_blur_mechanisms_keep_the_requested_material() {
+        for (selected, expected) in [
+            (
+                WindowBlurMaterial::Default,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::HudWindow,
+                },
+            ),
+            (
+                WindowBlurMaterial::HudWindow,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::HudWindow,
+                },
+            ),
+            (
+                WindowBlurMaterial::FullScreenUi,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::FullScreenUI,
+                },
+            ),
+            (
+                WindowBlurMaterial::Menu,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::Menu,
+                },
+            ),
+            (
+                WindowBlurMaterial::UnderWindowBackground,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::UnderWindowBackground,
+                },
+            ),
+            (
+                WindowBlurMaterial::Sidebar,
+                BlurMechanism::VisualEffect {
+                    material: NSVisualEffectMaterial::Sidebar,
+                },
+            ),
+            (
+                WindowBlurMaterial::Selection,
+                BlurMechanism::DeTintedSelection,
+            ),
+        ] {
+            set_window_blur_material(selected);
+            assert_eq!(resolve_blur_mechanism(), expected, "for {selected:?}");
+        }
+
+        set_window_blur_material(WindowBlurMaterial::Default);
     }
 }
