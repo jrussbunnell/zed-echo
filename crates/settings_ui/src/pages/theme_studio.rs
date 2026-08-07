@@ -432,6 +432,38 @@ fn parse_color_or(text: Option<&str>, fallback: Hsla) -> Hsla {
         .unwrap_or(fallback)
 }
 
+/// A setting split into what the user actually wrote and what the app resolves.
+pub(crate) struct SettingLayers<T> {
+    /// Present only when the user's own settings file sets this key. Drives the
+    /// "customized" styling and whether a reset control is offered.
+    pub user: Option<T>,
+    /// What the app currently uses, wherever it came from. Drives the swatch.
+    pub resolved: Option<T>,
+}
+
+/// Splits a setting into its user-set and resolved values.
+///
+/// `SettingsStore::get_value_from_file` walks *past* the requested file down to
+/// the defaults layer and reports which layer answered, so its value alone
+/// cannot say whether the user set anything: `default.json` ships a
+/// `read_aloud.pill_colors` palette, and treating that as a user override made
+/// both pill rows render as customized and their reset button write a key
+/// instead of clearing one.
+fn setting_layers<T: Clone + 'static>(
+    read: fn(&settings::SettingsContent) -> Option<&T>,
+    cx: &App,
+) -> SettingLayers<T> {
+    let (source_file, value) = settings::SettingsStore::global(cx)
+        .get_value_from_file(SettingsUiFile::User.to_settings(), read);
+    let resolved = value.cloned();
+    let user = if source_file == settings::SettingsFile::User {
+        resolved.clone()
+    } else {
+        None
+    };
+    SettingLayers { user, resolved }
+}
+
 /// Applies `mutate` to the current theme's override entry in the user settings
 /// file. The edit is targeted at that entry, leaving the rest of settings.json
 /// untouched.
@@ -1384,14 +1416,10 @@ fn render_font_family_row(
     access: AgentPanelStringAccess,
     cx: &mut App,
 ) -> AnyElement {
-    let read = access.read;
     let write = access.write;
-    let current = settings::SettingsStore::global(cx)
-        .get_value_from_file(SettingsUiFile::User.to_settings(), read)
-        .1
-        .cloned();
-    let is_set = current.is_some();
-    let current_font = SharedString::from(current.unwrap_or_default());
+    let layers = setting_layers(access.read, cx);
+    let is_set = layers.user.is_some();
+    let current_font = SharedString::from(layers.resolved.unwrap_or_default());
     let handle = ui::PopoverMenuHandle::default();
 
     h_flex()
@@ -1500,11 +1528,17 @@ fn render_agent_panel_section(
             cx,
         ));
         for (is_background, label) in [(false, "Text Color"), (true, "Background")] {
+            let fallback = if is_background {
+                cx.theme().colors().panel_background
+            } else {
+                cx.theme().colors().text
+            };
             children.push(render_settings_color_row(
                 settings_window,
                 SharedString::from(format!("agent:{group}:{label}")),
                 SharedString::new_static(label),
                 agent_panel_color_access(group, is_background),
+                fallback,
                 cx,
             ));
         }
@@ -1523,16 +1557,13 @@ fn render_settings_color_row(
     row_id: EditingRowId,
     label: SharedString,
     access: AgentPanelStringAccess,
+    fallback: Hsla,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
-    let read = access.read;
     let write = access.write;
-    let override_value = settings::SettingsStore::global(cx)
-        .get_value_from_file(SettingsUiFile::User.to_settings(), read)
-        .1
-        .cloned();
-    let fallback = cx.theme().colors().text;
-    let effective = parse_color_or(override_value.as_deref(), fallback);
+    let layers = setting_layers(access.read, cx);
+    let override_value = layers.user;
+    let effective = parse_color_or(layers.resolved.as_deref(), fallback);
 
     let commit = Rc::new(
         move |value: Option<String>, window: &mut Window, cx: &mut App| {
@@ -1681,24 +1712,34 @@ fn render_read_aloud_section(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
-    let configured = settings::SettingsStore::global(cx)
-        .get_value_from_file(SettingsUiFile::User.to_settings(), |settings_content| {
-            settings_content.read_aloud.as_ref()?.pill_colors.as_ref()
-        })
-        .1
-        .cloned();
-    let slots = pill_color_slots(configured.as_ref());
-    let default_pill_colors = [cx.theme().colors().text_accent, cx.theme().status().info];
+    let layers = setting_layers(
+        |settings_content| settings_content.read_aloud.as_ref()?.pill_colors.as_ref(),
+        cx,
+    );
+    let user_slots = pill_color_slots(layers.user.as_ref());
+    let resolved_slots = pill_color_slots(layers.resolved.as_ref());
+    let swatch_fallback = [cx.theme().colors().text_accent, cx.theme().status().info];
 
-    let pill_rows = slots
+    let pill_rows = user_slots
         .into_iter()
         .enumerate()
         .map(|(slot, override_value)| {
-            let effective = parse_color_or(override_value.as_deref(), default_pill_colors[slot]);
-            let configured = configured.clone();
+            let effective = parse_color_or(resolved_slots[slot].as_deref(), swatch_fallback[slot]);
+            let user_colors = layers.user.clone();
+            let resolved_colors = layers.resolved.clone();
             let commit = Rc::new(
                 move |value: Option<String>, window: &mut Window, cx: &mut App| {
-                    let colors = pill_colors_after_edit(configured.as_ref(), slot, value);
+                    // Setting a color starts from what is on screen, so customizing
+                    // one end of the default gradient keeps the other end. Clearing
+                    // one starts from what the user actually set, so clearing the
+                    // last of their colors removes the key instead of writing the
+                    // defaults back in as an override.
+                    let base = if value.is_some() {
+                        resolved_colors.clone()
+                    } else {
+                        user_colors.clone()
+                    };
+                    let colors = pill_colors_after_edit(base.as_ref(), slot, value);
                     update_settings_file(
                         SettingsUiFile::User,
                         Some("read_aloud.pill_colors"),
@@ -1907,22 +1948,86 @@ mod tests {
         assert!(style.window_background_appearance.is_none());
     }
 
+    /// Regression guard for the whole table, not a sample of it.
+    ///
+    /// The macro proves each Rust field exists, but nothing proves the literal
+    /// key string still matches that field's `#[serde(rename)]`. If an upstream
+    /// rebase renames a field, or a hand-edit pairs a key with the wrong one,
+    /// Theme Studio would write dead or wrong keys into the user's real
+    /// settings.json and every control for that token would silently do
+    /// nothing. Both directions fail this test.
     #[test]
-    fn writing_a_token_serializes_to_exactly_one_json_key() {
-        let token = all_color_tokens()
-            .find(|token| token.key == "terminal.ansi.red")
-            .expect("terminal.ansi.red exists");
-        let mut style = ThemeStyleContent::default();
-        (token.write)(&mut style, Some(ThemeColor::from("#ABCDEF")));
+    fn every_token_writes_and_reads_back_exactly_its_own_json_key() {
+        const SENTINEL: &str = "#ABCDEF";
+        for token in all_color_tokens() {
+            let mut style = ThemeStyleContent::default();
+            (token.write)(&mut style, Some(ThemeColor::from(SENTINEL)));
 
-        let value = serde_json::to_value(&style).expect("style content serializes");
-        let object = value.as_object().expect("style content is a JSON object");
-        assert_eq!(
-            object.keys().collect::<Vec<_>>(),
-            vec!["terminal.ansi.red"],
-            "only the edited token should appear in the serialized override"
+            let value = serde_json::to_value(&style).expect("style content serializes");
+            let object = value.as_object().expect("style content is a JSON object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                vec![token.key],
+                "token {} should serialize to exactly its own JSON key",
+                token.key
+            );
+            assert_eq!(object[token.key], serde_json::json!(SENTINEL));
+
+            let round_tripped: ThemeStyleContent =
+                serde_json::from_value(value).expect("the override deserializes");
+            assert_eq!(
+                (token.read)(&round_tripped).map(ToString::to_string),
+                Some(SENTINEL.to_string()),
+                "token {} should read back from the field it was written to",
+                token.key
+            );
+        }
+    }
+
+    /// `default.json` ships a `read_aloud.pill_colors` palette, and
+    /// `get_value_from_file` falls through to that layer. Treating its answer as
+    /// a user override made both pill rows render as customized and their reset
+    /// button write a key rather than clear one.
+    #[gpui::test]
+    fn defaults_are_not_reported_as_user_customizations(cx: &mut App) {
+        // Deliberately the real defaults file, so this tracks whatever palette
+        // actually ships rather than a synthetic stand-in.
+        let mut store = settings::SettingsStore::new(cx, &settings::default_settings());
+        store
+            .set_user_settings("{}", cx)
+            .expect("empty user settings parse");
+        cx.set_global(store);
+
+        fn pill_colors(settings_content: &settings::SettingsContent) -> Option<&Vec<String>> {
+            settings_content.read_aloud.as_ref()?.pill_colors.as_ref()
+        }
+
+        let layers = setting_layers(pill_colors, cx);
+        assert!(
+            layers.resolved.is_some(),
+            "premise of this test: default.json ships a pill_colors palette"
         );
-        assert_eq!(object["terminal.ansi.red"], serde_json::json!("#ABCDEF"));
+        assert_eq!(
+            layers.user, None,
+            "a user who never set pill_colors has no override"
+        );
+
+        // With no user value, clearing a slot must not write the defaults back
+        // in as an override.
+        assert_eq!(pill_colors_after_edit(layers.user.as_ref(), 0, None), None);
+
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(r##"{ "read_aloud": { "pill_colors": ["#111111"] } }"##, cx)
+                .expect("user settings parse");
+        });
+
+        let layers = setting_layers(pill_colors, cx);
+        assert_eq!(
+            layers.user,
+            Some(vec!["#111111".to_string()]),
+            "a value the user did set is reported as an override"
+        );
     }
 
     /// The real write path: an edit must land at
