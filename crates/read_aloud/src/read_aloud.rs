@@ -215,6 +215,15 @@ impl ReadAloud {
                 // restart plays the message the user actually sees.
                 self.clear_highlight(cx);
                 self.speaking = Some(markdown.clone());
+                // Completion state and the parse observation are per-entity,
+                // exactly as in `switch_to`. Without re-homing them here, a
+                // completion parked against this entity's lagging parse
+                // would wait on a notification from the *previous* entity —
+                // which never comes — leaving the message incomplete: its
+                // withheld tail unspoken on replay, and the controls never
+                // hiding after the audio drained.
+                self.pending_completion = false;
+                self.observe_speaking_parse(markdown, cx);
                 self.track_quietly(message_complete, cx);
                 return;
             }
@@ -284,15 +293,7 @@ impl ReadAloud {
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
-        self.speaking_parse_observation = Some(cx.observe(&markdown, |this, markdown, cx| {
-            if this.pending_completion
-                && this.speaking.as_ref() == Some(&markdown)
-                && Self::parse_is_current(&markdown, cx)
-            {
-                this.pending_completion = false;
-                this.mark_tracked_message_complete(cx);
-            }
-        }));
+        self.observe_speaking_parse(&markdown, cx);
         let message_complete = self.resolve_completeness(&markdown, message_complete, cx);
         self.message_complete = message_complete;
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
@@ -344,10 +345,27 @@ impl ReadAloud {
         self.start_polling(cx);
     }
 
+    /// Watches the newly tracked entity so a completion parked against its
+    /// lagging parse (`pending_completion`) is re-delivered when the parse
+    /// lands. Must be installed wherever `speaking` is assigned: an
+    /// observation left on a previous entity waits on a notification that
+    /// never comes.
+    fn observe_speaking_parse(&mut self, markdown: &Entity<Markdown>, cx: &mut Context<Self>) {
+        self.speaking_parse_observation = Some(cx.observe(markdown, |this, markdown, cx| {
+            if this.pending_completion
+                && this.speaking.as_ref() == Some(&markdown)
+                && Self::parse_is_current(&markdown, cx)
+            {
+                this.pending_completion = false;
+                this.mark_tracked_message_complete(cx);
+            }
+        }));
+    }
+
     /// Resolves the completeness to segment with. Completion against a parse
     /// that still lags the source is deferred — `pending_completion` holds it
     /// (surviving later incomplete enqueues) until the parse catches up and
-    /// the observation in `switch_to` re-delivers it.
+    /// the observation installed by `observe_speaking_parse` re-delivers it.
     fn resolve_completeness(
         &mut self,
         markdown: &Entity<Markdown>,
@@ -2045,6 +2063,72 @@ mod tests {
             ],
             "the sentence must be spoken whole once the parse catches up — \
              never finalized at the stale parse's chunk boundary"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_parked_completion_survives_a_stop_latched_entity_switch(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+
+        // The turn continues while stopped: the next block arrives and is
+        // tracked quietly (the stop-latched switch path).
+        markdown_b.update(cx, |markdown, cx| {
+            markdown.append("Alpha. And then I", cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        // Its final chunk and the turn's end land in one burst, while the
+        // background parse still lags: the completion parks. When the parse
+        // lands, the observation must deliver it — for THIS entity, not the
+        // one that was speaking before the stop.
+        markdown_b.update(cx, |markdown, cx| {
+            markdown.append(" will finish.", cx);
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, true, cx);
+        });
+        cx.run_until_parked();
+
+        // Replay from the stopped form (the mini player's play button routes
+        // through toggle's restart arm).
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        assert!(
+            provider
+                .spoken()
+                .ends_with(&["Alpha.".to_string(), "And then I will finish.".to_string()]),
+            "the replay must speak the delivered tail, not the parked cut, got {:?}",
+            provider.spoken()
+        );
+
+        sink.finish_one();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "the delivered completion lets the controls hide once the audio drains"
         );
     }
 }

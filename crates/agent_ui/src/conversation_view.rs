@@ -7753,6 +7753,102 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression: `EntriesRemoved` (user-message rewind, refusal
+    /// truncation) shifts later entry indices down, and an unclamped
+    /// auto-play watermark then sits above the regenerated turn's entries —
+    /// silently disabling auto-play until the entry count outgrows it.
+    #[gpui::test]
+    async fn test_read_aloud_auto_play_survives_a_rewind(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Old answer one.".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("First ask", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Middle answer one.".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second ask", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Subscribe over the four existing entries: watermark = 4.
+        let provider = read_aloud::FakeTts::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            |cx| {
+                read_aloud::ReadAloud::for_test(
+                    Arc::new(provider),
+                    Box::new(read_aloud::FakeSink::new()),
+                    cx,
+                )
+            }
+        });
+        thread_view.update(cx, |view, cx| {
+            view.set_read_aloud_for_test(reader.clone());
+            view.subscribe_read_aloud_for_test(cx);
+        });
+
+        // The user edits their second message: the thread truncates to two
+        // entries and the regenerated turn lands at indices 2–3, below the
+        // stale watermark.
+        let second_user_message_id = thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries().len(), 4);
+            let AgentThreadEntry::UserMessage(user_message) = &thread.entries()[2] else {
+                panic!("entry 2 should be the second user message");
+            };
+            user_message
+                .client_id
+                .clone()
+                .expect("stub user messages carry client ids")
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_user_message_id, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| assert_eq!(thread.entries().len(), 2));
+
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Regenerated answer one.".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second ask, edited", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Regenerated answer")),
+            "the regenerated turn must auto-play after a rewind, got {:?}",
+            provider.spoken()
+        );
+        assert!(
+            !provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Old answer") || text.contains("Middle answer")),
+            "history must still never auto-play, got {:?}",
+            provider.spoken()
+        );
+    }
+
     #[gpui::test]
     async fn test_thread_search_dismiss_clears_highlights(cx: &mut TestAppContext) {
         init_test(cx);

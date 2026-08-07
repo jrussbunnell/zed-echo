@@ -1215,6 +1215,13 @@ impl ThreadView {
                         });
                     }
                 }
+                AcpThreadEvent::EntriesRemoved(range) => {
+                    // A rewind or refusal truncation shifts every later
+                    // entry down; a stale watermark above the regenerated
+                    // turn's indices would silently disable auto-play for
+                    // every turn until the count grew past it again.
+                    this.read_aloud_watermark = this.read_aloud_watermark.min(range.start);
+                }
                 _ => {}
             },
         ));
