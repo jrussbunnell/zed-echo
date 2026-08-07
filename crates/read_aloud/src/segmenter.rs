@@ -198,11 +198,9 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
 
 /// How an inline code span should sound, if at all. `None` skips the span.
 /// The bar is "would a human reading this aloud say the token, or gesture at
-/// it?" — names get spoken (with `_`/`-` as word separators), while paths,
-/// expressions, flags, hashes, and URLs get gestured at.
+/// it?" — only word-like names get spoken (with `_`/`-` as word separators),
+/// while paths, expressions, flags, hashes, and URLs get gestured at.
 fn spoken_inline_code(content: &str) -> Option<String> {
-    /// Substrings that mark a span as code to gesture at, not prose to say.
-    const CODE_SIGNALS: &[&str] = &["/", "\\", "::", "(", ")", "=", "\"", "'", "`"];
     /// A token this long without a space is an identifier nobody says aloud.
     const MAX_TOKEN_LENGTH: usize = 20;
     /// More words than this reads as a code phrase, not a name.
@@ -212,15 +210,13 @@ fn spoken_inline_code(content: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if CODE_SIGNALS.iter().any(|signal| trimmed.contains(signal)) {
-        return None;
-    }
-    // `player.rs:250`-style line suffixes.
-    let bytes = trimmed.as_bytes();
-    if bytes
-        .iter()
-        .enumerate()
-        .any(|(index, byte)| *byte == b':' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit))
+    // Word-like is an allowlist, not a blocklist: any character outside
+    // letters/digits/`_`/`-`/spaces (`<`, `&`, `[`, `/`, `=`, `.`, `:`, ...)
+    // marks the span as code to skip, so `Vec<String>`, `&mut self`, or
+    // `player.rs:250` can never leak into the audio as character soup.
+    if !trimmed
+        .chars()
+        .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-' | ' '))
     {
         return None;
     }
@@ -228,7 +224,6 @@ fn spoken_inline_code(content: &str) -> Option<String> {
         if token.len() >= MAX_TOKEN_LENGTH
             || token.starts_with('-') // CLI flags: -p, --foo
             || is_hash_like(token)
-            || looks_file_like(token)
         {
             return None;
         }
@@ -257,28 +252,6 @@ fn is_hash_like(token: &str) -> bool {
         && token
             .chars()
             .any(|character| character.is_ascii_alphabetic())
-}
-
-/// `main.rs`, `.gitignore`, `settings.json` — a dot wired into a token the
-/// way file names have them.
-fn looks_file_like(token: &str) -> bool {
-    if token.starts_with('.') && token.len() > 1 {
-        return true;
-    }
-    let Some(dot) = token.rfind('.') else {
-        return false;
-    };
-    let extension = &token[dot + 1..];
-    token[..dot]
-        .chars()
-        .next_back()
-        .is_some_and(|character| character.is_ascii_alphanumeric())
-        && !extension.is_empty()
-        && extension.len() <= 5
-        && extension.starts_with(|character: char| character.is_ascii_alphabetic())
-        && extension
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
 }
 
 /// True when any enclosing tag makes the text non-prose.
@@ -693,6 +666,11 @@ mod tests {
             ),
             vec!["Set speaking rate and read aloud and enabled now."]
         );
+        assert_eq!(
+            spoken("Try `git status` first.\n", cx),
+            vec!["Try git status first."],
+            "short multi-word spans made of plain words are still names"
+        );
     }
 
     #[gpui::test]
@@ -711,6 +689,16 @@ mod tests {
         assert_eq!(
             spoken("Check `main.rs` and `let x = 1` here.\n", cx),
             vec!["Check and here."]
+        );
+        // Word-like is an allowlist: one character outside it is enough to
+        // mark the span as code, even without a classic path/flag signal.
+        assert_eq!(
+            spoken("Use `Vec<String>` or `&mut self` or `vec[0]` here.\n", cx),
+            vec!["Use or or here."]
+        );
+        assert_eq!(
+            spoken("Read `$HOME` and `x | y` and `a + b*c` now.\n", cx),
+            vec!["Read and and now."]
         );
     }
 

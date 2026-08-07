@@ -165,6 +165,23 @@ impl ReadAloud {
     ) {
         let switched_entity = self.speaking.as_ref() != Some(markdown);
         if switched_entity {
+            if self.stopped_by_user {
+                // The user's stop outlives the block that was sounding when
+                // they pressed it: one agent turn keeps arriving as fresh
+                // entities (a new one after every tool call), and none of
+                // them may restart speech — only `toggle` or a seek lifts
+                // the latch. The newest entity is still tracked (quietly,
+                // with the player left empty and silent) so an explicit
+                // toggle later restarts from the message the user actually
+                // sees, exactly as it does after a same-entity stop.
+                self.clear_highlight(cx);
+                self.speaking = Some(markdown.clone());
+                self.player.update(cx, |player, cx| {
+                    player.set_utterances(Vec::new(), cx);
+                    player.reset(cx);
+                });
+                return;
+            }
             if self.speaking.is_some() && !self.player.read(cx).is_idle() {
                 if let Some(entry) = self
                     .pending
@@ -1123,6 +1140,87 @@ mod tests {
             provider.spoken(),
             spoken_when_stopped,
             "the queued message must not speak after a stop"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_stop_sticks_while_the_next_block_keeps_streaming(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha. ".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+
+        // The turn keeps going: the block that was waiting its turn streams
+        // more chunks, each re-entering `enqueue_markdown` as a *different*
+        // entity against a now-idle player. None of that may undo the stop.
+        markdown_b.update(cx, |markdown, cx| markdown.append("Beta.\n", cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, true, cx);
+        });
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        assert!(
+            !read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "a stop must survive the rest of the turn arriving as new entities"
+        );
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_stopped,
+            "nothing new may be synthesized while stopped"
+        );
+        assert_eq!(
+            markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            None,
+            "and nothing may be highlighted"
+        );
+
+        // An explicit toggle afterwards restarts from the newest message —
+        // the view layer's toggle path calls `toggle` then re-enqueues, and
+        // the quiet tracking above made B the loaded message.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.toggle(cx);
+            read_aloud.enqueue_markdown(&markdown_b, true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "toggling back on must still work after the stop stuck"
+        );
+        assert!(
+            provider
+                .spoken()
+                .ends_with(&["Alpha.".to_string(), "Beta.".to_string()]),
+            "the restart reads the newest message from its top, got {:?}",
+            provider.spoken()
+        );
+        assert_eq!(
+            markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..6)
         );
     }
 
