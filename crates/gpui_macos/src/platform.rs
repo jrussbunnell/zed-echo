@@ -32,8 +32,8 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance,
+    WindowBlurMaterial, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -699,6 +699,10 @@ impl Platform for MacPlatform {
             };
             let _: () = msg_send![app, setAppearance: ns_appearance];
         }
+    }
+
+    fn set_window_blur_material(&self, material: WindowBlurMaterial) {
+        crate::window::set_window_blur_material(material);
     }
 
     fn open_url(&self, url: &str) {

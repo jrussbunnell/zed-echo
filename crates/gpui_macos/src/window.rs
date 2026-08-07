@@ -11,9 +11,10 @@ use cocoa::{
     appkit::{
         NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
         NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
-        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
-        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode,
+        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
+        NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -29,8 +30,8 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    WindowAppearance, WindowBackgroundAppearance, WindowBlurMaterial, WindowBounds,
+    WindowControlArea, WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -60,7 +61,7 @@ use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
     cell::Cell,
-    ffi::{CStr, CString, c_void},
+    ffi::{CStr, CString, c_int, c_void},
     mem,
     ops::Range,
     os::unix::ffi::OsStrExt,
@@ -68,8 +69,8 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        Arc, Once, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -591,6 +592,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    applied_blur: Option<BlurMechanism>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -1013,6 +1015,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                applied_blur: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1664,26 +1667,16 @@ impl PlatformWindow for MacWindow {
                 NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
             };
             this.native_window.setBackgroundColor_(background_color);
+        }
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
-                if let Some(blur_view) = this.blurred_view {
-                    NSView::removeFromSuperview(blur_view);
-                    this.blurred_view = None;
+        let requested_blur = (background_appearance == WindowBackgroundAppearance::Blurred)
+            .then(resolve_blur_mechanism);
+        if requested_blur != this.applied_blur {
+            unsafe {
+                remove_blur(&mut this);
+                if let Some(mechanism) = requested_blur {
+                    apply_blur(&mut this, mechanism);
                 }
-            } else if this.blurred_view.is_none() {
-                let content_view = this.native_window.contentView();
-                let frame = NSView::bounds(content_view);
-                let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
-                blur_view = NSView::initWithFrame_(blur_view, frame);
-                blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
-
-                let _: () = msg_send![
-                    content_view,
-                    addSubview: blur_view
-                    positioned: NSWindowOrderingMode::NSWindowBelow
-                    relativeTo: nil
-                ];
-                this.blurred_view = Some(blur_view.autorelease());
             }
         }
     }
@@ -3420,6 +3413,287 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
     }
 }
 
+/// How a window's `Blurred` background appearance is realized, resolved from the
+/// process-wide [`WindowBlurMaterial`] selection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BlurMechanism {
+    VisualEffect {
+        material: NSVisualEffectMaterial,
+        /// Hide the material's desktop tinting and strip its saturation filter, which is
+        /// what `BlurredView` does. Only the legacy `Selection` material asks for this: the
+        /// other materials were picked for how they look with their own tinting intact, and
+        /// the layer surgery would risk removing the layer that carries the frost on the
+        /// Liquid Glass AppKit.
+        remove_material_tinting: bool,
+    },
+    /// `NSGlassEffectView`, present from macOS 26 on.
+    GlassEffect,
+    /// The window server's own blur, applied to the window rather than through a view.
+    WindowServer { radius: c_int },
+}
+
+/// `hudWindow` rather than the `selection` material gpui historically used: `selection`
+/// stopped compositing behind-window content in binaries linked against the macOS 26 SDK,
+/// leaving blurred themes merely transparent, while `hudWindow` still frosts on both the
+/// old and the new AppKit.
+const DEFAULT_BLUR_MECHANISM: BlurMechanism = BlurMechanism::VisualEffect {
+    material: NSVisualEffectMaterial::HudWindow,
+    remove_material_tinting: false,
+};
+
+const WINDOW_SERVER_BLUR_RADIUS: c_int = 30;
+
+static WINDOW_BLUR_MATERIAL: AtomicU8 =
+    AtomicU8::new(blur_material_code(WindowBlurMaterial::Default));
+
+pub(crate) fn set_window_blur_material(material: WindowBlurMaterial) {
+    WINDOW_BLUR_MATERIAL.store(blur_material_code(material), Ordering::Relaxed);
+}
+
+const fn blur_material_code(material: WindowBlurMaterial) -> u8 {
+    match material {
+        WindowBlurMaterial::Default => 0,
+        WindowBlurMaterial::HudWindow => 1,
+        WindowBlurMaterial::FullScreenUi => 2,
+        WindowBlurMaterial::Menu => 3,
+        WindowBlurMaterial::UnderWindowBackground => 4,
+        WindowBlurMaterial::Sidebar => 5,
+        WindowBlurMaterial::Selection => 6,
+        WindowBlurMaterial::GlassEffect => 7,
+        WindowBlurMaterial::WindowServer => 8,
+    }
+}
+
+fn blur_material_from_code(code: u8) -> WindowBlurMaterial {
+    match code {
+        1 => WindowBlurMaterial::HudWindow,
+        2 => WindowBlurMaterial::FullScreenUi,
+        3 => WindowBlurMaterial::Menu,
+        4 => WindowBlurMaterial::UnderWindowBackground,
+        5 => WindowBlurMaterial::Sidebar,
+        6 => WindowBlurMaterial::Selection,
+        7 => WindowBlurMaterial::GlassEffect,
+        8 => WindowBlurMaterial::WindowServer,
+        _ => WindowBlurMaterial::Default,
+    }
+}
+
+fn resolve_blur_mechanism() -> BlurMechanism {
+    let stock_visual_effect = |material| BlurMechanism::VisualEffect {
+        material,
+        remove_material_tinting: false,
+    };
+
+    match blur_material_from_code(WINDOW_BLUR_MATERIAL.load(Ordering::Relaxed)) {
+        WindowBlurMaterial::Default | WindowBlurMaterial::HudWindow => DEFAULT_BLUR_MECHANISM,
+        WindowBlurMaterial::FullScreenUi => {
+            stock_visual_effect(NSVisualEffectMaterial::FullScreenUI)
+        }
+        WindowBlurMaterial::Menu => stock_visual_effect(NSVisualEffectMaterial::Menu),
+        WindowBlurMaterial::UnderWindowBackground => {
+            stock_visual_effect(NSVisualEffectMaterial::UnderWindowBackground)
+        }
+        WindowBlurMaterial::Sidebar => stock_visual_effect(NSVisualEffectMaterial::Sidebar),
+        WindowBlurMaterial::Selection => BlurMechanism::VisualEffect {
+            material: NSVisualEffectMaterial::Selection,
+            remove_material_tinting: true,
+        },
+        WindowBlurMaterial::GlassEffect => {
+            if glass_effect_view_class().is_some() {
+                BlurMechanism::GlassEffect
+            } else {
+                static WARNED: Once = Once::new();
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "the glass_effect window blur material needs NSGlassEffectView, \
+                         which this macOS does not have; using the default material"
+                    )
+                });
+                DEFAULT_BLUR_MECHANISM
+            }
+        }
+        WindowBlurMaterial::WindowServer => {
+            if window_server_blur().is_some() {
+                BlurMechanism::WindowServer {
+                    radius: WINDOW_SERVER_BLUR_RADIUS,
+                }
+            } else {
+                static WARNED: Once = Once::new();
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "the window_server window blur material needs private CoreGraphics \
+                         symbols that this macOS does not export; using the default material"
+                    )
+                });
+                DEFAULT_BLUR_MECHANISM
+            }
+        }
+    }
+}
+
+fn glass_effect_view_class() -> Option<&'static Class> {
+    Class::get("NSGlassEffectView")
+}
+
+/// Removes whatever blur is currently installed, leaving the window with none.
+unsafe fn remove_blur(window_state: &mut MacWindowState) {
+    unsafe {
+        if let Some(blur_view) = window_state.blurred_view.take() {
+            NSView::removeFromSuperview(blur_view);
+        }
+        if let Some(BlurMechanism::WindowServer { .. }) = window_state.applied_blur
+            && !set_window_server_blur_radius(window_state.native_window, 0)
+        {
+            // Radius 0 is how the window-server blur is cleared; without it the blur would
+            // outlive a switch to an opaque or plain-transparent appearance.
+            log::warn!("failed to clear the window-server background blur");
+        }
+        window_state.applied_blur = None;
+    }
+}
+
+/// Installs `mechanism`, falling back to [`DEFAULT_BLUR_MECHANISM`] if it cannot be applied
+/// to this window, so a blurred window is never left unstyled.
+unsafe fn apply_blur(window_state: &mut MacWindowState, mechanism: BlurMechanism) {
+    if unsafe { install_blur(window_state, mechanism) } {
+        window_state.applied_blur = Some(mechanism);
+        return;
+    }
+
+    if mechanism == DEFAULT_BLUR_MECHANISM {
+        return;
+    }
+    log::warn!("could not apply the {mechanism:?} window blur; using the default material");
+    if unsafe { install_blur(window_state, DEFAULT_BLUR_MECHANISM) } {
+        window_state.applied_blur = Some(DEFAULT_BLUR_MECHANISM);
+    }
+}
+
+/// Returns whether the mechanism was applied. Only touches `blurred_view`, so a caller that
+/// gets `false` back can try another mechanism without leaking a view.
+unsafe fn install_blur(window_state: &mut MacWindowState, mechanism: BlurMechanism) -> bool {
+    unsafe {
+        if let BlurMechanism::WindowServer { radius } = mechanism {
+            return set_window_server_blur_radius(window_state.native_window, radius);
+        }
+
+        let content_view = window_state.native_window.contentView();
+        if content_view.is_null() {
+            return false;
+        }
+        let frame = NSView::bounds(content_view);
+
+        let blur_view: id = match mechanism {
+            BlurMechanism::VisualEffect {
+                remove_material_tinting: true,
+                ..
+            } => {
+                // `BlurredView` sets its own material and performs the layer surgery.
+                let view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+                NSView::initWithFrame_(view, frame)
+            }
+            BlurMechanism::VisualEffect { material, .. } => {
+                let view: id = msg_send![class!(NSVisualEffectView), alloc];
+                let view = NSView::initWithFrame_(view, frame);
+                if !view.is_null() {
+                    NSVisualEffectView::setMaterial_(view, material);
+                    NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+                    let _: () = msg_send![
+                        view,
+                        setBlendingMode: NSVisualEffectBlendingMode::BehindWindow
+                    ];
+                }
+                view
+            }
+            BlurMechanism::GlassEffect => match glass_effect_view_class() {
+                Some(glass_class) => {
+                    let view: id = msg_send![glass_class, alloc];
+                    NSView::initWithFrame_(view, frame)
+                }
+                None => nil,
+            },
+            BlurMechanism::WindowServer { .. } => nil,
+        };
+        if blur_view.is_null() {
+            return false;
+        }
+
+        blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+        let _: () = msg_send![
+            content_view,
+            addSubview: blur_view
+            positioned: NSWindowOrderingMode::NSWindowBelow
+            relativeTo: nil
+        ];
+        window_state.blurred_view = Some(blur_view.autorelease());
+        true
+    }
+}
+
+type WindowServerConnection = c_int;
+type DefaultConnectionForThread = unsafe extern "C" fn() -> WindowServerConnection;
+type SetWindowBackgroundBlurRadius =
+    unsafe extern "C" fn(WindowServerConnection, u32, c_int) -> i32;
+
+struct WindowServerBlur {
+    default_connection: DefaultConnectionForThread,
+    set_blur_radius: SetWindowBackgroundBlurRadius,
+}
+
+/// The window-server blur is private API, so its symbols are looked up at runtime: linking
+/// them would turn "this macOS no longer exports them" into a link failure for all of gpui.
+fn window_server_blur() -> Option<&'static WindowServerBlur> {
+    static SYMBOLS: OnceLock<Option<WindowServerBlur>> = OnceLock::new();
+
+    SYMBOLS
+        .get_or_init(|| {
+            let default_connection = private_symbol(c"CGSDefaultConnectionForThread")?;
+            let set_blur_radius = private_symbol(c"CGSSetWindowBackgroundBlurRadius")?;
+            Some(WindowServerBlur {
+                default_connection: unsafe {
+                    mem::transmute::<*mut c_void, DefaultConnectionForThread>(default_connection)
+                },
+                set_blur_radius: unsafe {
+                    mem::transmute::<*mut c_void, SetWindowBackgroundBlurRadius>(set_blur_radius)
+                },
+            })
+        })
+        .as_ref()
+}
+
+fn private_symbol(symbol: &CStr) -> Option<*mut c_void> {
+    const SKYLIGHT_PATH: &CStr = c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight";
+
+    let mut address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
+    if address.is_null() {
+        let skylight = unsafe { libc::dlopen(SKYLIGHT_PATH.as_ptr(), libc::RTLD_LAZY) };
+        if !skylight.is_null() {
+            address = unsafe { libc::dlsym(skylight, symbol.as_ptr()) };
+        }
+    }
+    (!address.is_null()).then_some(address)
+}
+
+/// Returns whether the radius was set. A radius of 0 clears the blur.
+fn set_window_server_blur_radius(native_window: id, radius: c_int) -> bool {
+    let Some(blur) = window_server_blur() else {
+        return false;
+    };
+    let window_number: NSInteger = unsafe { msg_send![native_window, windowNumber] };
+    if window_number <= 0 {
+        return false;
+    }
+
+    let status = unsafe {
+        (blur.set_blur_radius)((blur.default_connection)(), window_number as u32, radius)
+    };
+    if status != 0 {
+        log::warn!("CGSSetWindowBackgroundBlurRadius failed with status {status}");
+        return false;
+    }
+    true
+}
+
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
@@ -3576,5 +3850,32 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    // The selected material crosses into the window state as a `u8`, so a code that does
+    // not round-trip would silently blur every window with the wrong material.
+    #[test]
+    fn blur_material_codes_round_trip() {
+        for material in [
+            WindowBlurMaterial::Default,
+            WindowBlurMaterial::HudWindow,
+            WindowBlurMaterial::FullScreenUi,
+            WindowBlurMaterial::Menu,
+            WindowBlurMaterial::UnderWindowBackground,
+            WindowBlurMaterial::Sidebar,
+            WindowBlurMaterial::Selection,
+            WindowBlurMaterial::GlassEffect,
+            WindowBlurMaterial::WindowServer,
+        ] {
+            assert_eq!(
+                blur_material_from_code(blur_material_code(material)),
+                material
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_blur_material_codes_fall_back_to_the_default() {
+        assert_eq!(blur_material_from_code(u8::MAX), WindowBlurMaterial::Default);
     }
 }

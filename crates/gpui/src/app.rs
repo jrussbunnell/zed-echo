@@ -52,8 +52,8 @@ use crate::{
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
     ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
     SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    ThermalState, Window, WindowAppearance, WindowBlurMaterial, WindowButtonLayout, WindowHandle,
+    WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -1356,6 +1356,17 @@ impl App {
     /// the system. On other platforms this is a no-op.
     pub fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
         self.platform.set_window_appearance(appearance);
+    }
+
+    /// Selects the mechanism used to blur what is behind windows whose background appearance
+    /// is [`crate::WindowBackgroundAppearance::Blurred`].
+    ///
+    /// Windows opened afterwards use it directly. Windows that are already open keep their
+    /// current blur until their background appearance is set again, so callers that want a
+    /// live switch should follow this with [`Window::set_background_appearance`] on the open
+    /// windows. On platforms other than macOS this is a no-op.
+    pub fn set_window_blur_material(&self, material: WindowBlurMaterial) {
+        self.platform.set_window_blur_material(material);
     }
 
     /// Returns the window button layout configuration when supported.

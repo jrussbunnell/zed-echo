@@ -177,6 +177,14 @@ pub trait Platform: 'static {
     /// other platforms.
     fn set_window_appearance(&self, _appearance: Option<WindowAppearance>) {}
 
+    /// Selects the mechanism used to blur what is behind windows whose background
+    /// appearance is [`WindowBackgroundAppearance::Blurred`].
+    ///
+    /// Windows opened afterwards use it directly; windows that are already open pick it up
+    /// the next time their background appearance is set. Currently only implemented on
+    /// macOS, and a no-op on other platforms.
+    fn set_window_blur_material(&self, _material: WindowBlurMaterial) {}
+
     /// Returns the window button layout configuration when supported.
     fn button_layout(&self) -> Option<WindowButtonLayout> {
         None
@@ -2090,6 +2098,41 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// The mechanism used to blur what is behind a window whose background appearance is
+/// [`WindowBackgroundAppearance::Blurred`].
+///
+/// Only macOS honors this; every other platform ignores it. Which mechanisms actually
+/// frost the desktop depends on the macOS version and on the SDK the binary was linked
+/// against, which is why this is user-selectable rather than a single hard-coded choice.
+/// A mechanism that is unavailable at runtime falls back to [`WindowBlurMaterial::Default`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WindowBlurMaterial {
+    /// Let the platform pick. On macOS this is the `hudWindow` material.
+    #[default]
+    Default,
+    /// macOS `NSVisualEffectMaterial.hudWindow`.
+    HudWindow,
+    /// macOS `NSVisualEffectMaterial.fullScreenUI`.
+    FullScreenUi,
+    /// macOS `NSVisualEffectMaterial.menu`.
+    Menu,
+    /// macOS `NSVisualEffectMaterial.underWindowBackground`.
+    UnderWindowBackground,
+    /// macOS `NSVisualEffectMaterial.sidebar`.
+    Sidebar,
+    /// macOS `NSVisualEffectMaterial.selection`, plus the layer surgery that removes the
+    /// material's desktop tinting and saturation.
+    ///
+    /// This is what gpui used unconditionally before the material became selectable. It
+    /// stopped frosting in binaries linked against the macOS 26 (Liquid Glass) SDK.
+    Selection,
+    /// macOS `NSGlassEffectView`, the Liquid Glass view introduced in macOS 26.
+    GlassEffect,
+    /// The window server's own background blur, applied to the window itself rather than
+    /// through a view. Uses private CoreGraphics symbols resolved at runtime.
+    WindowServer,
 }
 
 /// The text rendering mode to use for drawing glyphs.
