@@ -538,7 +538,11 @@ pub struct ThemeStyleContent {
     #[serde(rename = "background.appearance")]
     pub window_background_appearance: Option<WindowBackgroundContent>,
 
-    #[serde(default)]
+    // These three are not `Option`, so without `skip_serializing_if` every
+    // serialized theme override carries `"accents": []`, `"players": []` and
+    // `"syntax": {}`, which the settings UI would then write into the user's
+    // settings.json on the first color edit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accents: Vec<AccentContent>,
 
     #[serde(flatten, default)]
@@ -547,11 +551,11 @@ pub struct ThemeStyleContent {
     #[serde(flatten, default)]
     pub status: StatusColorsContent,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub players: Vec<PlayerColorContent>,
 
     /// The styles for syntax nodes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub syntax: IndexMap<String, HighlightStyleContent>,
 }
 
