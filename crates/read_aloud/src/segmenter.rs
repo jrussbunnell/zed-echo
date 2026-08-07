@@ -107,13 +107,22 @@ pub fn segment(parsed: &ParsedMarkdown, message_complete: bool) -> Vec<Utterance
                 last_content_end,
                 message_complete,
             ),
-            MarkdownEvent::Text | MarkdownEvent::Code => {
+            MarkdownEvent::Text => {
                 if !is_muted(&tag_stack) {
                     if let Some(text) = source.get(range.clone()) {
-                        runs.push(TextRun {
-                            source_range: range.clone(),
-                            text: text.to_string(),
-                        });
+                        push_prose_runs(&mut runs, range.clone(), text);
+                    }
+                }
+            }
+            MarkdownEvent::Code => {
+                if !is_muted(&tag_stack) {
+                    if let Some(content) = source.get(range.clone()) {
+                        if let Some(text) = spoken_inline_code(content) {
+                            runs.push(TextRun {
+                                source_range: range.clone(),
+                                text,
+                            });
+                        }
                     }
                 }
             }
@@ -146,6 +155,130 @@ fn starts_spoken_block(tag: &MarkdownTag) -> bool {
         tag,
         MarkdownTag::Paragraph | MarkdownTag::Heading { .. } | MarkdownTag::Item
     )
+}
+
+/// Pushes a plain-text run, split around tokens no human would read aloud —
+/// commit-hash-like hex strings and bare URLs. The surrounding text becomes
+/// separate runs, so the spoken→source origin map stays exact: the skipped
+/// bytes never gain a word highlight, while the sentence keeps flowing around
+/// them and (mid-sentence) the sentence wash still covers them.
+fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &str) {
+    /// Punctuation hugging a token — "(aa12de9)", "aa12de9." — stays spoken:
+    /// dropping a sentence terminator along with the token would merge
+    /// sentences.
+    const LEADING_EDGE: &[char] = &['(', '[', '{', '"', '\'', '<'];
+    const TRAILING_EDGE: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '>'];
+
+    let mut emitted_until = 0;
+    for token in text.split_whitespace() {
+        let token_start = token.as_ptr() as usize - text.as_ptr() as usize;
+        let core = token.trim_start_matches(LEADING_EDGE);
+        let core_start = token_start + (token.len() - core.len());
+        let core = core.trim_end_matches(TRAILING_EDGE);
+        let skip = !core.is_empty()
+            && (is_hash_like(core) || core.starts_with("http://") || core.starts_with("https://"));
+        if !skip {
+            continue;
+        }
+        if emitted_until < core_start {
+            runs.push(TextRun {
+                source_range: source_range.start + emitted_until..source_range.start + core_start,
+                text: text[emitted_until..core_start].to_string(),
+            });
+        }
+        emitted_until = core_start + core.len();
+    }
+    if emitted_until < text.len() {
+        runs.push(TextRun {
+            source_range: source_range.start + emitted_until..source_range.end,
+            text: text[emitted_until..].to_string(),
+        });
+    }
+}
+
+/// How an inline code span should sound, if at all. `None` skips the span.
+/// The bar is "would a human reading this aloud say the token, or gesture at
+/// it?" — names get spoken (with `_`/`-` as word separators), while paths,
+/// expressions, flags, hashes, and URLs get gestured at.
+fn spoken_inline_code(content: &str) -> Option<String> {
+    /// Substrings that mark a span as code to gesture at, not prose to say.
+    const CODE_SIGNALS: &[&str] = &["/", "\\", "::", "(", ")", "=", "\"", "'", "`"];
+    /// A token this long without a space is an identifier nobody says aloud.
+    const MAX_TOKEN_LENGTH: usize = 20;
+    /// More words than this reads as a code phrase, not a name.
+    const MAX_WORDS: usize = 3;
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if CODE_SIGNALS.iter().any(|signal| trimmed.contains(signal)) {
+        return None;
+    }
+    // `player.rs:250`-style line suffixes.
+    let bytes = trimmed.as_bytes();
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b':' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    for token in trimmed.split_whitespace() {
+        if token.len() >= MAX_TOKEN_LENGTH
+            || token.starts_with('-') // CLI flags: -p, --foo
+            || is_hash_like(token)
+            || looks_file_like(token)
+        {
+            return None;
+        }
+    }
+    let separated: String = content
+        .chars()
+        .map(|character| {
+            if matches!(character, '_' | '-') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    // `_`/`-` are 1:1 with the space replacing them, so the spoken bytes stay
+    // aligned with the source bytes for the origin map.
+    (separated.split_whitespace().count() <= MAX_WORDS).then_some(separated)
+}
+
+/// Commit-SHA-shaped: a long run of pure hex. Requiring both a digit and a
+/// letter keeps real words ("defaced") and plain numbers ("1234567") spoken.
+fn is_hash_like(token: &str) -> bool {
+    token.len() >= 7
+        && token.chars().all(|character| character.is_ascii_hexdigit())
+        && token.chars().any(|character| character.is_ascii_digit())
+        && token
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+}
+
+/// `main.rs`, `.gitignore`, `settings.json` — a dot wired into a token the
+/// way file names have them.
+fn looks_file_like(token: &str) -> bool {
+    if token.starts_with('.') && token.len() > 1 {
+        return true;
+    }
+    let Some(dot) = token.rfind('.') else {
+        return false;
+    };
+    let extension = &token[dot + 1..];
+    token[..dot]
+        .chars()
+        .next_back()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        && !extension.is_empty()
+        && extension.len() <= 5
+        && extension.starts_with(|character: char| character.is_ascii_alphabetic())
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
 }
 
 /// True when any enclosing tag makes the text non-prose.
@@ -196,12 +329,18 @@ fn flush(
     let mut origins: Vec<usize> = Vec::new();
     for run in runs.iter() {
         for (offset, character) in run.text.char_indices() {
+            // Skipped spans (inline code, hashes, URLs) leave the whitespace
+            // on both sides behind; collapsing it here keeps the spoken text
+            // natural ("in  and" → "in and") with the origin map in lockstep.
+            if character.is_whitespace() && combined.ends_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
             let source_index = run.source_range.start + offset.min(run.source_range.len());
             for _ in 0..character.len_utf8() {
                 origins.push(source_index);
             }
+            combined.push(character);
         }
-        combined.push_str(&run.text);
     }
     runs.clear();
 
@@ -215,7 +354,9 @@ fn flush(
 
     for sentence in sentences {
         let text = combined[sentence.clone()].trim();
-        if text.is_empty() {
+        // Covers the empty case too: a sentence with nothing alphanumeric —
+        // everything speakable in it was skipped — is noise, not speech.
+        if !text.chars().any(char::is_alphanumeric) {
             continue;
         }
         let leading =
@@ -541,5 +682,100 @@ mod tests {
             spoken_complete("Complete one. Still typing", cx),
             vec!["Complete one.", "Still typing"]
         );
+    }
+
+    #[gpui::test]
+    fn speaks_word_like_inline_code_with_separators_as_spaces(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken(
+                "Set `speaking_rate` and `read-aloud` and `enabled` now.\n",
+                cx
+            ),
+            vec!["Set speaking rate and read aloud and enabled now."]
+        );
+    }
+
+    #[gpui::test]
+    fn skips_path_and_code_like_inline_code(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken(
+                "The fix is in `crates/read_aloud/src/player.rs:250` and ready.\n",
+                cx
+            ),
+            vec!["The fix is in and ready."]
+        );
+        assert_eq!(
+            spoken("Run `cargo test -p read_aloud` locally.\n", cx),
+            vec!["Run locally."]
+        );
+        assert_eq!(
+            spoken("Check `main.rs` and `let x = 1` here.\n", cx),
+            vec!["Check and here."]
+        );
+    }
+
+    #[gpui::test]
+    fn skips_hash_like_tokens_even_outside_backticks(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken("Fixed in commit aa370aca7c today.\n", cx),
+            vec!["Fixed in commit today."]
+        );
+        assert_eq!(spoken("See `aa370aca7c` too.\n", cx), vec!["See too."]);
+        assert_eq!(
+            spoken("It served 1234567 requests.\n", cx),
+            vec!["It served 1234567 requests."],
+            "plain numbers are not hashes"
+        );
+    }
+
+    #[gpui::test]
+    fn skips_bare_urls_but_keeps_link_text(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken("See https://example.com/docs for more.\n", cx),
+            vec!["See for more."]
+        );
+        assert_eq!(
+            spoken("See <https://example.com> for more.\n", cx),
+            vec!["See for more."]
+        );
+        assert_eq!(
+            spoken("See [the docs](https://example.com) for more.\n", cx),
+            vec!["See the docs for more."]
+        );
+    }
+
+    #[gpui::test]
+    fn a_skipped_span_keeps_sentence_flow_and_origins(cx: &mut TestAppContext) {
+        let source = "The fix is in `player.rs:250` and ready.\n";
+        let utterances = utterances(source, false, cx);
+        assert_eq!(utterances.len(), 1);
+        let utterance = &utterances[0];
+        assert_eq!(utterance.spoken_text, "The fix is in and ready.");
+
+        // The sentence wash still covers the skipped span...
+        let code_start = source.find("`player").expect("code span exists");
+        let code_end = source.find(" and").expect("code span ends");
+        assert!(utterance.source_range.start < code_start);
+        assert!(utterance.source_range.end > code_end);
+
+        // ...but no spoken byte maps into it, so the word pill can never
+        // land there.
+        let code_range = code_start..code_end;
+        assert!(
+            utterance
+                .spoken_origins
+                .iter()
+                .all(|origin| !code_range.contains(origin))
+        );
+
+        // Words after the skip still map to the right source bytes.
+        let spoken_start = utterance
+            .spoken_text
+            .find("and")
+            .expect("word survives the skip");
+        let mapped = utterance
+            .source_range_for_spoken(spoken_start..spoken_start + "and".len())
+            .expect("word maps back to the source");
+        assert_eq!(&source[mapped], "and");
     }
 }

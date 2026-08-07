@@ -62,7 +62,12 @@ impl Player {
     /// Replaces the utterance list. Utterances already synthesized keep their
     /// place, so a streaming append only synthesizes what is new.
     pub fn set_utterances(&mut self, utterances: Vec<Utterance>, cx: &mut Context<Self>) {
-        self.utterances = utterances;
+        if self.utterances != utterances {
+            self.utterances = utterances;
+            // The utterance count feeds UI (the mini player's counter), which
+            // observes this entity rather than polling it.
+            cx.notify();
+        }
         if self.next_to_synthesize > self.utterances.len() {
             self.next_to_synthesize = self.utterances.len();
         }
@@ -83,6 +88,7 @@ impl Player {
         self.next_to_synthesize = index;
         self.last_reported = None;
         self.pump(cx);
+        cx.notify();
     }
 
     /// Cancels in-flight synthesis, drops whatever audio is queued, and
@@ -159,6 +165,24 @@ impl Player {
 
     pub fn utterances(&self) -> &[Utterance] {
         &self.utterances
+    }
+
+    /// True when there is nothing left to do: no audio queued, no synthesis
+    /// in flight, and nothing awaiting synthesis. Unlike `speaking_index()`
+    /// being `None` — which also happens transiently whenever playback
+    /// drains faster than synthesis or a slow stream delivers text — this is
+    /// the durable "done until someone hands over more work" state.
+    pub fn is_idle(&self) -> bool {
+        self.sink.queued() == 0
+            && self.synthesis.is_none()
+            && self.next_to_synthesize >= self.utterances.len()
+    }
+
+    /// Index of the utterance currently being synthesized (or next in line).
+    /// Stands in for `speaking_index()` in UI while the sink is momentarily
+    /// empty but work is still under way.
+    pub fn next_to_synthesize(&self) -> usize {
+        self.next_to_synthesize
     }
 
     /// Source range of the word being spoken right now, derived from the

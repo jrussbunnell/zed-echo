@@ -19,7 +19,7 @@ pub use provider::FakeTts;
 #[cfg(any(test, feature = "test-support"))]
 pub use sink::FakeSink;
 
-use gpui::{AppContext as _, Context, Entity, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, SharedString, Subscription, Task};
 use markdown::Markdown;
 use settings::{RegisterSetting, Settings};
 use std::ops::Range;
@@ -76,11 +76,29 @@ pub fn init(cx: &mut gpui::App) {
 /// (spoken words last a few hundred milliseconds each).
 const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
+/// A snapshot of the player, thin enough to derive on every render, for the
+/// mini player UI. `None` while there is nothing to control.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybackState {
+    pub utterance_index: usize,
+    pub utterance_count: usize,
+    pub paused: bool,
+    pub sentence_text: SharedString,
+}
+
 pub struct ReadAloud {
     player: Entity<Player>,
     /// The markdown entity currently being spoken, and the utterances derived
     /// from it. Kept together so the highlight can be cleared on switch.
     speaking: Option<Entity<Markdown>>,
+    /// Messages that arrived while another was still sounding. Agent turns
+    /// emit a fresh markdown entity after every tool call; switching the
+    /// player the moment one appeared used to truncate the sentence being
+    /// spoken. Instead the newcomers wait here (FIFO) until the player runs
+    /// out of work for the current entity. Only bookkeeping lives here — the
+    /// entity's content is re-read at switch time, and highlights are only
+    /// ever driven by `speaking`, never by this queue.
+    pending: Vec<(Entity<Markdown>, bool)>,
     /// Set when the user stops playback with `toggle`, cleared by anything that
     /// starts it again. Without it a stop does not stick while a message is
     /// still streaming: the next `enqueue_markdown` grows the utterance list
@@ -119,19 +137,26 @@ impl ReadAloud {
             PlayerEvent::Speaking(index) => this.highlight_utterance(Some(*index), cx),
             PlayerEvent::Finished => this.highlight_utterance(None, cx),
         });
+        // The mini player renders from `playback_state`, so anything watching
+        // this entity must wake whenever the underlying player changes.
+        let player_observation = cx.observe(&player, |_, _, cx| cx.notify());
 
         Self {
             player,
             speaking: None,
+            pending: Vec::new(),
             stopped_by_user: false,
             poll_task: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, player_observation],
         }
     }
 
     /// Segments a markdown entity and hands the utterances to the player.
     /// Safe to call repeatedly as content streams in — the player only
-    /// synthesizes what it has not already queued.
+    /// synthesizes what it has not already queued. A *different* entity
+    /// arriving while the current one still has audio or synthesis under way
+    /// does not interrupt it: the newcomer waits in a FIFO until the current
+    /// entity's utterances finish (see `pending`).
     pub fn enqueue_markdown(
         &mut self,
         markdown: &Entity<Markdown>,
@@ -140,49 +165,110 @@ impl ReadAloud {
     ) {
         let switched_entity = self.speaking.as_ref() != Some(markdown);
         if switched_entity {
-            self.clear_highlight(cx);
-            self.speaking = Some(markdown.clone());
-            self.stopped_by_user = false;
-        } else if self.stopped_by_user {
+            if self.speaking.is_some() && !self.player.read(cx).is_idle() {
+                if let Some(entry) = self
+                    .pending
+                    .iter_mut()
+                    .find(|(pending, _)| pending == markdown)
+                {
+                    entry.1 = message_complete;
+                } else {
+                    log::debug!("read_aloud: queued a new entity while another is still speaking");
+                    self.pending.push((markdown.clone(), message_complete));
+                }
+                return;
+            }
+            self.switch_to(markdown.clone(), message_complete, cx);
+            return;
+        }
+        if self.stopped_by_user {
             // The user stopped this message. More of it arriving is not a
             // reason to start speaking again; only `toggle` or a seek is.
             return;
         }
+        self.refresh_current(message_complete, cx);
+    }
 
+    /// Makes `markdown` the speaking entity and restarts the player from its
+    /// top, dropping whatever the previous entity still had queued. The
+    /// pending FIFO is left alone: callers decide whether the switch consumes
+    /// it (finishing naturally) or overrides it (explicit user intent).
+    fn switch_to(
+        &mut self,
+        markdown: Entity<Markdown>,
+        message_complete: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_highlight(cx);
+        self.speaking = Some(markdown);
+        self.stopped_by_user = false;
+
+        let Some(markdown) = self.speaking.clone() else {
+            return;
+        };
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player.update(cx, |player, cx| {
             player.set_utterances(utterances, cx);
-            if switched_entity {
-                // `set_utterances` alone is not enough on a switch: it only
-                // clamps `next_to_synthesize` down when it exceeds the new
-                // utterance count, so if the new message happens to have at
-                // least as many utterances as the old one had already
-                // reached, `pump` thinks synthesis is caught up and the new
-                // message is never synthesized while the old message's
-                // audio keeps playing from the sink. `reset` clears the sink
-                // (dropping the old message's queued audio), cancels any
-                // in-flight synthesis for the old message, and restarts
-                // `next_to_synthesize` from the top of the new one.
-                //
-                // `seek_to(0, ..)` cannot be used here: it early-returns
-                // whenever the target index is out of range, which is
-                // exactly the state of the very first chunk of a new
-                // streaming message — the segmenter withholds an
-                // unterminated trailing fragment, so a fresh entity often
-                // starts out with zero utterances. `seek_to` would then
-                // leave the old message's stale audio sitting in the sink
-                // until the new message finally produces its first
-                // utterance. `reset` has no such guard: it always clears the
-                // sink and always pumps, whether or not there is anything to
-                // synthesize yet.
-                //
-                // A plain `stop` before `set_utterances` does not work
-                // either — `set_utterances` would just clamp the resulting
-                // `next_to_synthesize` right back down to the new length.
-                player.reset(cx);
-            }
+            // `set_utterances` alone is not enough on a switch: it only
+            // clamps `next_to_synthesize` down when it exceeds the new
+            // utterance count, so if the new message happens to have at
+            // least as many utterances as the old one had already
+            // reached, `pump` thinks synthesis is caught up and the new
+            // message is never synthesized while the old message's
+            // audio keeps playing from the sink. `reset` clears the sink
+            // (dropping the old message's queued audio), cancels any
+            // in-flight synthesis for the old message, and restarts
+            // `next_to_synthesize` from the top of the new one.
+            //
+            // `seek_to(0, ..)` cannot be used here: it early-returns
+            // whenever the target index is out of range, which is
+            // exactly the state of the very first chunk of a new
+            // streaming message — the segmenter withholds an
+            // unterminated trailing fragment, so a fresh entity often
+            // starts out with zero utterances. `seek_to` would then
+            // leave the old message's stale audio sitting in the sink
+            // until the new message finally produces its first
+            // utterance. `reset` has no such guard: it always clears the
+            // sink and always pumps, whether or not there is anything to
+            // synthesize yet.
+            //
+            // A plain `stop` before `set_utterances` does not work
+            // either — `set_utterances` would just clamp the resulting
+            // `next_to_synthesize` right back down to the new length.
+            player.reset(cx);
         });
+        self.push_speakable_ranges(cx);
         self.start_polling(cx);
+    }
+
+    /// Re-segments the current entity in place — the streaming-append path.
+    fn refresh_current(&mut self, message_complete: bool, cx: &mut Context<Self>) {
+        let Some(markdown) = self.speaking.clone() else {
+            return;
+        };
+        let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
+        self.player
+            .update(cx, |player, cx| player.set_utterances(utterances, cx));
+        self.push_speakable_ranges(cx);
+        self.start_polling(cx);
+    }
+
+    /// Mirrors the current utterance ranges into the speaking entity so its
+    /// element can preview (hover) and advertise (cursor) click-to-seek.
+    fn push_speakable_ranges(&self, cx: &mut Context<Self>) {
+        let Some(markdown) = self.speaking.clone() else {
+            return;
+        };
+        let ranges: Vec<Range<usize>> = self
+            .player
+            .read(cx)
+            .utterances()
+            .iter()
+            .map(|utterance| utterance.source_range.clone())
+            .collect();
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_speakable_ranges(ranges, cx);
+        });
     }
 
     pub fn seek_to_source_index(
@@ -191,8 +277,11 @@ impl ReadAloud {
         source_index: usize,
         cx: &mut Context<Self>,
     ) {
+        // A click is explicit intent: whatever was waiting its turn is
+        // overruled by it.
+        self.pending.clear();
         if self.speaking.as_ref() != Some(markdown) {
-            self.enqueue_markdown(markdown, false, cx);
+            self.switch_to(markdown.clone(), false, cx);
         }
 
         let target = self
@@ -227,6 +316,9 @@ impl ReadAloud {
             self.player.update(cx, |player, cx| player.stop(cx));
             self.poll_task = None;
             self.stopped_by_user = true;
+            // A stop is explicit intent about the whole session, not just the
+            // current message: nothing waiting its turn may start either.
+            self.pending.clear();
             // `self.speaking` is deliberately retained so toggling back on has
             // a message to restart.
         } else if self.speaking.is_some() {
@@ -242,13 +334,65 @@ impl ReadAloud {
     /// Pause/resume, holding queue position — the counterpart to `toggle`,
     /// which stops and restarts from the top.
     pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
-        self.player.update(cx, |player, _cx| {
+        self.player.update(cx, |player, cx| {
             if player.is_paused() {
                 player.resume();
             } else {
                 player.pause();
             }
+            // Pause state lives in the sink, which cannot notify; the mini
+            // player's play/pause glyph re-renders off this.
+            cx.notify();
         });
+    }
+
+    /// What the mini player needs to render, `None` when it should be
+    /// hidden: nothing loaded, playback finished, or stopped.
+    pub fn playback_state(&self, cx: &App) -> Option<PlaybackState> {
+        self.speaking.as_ref()?;
+        let player = self.player.read(cx);
+        let utterance_count = player.utterances().len();
+        let utterance_index = player.speaking_index().or_else(|| {
+            // The sink can be momentarily empty while synthesis catches up;
+            // the utterance being synthesized stands in so the controls do
+            // not blink out mid-message.
+            (!player.is_idle() && utterance_count > 0)
+                .then(|| player.next_to_synthesize().min(utterance_count - 1))
+        })?;
+        let utterance = player.utterances().get(utterance_index)?;
+        Some(PlaybackState {
+            utterance_index,
+            utterance_count,
+            paused: player.is_paused(),
+            sentence_text: SharedString::new(utterance.spoken_text.as_str()),
+        })
+    }
+
+    /// Seeks one utterance back, clamped at the start.
+    pub fn previous_sentence(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.playback_state(cx) else {
+            return;
+        };
+        let Some(target) = state.utterance_index.checked_sub(1) else {
+            return;
+        };
+        self.player
+            .update(cx, |player, cx| player.seek_to(target, cx));
+        self.start_polling(cx);
+    }
+
+    /// Seeks one utterance forward, clamped at the end.
+    pub fn next_sentence(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.playback_state(cx) else {
+            return;
+        };
+        let target = state.utterance_index + 1;
+        if target >= state.utterance_count {
+            return;
+        }
+        self.player
+            .update(cx, |player, cx| player.seek_to(target, cx));
+        self.start_polling(cx);
     }
 
     pub fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
@@ -273,21 +417,35 @@ impl ReadAloud {
         }
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(still_playing) = this.update(cx, |this, cx| {
-                    let (still_playing, word_range) = this.player.update(cx, |player, cx| {
+                let Ok(keep_polling) = this.update(cx, |this, cx| {
+                    let (word_range, idle) = this.player.update(cx, |player, cx| {
                         player.poll_position(cx);
-                        (
-                            player.speaking_index().is_some(),
-                            player.current_word_source_range(),
-                        )
+                        (player.current_word_source_range(), player.is_idle())
                     });
                     this.highlight_word(word_range, cx);
-                    still_playing
+                    // The loop lives as long as the player has *work* — audio
+                    // queued, synthesis in flight, or utterances awaiting
+                    // synthesis — not merely audio. A momentarily-empty sink
+                    // (playback outrunning a slow stream or a slow provider)
+                    // used to kill the loop here, and with it the only thing
+                    // that pumps synthesis once the prefetched audio drained:
+                    // playback then stalled mid-message until the next
+                    // enqueue happened to arrive.
+                    if !idle {
+                        return true;
+                    }
+                    if !this.pending.is_empty() {
+                        let (markdown, message_complete) = this.pending.remove(0);
+                        log::debug!("read_aloud: switched to a queued entity");
+                        this.switch_to(markdown, message_complete, cx);
+                        return true;
+                    }
+                    this.poll_task = None;
+                    false
                 }) else {
                     return;
                 };
-                if !still_playing {
-                    this.update(cx, |this, _cx| this.poll_task = None).ok();
+                if !keep_polling {
                     return;
                 }
                 cx.background_executor().timer(POSITION_POLL_INTERVAL).await;
@@ -388,18 +546,18 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn enqueuing_a_different_entity_speaks_it_and_never_highlights_the_old_one(
+    async fn a_different_entity_waits_its_turn_instead_of_truncating_speech(
         cx: &mut TestAppContext,
     ) {
         let provider = FakeTts::new();
         let sink = FakeSink::new();
-        let markdown_a =
-            cx.new(|cx| Markdown::new("One. Two. Three. Four. Five.\n".into(), None, None, cx));
+        let markdown_a = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
         let markdown_b = cx.new(|cx| Markdown::new("Alpha. Beta.\n".into(), None, None, cx));
         cx.run_until_parked();
 
         let read_aloud = cx.new({
             let provider = provider.clone();
+            let sink = sink.clone();
             |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
         });
 
@@ -407,35 +565,60 @@ mod tests {
             read_aloud.enqueue_markdown(&markdown_a, false, cx);
         });
         cx.run_until_parked();
+        let queued_before = sink.queued();
+        assert!(queued_before > 0, "setup: A should have queued audio");
 
-        // Switch to a different entity while `markdown_a` is still mid-queue
-        // (the prefetch window only synthesizes 2 of its 5 utterances).
+        // B arrives mid-speech — the agent moved on to its next message
+        // block — and must wait rather than cut A off.
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown_b, false, cx);
         });
+        cx.run_until_parked();
+        assert_eq!(
+            sink.queued(),
+            queued_before,
+            "A's queued audio must not be dropped when B arrives"
+        );
+        assert_eq!(
+            provider.spoken(),
+            vec!["One.", "Two."],
+            "B must not be synthesized while A is still speaking"
+        );
+        assert_eq!(
+            markdown_a.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..4),
+            "A keeps the highlight while B waits"
+        );
+
+        // A finishes; the queue pops and B speaks from its start.
+        sink.finish_one();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
         cx.run_until_parked();
 
         assert!(
             provider
                 .spoken()
                 .ends_with(&["Alpha.".to_string(), "Beta.".to_string()]),
-            "the new message must still be synthesized after switching entities, got {:?}",
+            "B must be synthesized once A finishes, got {:?}",
             provider.spoken()
         );
         assert_eq!(
             markdown_a.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             None,
-            "the old message must never be highlighted after switching away from it"
+            "the finished message must never stay highlighted"
         );
         assert_eq!(
             markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..6),
-            "the new message's first sentence should be highlighted"
+            "the popped message's first sentence should be highlighted"
         );
     }
 
     #[gpui::test]
-    async fn switching_to_an_entity_with_no_utterances_yet_still_drops_the_old_queue(
+    async fn a_click_switch_to_an_entity_with_no_utterances_yet_still_drops_the_old_queue(
         cx: &mut TestAppContext,
     ) {
         let provider = FakeTts::new();
@@ -461,8 +644,10 @@ mod tests {
         cx.run_until_parked();
         assert!(sink.queued() > 0, "setup: A should have queued audio");
 
+        // A click is explicit intent, so unlike a mid-speech enqueue it
+        // switches immediately.
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+            read_aloud.seek_to_source_index(&markdown_b, 0, cx);
         });
         assert_eq!(
             sink.queued(),
@@ -772,5 +957,363 @@ mod tests {
             markdown.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
             Some(0..10)
         );
+    }
+
+    #[gpui::test]
+    async fn streaming_updates_to_the_current_entity_apply_while_another_waits(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One. ".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        // A is still streaming; its updates must keep applying live even
+        // though B is waiting.
+        markdown_a.update(cx, |markdown, cx| markdown.append("Two.\n", cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, true, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..3 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            provider.spoken(),
+            vec!["One.", "Two.", "Alpha."],
+            "A's late sentence speaks before the waiting message"
+        );
+    }
+
+    #[gpui::test]
+    async fn dedupe_updates_a_pending_entitys_message_complete(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One.\n".into(), None, None, cx));
+        let markdown_b =
+            cx.new(|cx| Markdown::new("Alpha. Tail without terminator".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+
+        // B queues while streaming, then its final chunk marks it complete.
+        // Re-enqueueing must update the pending record, not duplicate it.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+            read_aloud.enqueue_markdown(&markdown_b, true, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..3 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            provider.spoken(),
+            vec!["One.", "Alpha.", "Tail without terminator"],
+            "the pending message must speak once (no duplicate) and, being \
+             complete, include its unterminated tail"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_seek_clears_the_pending_queue(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let source = "One. Two.\n";
+        let markdown_a = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        // The user clicks a sentence: explicit intent overrides the queue.
+        let click = source.find("Two.").expect("test source has a sentence");
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.seek_to_source_index(&markdown_a, click, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..3 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert!(
+            !provider.spoken().iter().any(|text| text == "Alpha."),
+            "the queued message must not speak after a seek overruled it, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    #[gpui::test]
+    async fn a_stop_clears_the_pending_queue(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+
+        for _ in 0..3 {
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert!(
+            !read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "a stop must stick even with a message waiting its turn"
+        );
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_stopped,
+            "the queued message must not speak after a stop"
+        );
+    }
+
+    #[gpui::test]
+    async fn playback_resumes_when_speech_outpaces_a_slow_stream(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("First one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["First one."]);
+
+        // Speech finishes everything segmented so far; the reader parks.
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+
+        // More of the SAME message arrives, and — like the real provider mid
+        // HTTP request — synthesis is still in flight when the reader's next
+        // tick lands on an empty sink. It must keep waiting for the audio,
+        // not park forever.
+        provider.hold();
+        markdown.update(cx, |markdown, cx| {
+            markdown.append("Second one. Third one. Fourth one. Fifth one.\n", cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        provider.release_all();
+        cx.run_until_parked();
+
+        // Only the prefetch window is queued up front; draining it must keep
+        // pulling the rest of the message through with no further enqueues.
+        for _ in 0..4 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "First one.",
+                "Second one.",
+                "Third one.",
+                "Fourth one.",
+                "Fifth one."
+            ],
+            "every sentence must speak even though the stream was slower than speech"
+        );
+
+        // And repeatedly: the same stall-and-resume must work again.
+        provider.hold();
+        markdown.update(cx, |markdown, cx| markdown.append("Sixth one.\n", cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        provider.release_all();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken().last().map(String::as_str),
+            Some("Sixth one.")
+        );
+
+        // A trailing fragment withheld while streaming still speaks once the
+        // message completes.
+        markdown.update(cx, |markdown, cx| markdown.append("Trailing tail", cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken().last().map(String::as_str),
+            Some("Trailing tail"),
+            "message completion must release the withheld tail"
+        );
+    }
+
+    #[gpui::test]
+    async fn playback_state_reflects_the_player(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "nothing loaded means nothing to control"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            Some(PlaybackState {
+                utterance_index: 0,
+                utterance_count: 2,
+                paused: false,
+                sentence_text: "First one.".into(),
+            })
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+        assert_eq!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| state.paused),
+            Some(true)
+        );
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+
+        sink.finish_one();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "a finished message leaves nothing to control"
+        );
+    }
+
+    #[gpui::test]
+    async fn previous_and_next_sentence_clamp_at_the_ends(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        let index = |cx: &mut TestAppContext| {
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| state.utterance_index)
+        };
+        assert_eq!(index(cx), Some(0));
+
+        let spoken_before = provider.spoken();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.previous_sentence(cx));
+        cx.run_until_parked();
+        assert_eq!(index(cx), Some(0), "previous at the start is a no-op");
+        assert_eq!(
+            provider.spoken(),
+            spoken_before,
+            "a clamped seek must not resynthesize anything"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.next_sentence(cx));
+        cx.run_until_parked();
+        assert_eq!(index(cx), Some(1));
+
+        let spoken_before = provider.spoken();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.next_sentence(cx));
+        cx.run_until_parked();
+        assert_eq!(index(cx), Some(1), "next at the end is a no-op");
+        assert_eq!(provider.spoken(), spoken_before);
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.previous_sentence(cx));
+        cx.run_until_parked();
+        assert_eq!(index(cx), Some(0), "previous seeks back to the start");
     }
 }

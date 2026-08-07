@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use gpui::{App, Task};
+use gpui::{App, AppContext as _, Task};
 use std::sync::{Arc, Mutex};
 
 /// Raw uncompressed audio. Interleaved if `channels > 1`.
@@ -31,6 +31,8 @@ struct FakeTtsState {
     spoken: Vec<String>,
     fail_next: bool,
     emit_word_timings: bool,
+    hold: bool,
+    held: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
 /// Test double. Produces one silent sample per character so queue ordering
@@ -66,20 +68,34 @@ impl FakeTts {
             state.emit_word_timings = true;
         }
     }
-}
 
-/// One fake word every 100ms, mirroring how Inworld reports timings relative
-/// to the start of the utterance's audio.
-pub const FAKE_WORD_DURATION_SECS: f32 = 0.1;
-
-impl TtsProvider for FakeTts {
-    fn synthesize(&self, text: String, _cx: &App) -> Task<Result<Pcm>> {
-        let Ok(mut state) = self.state.lock() else {
-            return Task::ready(Err(anyhow!("FakeTts state poisoned")));
-        };
-        if std::mem::take(&mut state.fail_next) {
-            return Task::ready(Err(anyhow!("FakeTts was told to fail")));
+    /// Holds every subsequent synthesis in flight until [`Self::release_all`],
+    /// so tests can reproduce the real provider's network latency.
+    pub fn hold(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.hold = true;
         }
+    }
+
+    /// Completes every synthesis started while holding, and stops holding
+    /// new ones.
+    pub fn release_all(&self) {
+        let held = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            state.hold = false;
+            std::mem::take(&mut state.held)
+        };
+        for sender in held {
+            sender.send(()).ok();
+        }
+    }
+
+    fn finish_synthesis(&self, text: String) -> Result<Pcm> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(anyhow!("FakeTts state poisoned"));
+        };
         state.spoken.push(text.clone());
         let words = if state.emit_word_timings {
             text.split_whitespace()
@@ -93,12 +109,42 @@ impl TtsProvider for FakeTts {
         } else {
             Vec::new()
         };
-        Task::ready(Ok(Pcm {
+        Ok(Pcm {
             samples: vec![0.0; text.chars().count()],
             sample_rate: 22050,
             channels: 1,
             words,
-        }))
+        })
+    }
+}
+
+/// One fake word every 100ms, mirroring how Inworld reports timings relative
+/// to the start of the utterance's audio.
+pub const FAKE_WORD_DURATION_SECS: f32 = 0.1;
+
+impl TtsProvider for FakeTts {
+    fn synthesize(&self, text: String, cx: &App) -> Task<Result<Pcm>> {
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return Task::ready(Err(anyhow!("FakeTts state poisoned")));
+            };
+            if std::mem::take(&mut state.fail_next) {
+                return Task::ready(Err(anyhow!("FakeTts was told to fail")));
+            }
+            if state.hold {
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                state.held.push(sender);
+                drop(state);
+                let this = self.clone();
+                return cx.background_spawn(async move {
+                    receiver
+                        .await
+                        .map_err(|_| anyhow!("FakeTts dropped a held synthesis"))?;
+                    this.finish_synthesis(text)
+                });
+            }
+        }
+        Task::ready(self.finish_synthesis(text))
     }
 }
 
