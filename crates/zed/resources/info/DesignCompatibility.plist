@@ -1,0 +1,11 @@
+<!-- Binaries linked against the macOS 26+ SDK adopt Liquid Glass rendering,
+     under which the NSVisualEffectView material gpui uses for blurred window
+     backgrounds no longer frosts behind-window content. This key opts back
+     into the pre-Liquid-Glass design. Official Zed builds link an older SDK
+     and are unaffected; local builds use the installed Xcode SDK. Caveat:
+     Apple documents the key as ignored when building with the macOS 27+ SDK,
+     so under current Xcode-beta it may be inert - it is kept as zero-risk
+     compatibility for 26.x-SDK builds, and the lasting fix is a gpui blur
+     material that still frosts under Liquid Glass. -->
+<key>UIDesignRequiresCompatibility</key>
+<true/>

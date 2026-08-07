@@ -203,7 +203,18 @@ fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {
 /// Reloads the current theme from settings.
 pub fn reload_theme(cx: &mut App) {
     let theme = configured_theme(cx);
+    // Extension themes load after windows are created, so the appearance the
+    // window was opened with may belong to a fallback theme. Re-apply it here
+    // or a `blurred`/`transparent` theme stays opaque until a settings change.
+    let background_appearance = theme.window_background_appearance();
     GlobalTheme::update_theme(cx, theme);
+    for window in cx.windows() {
+        window
+            .update(cx, |_, window, _| {
+                window.set_background_appearance(background_appearance)
+            })
+            .ok();
+    }
     cx.refresh_windows();
 }
 
