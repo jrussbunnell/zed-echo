@@ -157,11 +157,12 @@ fn starts_spoken_block(tag: &MarkdownTag) -> bool {
     )
 }
 
-/// Pushes a plain-text run, split around tokens no human would read aloud —
-/// commit-hash-like hex strings and bare URLs. The surrounding text becomes
-/// separate runs, so the spoken→source origin map stays exact: the skipped
-/// bytes never gain a word highlight, while the sentence keeps flowing around
-/// them and (mid-sentence) the sentence wash still covers them.
+/// Pushes a plain-text run, split around tokens no human would read aloud
+/// verbatim. Hash-like tokens go silent; bare URLs speak their host instead
+/// (as a substitute run over the token's source bytes). Splitting into
+/// separate runs keeps the spoken→source origin map exact: a substitute's
+/// word highlight lands on the original token's span, the sentence keeps
+/// flowing, and (mid-sentence) the sentence wash still covers everything.
 fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &str) {
     /// Punctuation hugging a token — "(aa12de9)", "aa12de9." — stays spoken:
     /// dropping a sentence terminator along with the token would merge
@@ -175,15 +176,30 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
         let core = token.trim_start_matches(LEADING_EDGE);
         let core_start = token_start + (token.len() - core.len());
         let core = core.trim_end_matches(TRAILING_EDGE);
-        let skip = !core.is_empty()
-            && (is_hash_like(core) || core.starts_with("http://") || core.starts_with("https://"));
-        if !skip {
+        if core.is_empty() {
             continue;
         }
+        let replacement = if is_hash_like(core) {
+            Some(None)
+        } else if core.starts_with("http://") || core.starts_with("https://") {
+            Some(spoken_url_host(core))
+        } else {
+            None
+        };
+        let Some(substitute) = replacement else {
+            continue;
+        };
         if emitted_until < core_start {
             runs.push(TextRun {
                 source_range: source_range.start + emitted_until..source_range.start + core_start,
                 text: text[emitted_until..core_start].to_string(),
+            });
+        }
+        if let Some(substitute) = substitute {
+            runs.push(TextRun {
+                source_range: source_range.start + core_start
+                    ..source_range.start + core_start + core.len(),
+                text: substitute,
             });
         }
         emitted_until = core_start + core.len();
@@ -196,10 +212,12 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
     }
 }
 
-/// How an inline code span should sound, if at all. `None` skips the span.
-/// The bar is "would a human reading this aloud say the token, or gesture at
-/// it?" — only word-like names get spoken (with `_`/`-` as word separators),
-/// while paths, expressions, flags, hashes, and URLs get gestured at.
+/// How an inline code span should sound. Word-like names are spoken with
+/// `_`/`-` as word separators; everything else gets a natural spoken
+/// fragment — a URL its host, a path its final component, other code its
+/// leading word runs — so the sentence flows through it instead of jumping
+/// over a hole. `None` (silence) remains only where nothing sensible can be
+/// said: pure symbols and hash-like tokens.
 fn spoken_inline_code(content: &str) -> Option<String> {
     /// A token this long without a space is an identifier nobody says aloud.
     const MAX_TOKEN_LENGTH: usize = 20;
@@ -210,37 +228,119 @@ fn spoken_inline_code(content: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    // Word-like is an allowlist, not a blocklist: any character outside
-    // letters/digits/`_`/`-`/spaces (`<`, `&`, `[`, `/`, `=`, `.`, `:`, ...)
-    // marks the span as code to skip, so `Vec<String>`, `&mut self`, or
-    // `player.rs:250` can never leak into the audio as character soup.
-    if !trimmed
+    // Word-like is an allowlist: only letters/digits/`_`/`-`/spaces, spoken
+    // verbatim with separators as spaces. The 1:1 replacement keeps the
+    // spoken bytes aligned with the source bytes for the origin map.
+    let word_like = trimmed
         .chars()
         .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-' | ' '))
-    {
-        return None;
-    }
-    for token in trimmed.split_whitespace() {
-        if token.len() >= MAX_TOKEN_LENGTH
-            || token.starts_with('-') // CLI flags: -p, --foo
-            || is_hash_like(token)
-        {
-            return None;
+        && trimmed.split_whitespace().all(|token| {
+            token.len() < MAX_TOKEN_LENGTH && !token.starts_with('-') && !is_hash_like(token)
+        });
+    if word_like {
+        let separated: String = content
+            .chars()
+            .map(|character| {
+                if matches!(character, '_' | '-') {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        if separated.split_whitespace().count() <= MAX_WORDS {
+            return Some(separated);
         }
     }
-    let separated: String = content
-        .chars()
-        .map(|character| {
-            if matches!(character, '_' | '-') {
-                ' '
-            } else {
-                character
-            }
-        })
+    if trimmed.contains("://") {
+        return spoken_url_host(trimmed);
+    }
+    // Bare file names (`main.rs`) and `file:line` references take the same
+    // spoken form as full paths: the name, minus extension and line suffix.
+    if trimmed.contains(['/', '\\'])
+        || (!trimmed.contains(char::is_whitespace) && trimmed.contains(['.', ':']))
+    {
+        return spoken_path_component(trimmed);
+    }
+    spoken_word_runs(trimmed)
+}
+
+/// How many alphanumeric word runs a substitute may speak. Enough to name
+/// the thing (`cargo test p read`), short enough not to recite it.
+const MAX_SUBSTITUTE_RUNS: usize = 4;
+
+/// The alphanumeric word runs of a code fragment, in order and capped — the
+/// part of it a human would actually say: "Vec String" for `Vec<String>`,
+/// "HOME" for `$HOME`. `None` when nothing sayable survives (pure symbols,
+/// hash-like or unpronounceably long runs).
+fn spoken_word_runs(code: &str) -> Option<String> {
+    /// Runs this long are identifiers nobody says aloud, like hashes.
+    const MAX_RUN_LENGTH: usize = 20;
+
+    let runs: Vec<&str> = code
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|run| !run.is_empty() && run.len() < MAX_RUN_LENGTH && !is_hash_like(run))
+        .take(MAX_SUBSTITUTE_RUNS)
         .collect();
-    // `_`/`-` are 1:1 with the space replacing them, so the spoken bytes stay
-    // aligned with the source bytes for the origin map.
-    (separated.split_whitespace().count() <= MAX_WORDS).then_some(separated)
+    if runs.is_empty() {
+        None
+    } else {
+        Some(runs.join(" "))
+    }
+}
+
+/// A path speaks its final component's name — "player" for
+/// `crates/read_aloud/src/player.rs:250` — with the extension and any
+/// `:line` suffix dropped.
+fn spoken_path_component(path: &str) -> Option<String> {
+    let component = path
+        .split(['/', '\\'])
+        .map(str::trim)
+        .rfind(|segment| !segment.is_empty())?;
+    let component = match component.rfind(':') {
+        Some(colon)
+            if colon + 1 < component.len()
+                && component[colon + 1..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit()) =>
+        {
+            &component[..colon]
+        }
+        _ => component,
+    };
+    let component = match component.rfind('.') {
+        Some(dot)
+            if dot > 0
+                && !component[dot + 1..].is_empty()
+                && component[dot + 1..].len() <= 5
+                && component[dot + 1..]
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()) =>
+        {
+            &component[..dot]
+        }
+        _ => component,
+    };
+    spoken_word_runs(component)
+}
+
+/// A URL speaks its host, minus the TLD (and any `www`) — "docs inworld"
+/// for `https://docs.inworld.ai/tts`. `None` when no host can be extracted.
+fn spoken_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .split(':')
+        .next()?;
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    let labels = labels.strip_prefix(["www"].as_slice()).unwrap_or(&labels);
+    let speakable = match labels {
+        [] => return None,
+        [only] => std::slice::from_ref(only),
+        [named @ .., _top_level_domain] => named,
+    };
+    spoken_word_runs(&speakable.join(" "))
 }
 
 /// Commit-SHA-shaped: a long run of pure hex. Requiring both a digit and a
@@ -674,31 +774,44 @@ mod tests {
     }
 
     #[gpui::test]
-    fn skips_path_and_code_like_inline_code(cx: &mut TestAppContext) {
+    fn substitutes_a_paths_final_component(cx: &mut TestAppContext) {
         assert_eq!(
             spoken(
                 "The fix is in `crates/read_aloud/src/player.rs:250` and ready.\n",
                 cx
             ),
-            vec!["The fix is in and ready."]
+            vec!["The fix is in player and ready."]
+        );
+        assert_eq!(
+            spoken("Drop it in `~/Library/Application Support` please.\n", cx),
+            vec!["Drop it in Application Support please."]
+        );
+        assert_eq!(
+            spoken("Check `main.rs` first.\n", cx),
+            vec!["Check main first."],
+            "a bare file name drops its extension like a path component does"
+        );
+    }
+
+    #[gpui::test]
+    fn substitutes_code_like_inline_code_with_word_runs(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken("Use `Vec<String>` or `&mut self` or `vec[0]` here.\n", cx),
+            vec!["Use Vec String or mut self or vec 0 here."]
+        );
+        assert_eq!(
+            spoken("Read `$HOME` and `let x = 1` now.\n", cx),
+            vec!["Read HOME and let x 1 now."]
         );
         assert_eq!(
             spoken("Run `cargo test -p read_aloud` locally.\n", cx),
-            vec!["Run locally."]
+            vec!["Run cargo test p read locally."],
+            "word runs are capped at four"
         );
         assert_eq!(
-            spoken("Check `main.rs` and `let x = 1` here.\n", cx),
-            vec!["Check and here."]
-        );
-        // Word-like is an allowlist: one character outside it is enough to
-        // mark the span as code, even without a classic path/flag signal.
-        assert_eq!(
-            spoken("Use `Vec<String>` or `&mut self` or `vec[0]` here.\n", cx),
-            vec!["Use or or here."]
-        );
-        assert_eq!(
-            spoken("Read `$HOME` and `x | y` and `a + b*c` now.\n", cx),
-            vec!["Read and and now."]
+            spoken("Use `->>=` here.\n", cx),
+            vec!["Use here."],
+            "pure symbols still go silent — there is nothing to say"
         );
     }
 
@@ -717,53 +830,96 @@ mod tests {
     }
 
     #[gpui::test]
-    fn skips_bare_urls_but_keeps_link_text(cx: &mut TestAppContext) {
+    fn substitutes_a_bare_urls_host_and_keeps_link_text(cx: &mut TestAppContext) {
         assert_eq!(
-            spoken("See https://example.com/docs for more.\n", cx),
-            vec!["See for more."]
+            spoken("See https://docs.inworld.ai/tts for more.\n", cx),
+            vec!["See docs inworld for more."]
         );
         assert_eq!(
             spoken("See <https://example.com> for more.\n", cx),
-            vec!["See for more."]
+            vec!["See example for more."]
+        );
+        assert_eq!(
+            spoken("Check `https://docs.inworld.ai/tts` too.\n", cx),
+            vec!["Check docs inworld too."],
+            "URLs inside code spans speak the same host form"
         );
         assert_eq!(
             spoken("See [the docs](https://example.com) for more.\n", cx),
-            vec!["See the docs for more."]
+            vec!["See the docs for more."],
+            "link text is still spoken with the URL stripped"
         );
     }
 
     #[gpui::test]
-    fn a_skipped_span_keeps_sentence_flow_and_origins(cx: &mut TestAppContext) {
+    fn a_substituted_span_keeps_sentence_flow_and_origins(cx: &mut TestAppContext) {
         let source = "The fix is in `player.rs:250` and ready.\n";
         let utterances = utterances(source, false, cx);
         assert_eq!(utterances.len(), 1);
         let utterance = &utterances[0];
-        assert_eq!(utterance.spoken_text, "The fix is in and ready.");
+        assert_eq!(utterance.spoken_text, "The fix is in player and ready.");
 
-        // The sentence wash still covers the skipped span...
+        // The sentence wash covers the substituted span...
         let code_start = source.find("`player").expect("code span exists");
         let code_end = source.find(" and").expect("code span ends");
         assert!(utterance.source_range.start < code_start);
         assert!(utterance.source_range.end > code_end);
 
-        // ...but no spoken byte maps into it, so the word pill can never
-        // land there.
-        let code_range = code_start..code_end;
-        assert!(
-            utterance
-                .spoken_origins
-                .iter()
-                .all(|origin| !code_range.contains(origin))
-        );
-
-        // Words after the skip still map to the right source bytes.
+        // ...and the substitute's word pill lands on the original span.
         let spoken_start = utterance
             .spoken_text
-            .find("and")
-            .expect("word survives the skip");
+            .find("player")
+            .expect("the substitute is spoken");
         let mapped = utterance
-            .source_range_for_spoken(spoken_start..spoken_start + "and".len())
+            .source_range_for_spoken(spoken_start..spoken_start + "player".len())
+            .expect("the substitute maps back to the source");
+        assert!(
+            mapped.start >= code_start && mapped.end <= code_end + 1,
+            "the pill for a substitute must cover source bytes of the code \
+             span it stands for, got {mapped:?}"
+        );
+
+        // Words after the substitute still map to their own source bytes.
+        let spoken_and = utterance
+            .spoken_text
+            .rfind("and")
+            .expect("the sentence continues");
+        let mapped_and = utterance
+            .source_range_for_spoken(spoken_and..spoken_and + "and".len())
             .expect("word maps back to the source");
-        assert_eq!(&source[mapped], "and");
+        assert_eq!(&source[mapped_and], "and");
+    }
+
+    #[gpui::test]
+    fn keeps_the_ill_sentence_whole_for_both_apostrophes(cx: &mut TestAppContext) {
+        // The user-reported cut: the sentence must never split after "I'll",
+        // with either the ASCII or the typographic apostrophe, complete or
+        // streamed. (The heard cut came from the reader finalizing a stale
+        // parse, covered in read_aloud's tests; these pin the segmenter's
+        // own behavior around the multi-byte `’`/`≥`/`×` characters.)
+        let ascii = "Sounds good. When you've got it, drop the file anywhere in the repo \
+                     (one big square PNG \u{2265}1024\u{d7}1024 is enough) and I'll generate \
+                     both sizes and rebundle.\n";
+        let curly = "Sounds good. When you\u{2019}ve got it, drop the file anywhere in the repo \
+                     (one big square PNG \u{2265}1024\u{d7}1024 is enough) and I\u{2019}ll \
+                     generate both sizes and rebundle.\n";
+        for source in [ascii, curly] {
+            let complete = spoken_complete(source, cx);
+            assert_eq!(complete.len(), 2, "two sentences, never a fragment");
+            assert!(
+                complete[1].ends_with("generate both sizes and rebundle."),
+                "the second sentence stays whole, got {:?}",
+                complete[1]
+            );
+
+            // Streamed with the chunk boundary right after "ll": the
+            // unterminated fragment is withheld, not spoken as a cut.
+            let cut = source.find("ll generate").expect("test string") + 2;
+            assert_eq!(
+                spoken(&source[..cut], cx),
+                vec!["Sounds good."],
+                "a mid-sentence streaming prefix must withhold the fragment"
+            );
+        }
     }
 }

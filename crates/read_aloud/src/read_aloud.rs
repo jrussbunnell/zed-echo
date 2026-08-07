@@ -115,6 +115,16 @@ pub struct ReadAloud {
     /// outran the stream), not the end — the mini player stays visible
     /// through it instead of blinking out.
     message_complete: bool,
+    /// Completion arrived while the entity's background parse still lagged
+    /// its source. Finalizing that stale parse would speak its trailing
+    /// sentence fragment — a mid-stream chunk boundary, not a sentence end —
+    /// so the completion waits here until the parse catches up (see the
+    /// observation installed in `switch_to`).
+    pending_completion: bool,
+    /// Watches the speaking entity so a deferred completion can be applied
+    /// the moment its parse lands; nothing else re-runs segmentation after
+    /// the turn's final thread event.
+    speaking_parse_observation: Option<Subscription>,
     poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -157,9 +167,21 @@ impl ReadAloud {
             pending: Vec::new(),
             stopped_by_user: false,
             message_complete: false,
+            pending_completion: false,
+            speaking_parse_observation: None,
             poll_task: None,
             _subscriptions: vec![subscription, player_observation],
         }
+    }
+
+    /// Whether the entity's background parse has caught up with its source.
+    /// Segmentation reads the last *completed* parse, which lags appends;
+    /// mid-stream that parse often ends at a chunk boundary in the middle of
+    /// a sentence, so treating it as the complete message would finalize a
+    /// fragment (the "…and I'll" cut).
+    fn parse_is_current(markdown: &Entity<Markdown>, cx: &App) -> bool {
+        let markdown = markdown.read(cx);
+        markdown.parsed_markdown().source() == markdown.source()
     }
 
     /// Segments a markdown entity and hands the utterances to the player.
@@ -232,6 +254,7 @@ impl ReadAloud {
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
+        let message_complete = self.resolve_completeness(&markdown, message_complete, cx);
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player.update(cx, |player, cx| {
             player.set_utterances(utterances, cx);
@@ -254,11 +277,24 @@ impl ReadAloud {
         self.clear_highlight(cx);
         self.speaking = Some(markdown);
         self.stopped_by_user = false;
-        self.message_complete = message_complete;
+        // Completion state is per-entity: a switch starts from this call's
+        // own knowledge, not the previous entity's deferred flag.
+        self.pending_completion = false;
 
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
+        self.speaking_parse_observation = Some(cx.observe(&markdown, |this, markdown, cx| {
+            if this.pending_completion
+                && this.speaking.as_ref() == Some(&markdown)
+                && Self::parse_is_current(&markdown, cx)
+            {
+                this.pending_completion = false;
+                this.mark_tracked_message_complete(cx);
+            }
+        }));
+        let message_complete = self.resolve_completeness(&markdown, message_complete, cx);
+        self.message_complete = message_complete;
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player.update(cx, |player, cx| {
             player.set_utterances(utterances, cx);
@@ -299,12 +335,29 @@ impl ReadAloud {
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
+        let message_complete = self.resolve_completeness(&markdown, message_complete, cx);
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player
             .update(cx, |player, cx| player.set_utterances(utterances, cx));
         self.message_complete = message_complete;
         self.push_speakable_ranges(cx);
         self.start_polling(cx);
+    }
+
+    /// Resolves the completeness to segment with. Completion against a parse
+    /// that still lags the source is deferred — `pending_completion` holds it
+    /// (surviving later incomplete enqueues) until the parse catches up and
+    /// the observation in `switch_to` re-delivers it.
+    fn resolve_completeness(
+        &mut self,
+        markdown: &Entity<Markdown>,
+        message_complete: bool,
+        cx: &App,
+    ) -> bool {
+        let requested = message_complete || self.pending_completion;
+        let effective = requested && Self::parse_is_current(markdown, cx);
+        self.pending_completion = requested && !effective;
+        effective
     }
 
     /// Explicit request to hear one message from its beginning. Overrides
@@ -367,6 +420,8 @@ impl ReadAloud {
         self.speaking = None;
         self.stopped_by_user = true;
         self.message_complete = false;
+        self.pending_completion = false;
+        self.speaking_parse_observation = None;
         self.poll_task = None;
         self.player.update(cx, |player, cx| {
             player.set_utterances(Vec::new(), cx);
@@ -1938,6 +1993,58 @@ mod tests {
             read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
             None,
             "and once the tail drains, the player hides"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_completion_racing_the_parser_does_not_cut_the_sentence(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+
+        // A chunk lands that ends mid-sentence; its parse completes.
+        markdown.update(cx, |markdown, cx| {
+            markdown.append(
+                "Sounds good. When you\u{2019}ve got it, drop the file anywhere in the repo \
+                 (one big square PNG \u{2265}1024\u{d7}1024 is enough) and I\u{2019}ll",
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["Sounds good."]);
+
+        // The rest of the sentence arrives together with the turn's end —
+        // the completion is processed while the background parse still
+        // reflects the old chunk boundary after "I'll".
+        markdown.update(cx, |markdown, cx| {
+            markdown.append(" generate both sizes and rebundle.", cx);
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "Sounds good.".to_string(),
+                "When you\u{2019}ve got it, drop the file anywhere in the repo (one big square \
+                 PNG \u{2265}1024\u{d7}1024 is enough) and I\u{2019}ll generate both sizes and \
+                 rebundle."
+                    .to_string(),
+            ],
+            "the sentence must be spoken whole once the parse catches up — \
+             never finalized at the stale parse's chunk boundary"
         );
     }
 }
