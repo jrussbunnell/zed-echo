@@ -78,11 +78,16 @@ const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
 /// A snapshot of the player, thin enough to derive on every render, for the
 /// mini player UI. `None` while there is nothing to control.
+///
+/// `stopped` is the reduced replay form shown after a user stop: playback is
+/// parked, `utterance_index` is 0, and `sentence_text` previews the tracked
+/// message's first sentence so a play button can offer to restart it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackState {
     pub utterance_index: usize,
     pub utterance_count: usize,
     pub paused: bool,
+    pub stopped: bool,
     pub sentence_text: SharedString,
 }
 
@@ -105,6 +110,11 @@ pub struct ReadAloud {
     /// past the cursor `stop` parked at the old end, and the player starts
     /// speaking again without being asked.
     stopped_by_user: bool,
+    /// Whether the tracked entity's message had finished streaming as of the
+    /// last segmentation. While it has not, an idle player is a lull (speech
+    /// outran the stream), not the end — the mini player stays visible
+    /// through it instead of blinking out.
+    message_complete: bool,
     poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -146,6 +156,7 @@ impl ReadAloud {
             speaking: None,
             pending: Vec::new(),
             stopped_by_user: false,
+            message_complete: false,
             poll_task: None,
             _subscriptions: vec![subscription, player_observation],
         }
@@ -166,20 +177,23 @@ impl ReadAloud {
         let switched_entity = self.speaking.as_ref() != Some(markdown);
         if switched_entity {
             if self.stopped_by_user {
+                if self.speaking.is_none() {
+                    // Dismissed: the user closed the stopped controls, so
+                    // passive streaming must not resurrect them. Only
+                    // explicit intent (a seek or `play_from_top`) leaves
+                    // this state.
+                    return;
+                }
                 // The user's stop outlives the block that was sounding when
                 // they pressed it: one agent turn keeps arriving as fresh
                 // entities (a new one after every tool call), and none of
-                // them may restart speech — only `toggle` or a seek lifts
-                // the latch. The newest entity is still tracked (quietly,
-                // with the player left empty and silent) so an explicit
-                // toggle later restarts from the message the user actually
-                // sees, exactly as it does after a same-entity stop.
+                // them may restart speech — only explicit intent lifts the
+                // latch. The newest entity is still tracked (quietly, parked
+                // and silent) so the stopped-form controls preview it and a
+                // restart plays the message the user actually sees.
                 self.clear_highlight(cx);
                 self.speaking = Some(markdown.clone());
-                self.player.update(cx, |player, cx| {
-                    player.set_utterances(Vec::new(), cx);
-                    player.reset(cx);
-                });
+                self.track_quietly(message_complete, cx);
                 return;
             }
             if self.speaking.is_some() && !self.player.read(cx).is_idle() {
@@ -200,10 +214,31 @@ impl ReadAloud {
         }
         if self.stopped_by_user {
             // The user stopped this message. More of it arriving is not a
-            // reason to start speaking again; only `toggle` or a seek is.
+            // reason to start speaking again; only explicit intent is — but
+            // the parked preview keeps tracking what a restart would say.
+            self.track_quietly(message_complete, cx);
             return;
         }
         self.refresh_current(message_complete, cx);
+    }
+
+    /// Re-segments the tracked entity without starting playback: the stop
+    /// latch stays, nothing is synthesized (the pump `set_utterances` spawns
+    /// is dropped before it can run), and the player ends parked exactly as
+    /// `Player::stop` leaves it. This keeps the stopped-form mini player's
+    /// first-sentence preview — and the content a later restart speaks —
+    /// current while a stopped turn keeps streaming.
+    fn track_quietly(&mut self, message_complete: bool, cx: &mut Context<Self>) {
+        let Some(markdown) = self.speaking.clone() else {
+            return;
+        };
+        let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
+        self.player.update(cx, |player, cx| {
+            player.set_utterances(utterances, cx);
+            player.stop(cx);
+        });
+        self.message_complete = message_complete;
+        self.push_speakable_ranges(cx);
     }
 
     /// Makes `markdown` the speaking entity and restarts the player from its
@@ -219,6 +254,7 @@ impl ReadAloud {
         self.clear_highlight(cx);
         self.speaking = Some(markdown);
         self.stopped_by_user = false;
+        self.message_complete = message_complete;
 
         let Some(markdown) = self.speaking.clone() else {
             return;
@@ -266,8 +302,58 @@ impl ReadAloud {
         let utterances = segment(markdown.read(cx).parsed_markdown(), message_complete);
         self.player
             .update(cx, |player, cx| player.set_utterances(utterances, cx));
+        self.message_complete = message_complete;
         self.push_speakable_ranges(cx);
         self.start_polling(cx);
+    }
+
+    /// Explicit request to hear one message from its beginning. Overrides
+    /// everything passive: the pending queue, a latched stop, a dismissal,
+    /// and whatever is currently sounding.
+    pub fn play_from_top(
+        &mut self,
+        markdown: &Entity<Markdown>,
+        message_complete: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending.clear();
+        self.switch_to(markdown.clone(), message_complete, cx);
+    }
+
+    /// Stops playback where it is and latches the stop: nothing speaks again
+    /// until explicit intent (a toggle, a seek, or `play_from_top`). Same
+    /// path `toggle` takes while speaking.
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        // `stop` emits `Finished`, and this entity's own subscription to
+        // the player already clears the highlight in response — no need
+        // to do it again here.
+        self.player.update(cx, |player, cx| player.stop(cx));
+        self.poll_task = None;
+        self.stopped_by_user = true;
+        // A stop is explicit intent about the whole session, not just the
+        // current message: nothing waiting its turn may start either.
+        self.pending.clear();
+        // `self.speaking` is deliberately retained so the stopped-form
+        // controls have a message to preview and restart.
+    }
+
+    /// Hides the player UI entirely: stops tracking, drops the parked
+    /// utterances, and keeps the stop latch so passive streaming can bring
+    /// back neither the controls nor audio. Purely playback-UI state — the
+    /// thread and settings are untouched. "Dismissed" is the latch with
+    /// nothing tracked; any explicit playback request leaves it.
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.pending.clear();
+        self.clear_highlight(cx);
+        self.speaking = None;
+        self.stopped_by_user = true;
+        self.message_complete = false;
+        self.poll_task = None;
+        self.player.update(cx, |player, cx| {
+            player.set_utterances(Vec::new(), cx);
+            player.reset(cx);
+        });
+        cx.notify();
     }
 
     /// Mirrors the current utterance ranges into the speaking entity so its
@@ -327,17 +413,7 @@ impl ReadAloud {
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
         if self.is_speaking() {
-            // `stop` emits `Finished`, and this entity's own subscription to
-            // the player already clears the highlight in response — no need
-            // to do it again here.
-            self.player.update(cx, |player, cx| player.stop(cx));
-            self.poll_task = None;
-            self.stopped_by_user = true;
-            // A stop is explicit intent about the whole session, not just the
-            // current message: nothing waiting its turn may start either.
-            self.pending.clear();
-            // `self.speaking` is deliberately retained so toggling back on has
-            // a message to restart.
+            self.stop(cx);
         } else if self.speaking.is_some() {
             // Restart from the top. `stop` discarded the queue position, and
             // resuming mid-sentence would need an offset into audio the sink
@@ -364,16 +440,29 @@ impl ReadAloud {
     }
 
     /// What the mini player needs to render, `None` when it should be
-    /// hidden: nothing loaded, playback finished, or stopped.
+    /// hidden: nothing loaded, dismissed, or playback naturally finished. A
+    /// user stop keeps a reduced `stopped` state alive so restarting stays
+    /// one click away.
     pub fn playback_state(&self, cx: &App) -> Option<PlaybackState> {
         self.speaking.as_ref()?;
         let player = self.player.read(cx);
         let utterance_count = player.utterances().len();
+        if self.stopped_by_user {
+            let utterance = player.utterances().first()?;
+            return Some(PlaybackState {
+                utterance_index: 0,
+                utterance_count,
+                paused: false,
+                stopped: true,
+                sentence_text: SharedString::new(utterance.spoken_text.as_str()),
+            });
+        }
         let utterance_index = player.speaking_index().or_else(|| {
-            // The sink can be momentarily empty while synthesis catches up;
-            // the utterance being synthesized stands in so the controls do
-            // not blink out mid-message.
-            (!player.is_idle() && utterance_count > 0)
+            // Two reasons the sink can be empty mid-message: synthesis is
+            // catching up, or speech outran a still-streaming message (an
+            // idle lull). Either way the controls must not blink out, so the
+            // utterance next in line stands in.
+            ((!player.is_idle() || !self.message_complete) && utterance_count > 0)
                 .then(|| player.next_to_synthesize().min(utterance_count - 1))
         })?;
         let utterance = player.utterances().get(utterance_index)?;
@@ -381,6 +470,7 @@ impl ReadAloud {
             utterance_index,
             utterance_count,
             paused: player.is_paused(),
+            stopped: false,
             sentence_text: SharedString::new(utterance.spoken_text.as_str()),
         })
     }
@@ -1198,6 +1288,17 @@ mod tests {
             None,
             "and nothing may be highlighted"
         );
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            Some(PlaybackState {
+                utterance_index: 0,
+                utterance_count: 2,
+                paused: false,
+                stopped: true,
+                sentence_text: "Alpha.".into(),
+            }),
+            "the stopped-form controls preview the newest (quietly tracked) message"
+        );
 
         // An explicit toggle afterwards restarts from the newest message —
         // the view layer's toggle path calls `toggle` then re-enqueues, and
@@ -1335,7 +1436,7 @@ mod tests {
         );
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.enqueue_markdown(&markdown, false, cx);
+            read_aloud.enqueue_markdown(&markdown, true, cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -1344,6 +1445,7 @@ mod tests {
                 utterance_index: 0,
                 utterance_count: 2,
                 paused: false,
+                stopped: false,
                 sentence_text: "First one.".into(),
             })
         );
@@ -1413,5 +1515,233 @@ mod tests {
         read_aloud.update(cx, |read_aloud, cx| read_aloud.previous_sentence(cx));
         cx.run_until_parked();
         assert_eq!(index(cx), Some(0), "previous seeks back to the start");
+    }
+
+    #[gpui::test]
+    async fn play_from_top_overrides_stop_and_pending_queue(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha. Beta.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.run_until_parked();
+
+        // Explicit intent interrupts A immediately and empties the queue.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.play_from_top(&markdown_b, true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            provider
+                .spoken()
+                .ends_with(&["Alpha.".to_string(), "Beta.".to_string()]),
+            "play_from_top must speak the requested message from its start, got {:?}",
+            provider.spoken()
+        );
+        assert_eq!(
+            markdown_a.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            None
+        );
+        assert_eq!(
+            markdown_b.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..6)
+        );
+
+        // Drain B: with the queue cleared, nothing (i.e. not A) follows it.
+        let spoken_after_switch = provider.spoken();
+        for _ in 0..3 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            provider.spoken(),
+            spoken_after_switch,
+            "the pending queue must have been cleared by play_from_top"
+        );
+
+        // And it overrides a latched stop too.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, true, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.play_from_top(&markdown_a, true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()),
+            "play_from_top must lift a latched stop"
+        );
+        assert_eq!(
+            markdown_a.read_with(cx, |markdown, _| markdown.speaking_highlight().cloned()),
+            Some(0..4),
+            "and it restarts at the first sentence"
+        );
+    }
+
+    #[gpui::test]
+    async fn stopping_leaves_a_restartable_stopped_state(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud =
+            cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+
+        // The speaker-button stop path and `toggle` while speaking share
+        // `stop`; either way the reduced stopped form must remain.
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.stop(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            Some(PlaybackState {
+                utterance_index: 0,
+                utterance_count: 2,
+                paused: false,
+                stopped: true,
+                sentence_text: "First one.".into(),
+            }),
+            "a stop must leave a restartable stopped state, not hide the player"
+        );
+
+        // The stopped-form play button routes through `toggle`'s restart.
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        assert!(read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+        assert_eq!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| (state.stopped, state.utterance_index)),
+            Some((false, 0)),
+            "restarting leaves the stopped form and begins at the top"
+        );
+    }
+
+    #[gpui::test]
+    async fn dismiss_hides_the_player_until_explicit_intent(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One. Two.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+        assert!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .is_some_and(|state| state.stopped),
+            "setup: the stop leaves the stopped form visible"
+        );
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.dismiss(cx));
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "dismiss hides the player entirely"
+        );
+
+        // Passive streaming — of the old message or a new block — must not
+        // resurrect the controls or start audio.
+        markdown_a.update(cx, |markdown, cx| markdown.append("Three.\n", cx));
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, false, cx);
+            read_aloud.enqueue_markdown(&markdown_b, false, cx);
+        });
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "passive updates must not undo a dismissal"
+        );
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+        assert_eq!(provider.spoken(), spoken_when_stopped);
+
+        // Explicit intent leaves the dismissed state.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.play_from_top(&markdown_b, true, cx);
+        });
+        cx.run_until_parked();
+        assert!(read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+        assert_eq!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| state.stopped),
+            Some(false)
+        );
+    }
+
+    #[gpui::test]
+    async fn the_player_state_survives_a_streaming_lull(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("First one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+
+        // Speech outruns the stream: everything segmented so far has played,
+        // but the message is not complete — the controls must hold on.
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| (state.stopped, state.utterance_index)),
+            Some((false, 0)),
+            "an idle lull mid-stream must not hide the controls"
+        );
+
+        // Completion with nothing further to speak is a real finish: hide.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "a naturally finished, complete message leaves nothing to control"
+        );
     }
 }

@@ -7498,6 +7498,13 @@ pub(crate) mod tests {
             "the second toggle must stop"
         );
         assert!(sink.is_stopped());
+        assert_eq!(
+            reader
+                .read_with(cx, |reader, cx| reader.playback_state(cx))
+                .map(|state| (state.stopped, state.sentence_text)),
+            Some((true, "First one.".into())),
+            "a stop must leave the mini player's reduced replay form, not hide it"
+        );
 
         thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
         cx.run_until_parked();

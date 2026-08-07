@@ -1278,13 +1278,18 @@ impl ThreadView {
                 // would speak nothing. `toggle` also lifts the user-stop latch,
                 // without which the enqueue below would be ignored.
                 read_aloud.toggle(cx);
+                // Re-segment even when this message is the one already loaded.
+                // With `auto_play` off nothing else ever refreshes the
+                // utterance list, and the first load can easily have landed
+                // while the message had no complete sentence in it yet —
+                // leaving `toggle` alone with nothing to restart, forever.
+                read_aloud.enqueue_markdown(&markdown, message_complete, cx);
+            } else {
+                // Loading a different message is explicit intent, and must
+                // override a latched stop or a dismissal — which
+                // `enqueue_markdown`, the passive streaming path, honors.
+                read_aloud.play_from_top(&markdown, message_complete, cx);
             }
-            // Re-segment even when this message is the one already loaded. With
-            // `auto_play` off nothing else ever refreshes the utterance list,
-            // and the first load can easily have landed while the message had
-            // no complete sentence in it yet — leaving `toggle` alone with
-            // nothing to restart, forever.
-            read_aloud.enqueue_markdown(&markdown, message_complete, cx);
         });
     }
 
@@ -1294,20 +1299,110 @@ impl ThreadView {
     }
 
     /// Floating playback controls for read aloud, docked just above the
-    /// composer and hidden whenever the player has nothing going on. Every
-    /// button routes through the same code paths as the `read_aloud::Toggle`
-    /// and `read_aloud::TogglePause` actions, so behavior stays identical to
-    /// the keyboard.
+    /// composer. While something plays (or is paused or synthesizing) it
+    /// shows the full transport; after a user stop it reduces to a replay
+    /// form — play, first-sentence preview, and an X that dismisses the
+    /// player entirely. Buttons route through the same code paths as the
+    /// `read_aloud::Toggle` and `read_aloud::TogglePause` actions, so
+    /// behavior stays identical to the keyboard.
     fn render_read_aloud_mini_player(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let read_aloud = self.read_aloud.as_ref()?;
         let state = read_aloud.read(cx).playback_state(cx)?;
-        let at_start = state.utterance_index == 0;
-        let at_end = state.utterance_index + 1 >= state.utterance_count;
-        let counter = format!("{}/{}", state.utterance_index + 1, state.utterance_count);
-        let play_pause_icon = if state.paused {
-            IconName::PlayFilled
+
+        let sentence_preview = div().max_w(rems(16.)).child(
+            Label::new(state.sentence_text.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        );
+
+        let pill = h_flex()
+            .gap_1()
+            .py_1()
+            .px_2()
+            .rounded_full()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_md();
+
+        let pill = if state.stopped {
+            pill.child(
+                IconButton::new("read-aloud-restart", IconName::PlayFilled)
+                    .icon_size(IconSize::Small)
+                    .style(ui::ButtonStyle::Filled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(read_aloud) = this.read_aloud.clone() {
+                            // The same restart path the Toggle action takes:
+                            // rewind the tracked message and speak it.
+                            read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+                        }
+                    })),
+            )
+            .child(sentence_preview)
+            .child(
+                IconButton::new("read-aloud-dismiss", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(read_aloud) = this.read_aloud.clone() {
+                            read_aloud.update(cx, |read_aloud, cx| read_aloud.dismiss(cx));
+                        }
+                    })),
+            )
         } else {
-            IconName::DebugPause
+            let at_start = state.utterance_index == 0;
+            let at_end = state.utterance_index + 1 >= state.utterance_count;
+            let counter = format!("{}/{}", state.utterance_index + 1, state.utterance_count);
+            let play_pause_icon = if state.paused {
+                IconName::PlayFilled
+            } else {
+                IconName::DebugPause
+            };
+
+            pill.child(
+                IconButton::new("read-aloud-previous", IconName::ChevronLeft)
+                    .icon_size(IconSize::Small)
+                    .disabled(at_start)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(read_aloud) = this.read_aloud.clone() {
+                            read_aloud
+                                .update(cx, |read_aloud, cx| read_aloud.previous_sentence(cx));
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new("read-aloud-play-pause", play_pause_icon)
+                    .icon_size(IconSize::Small)
+                    .style(ui::ButtonStyle::Filled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(read_aloud) = this.read_aloud.clone() {
+                            read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new("read-aloud-next", IconName::ChevronRight)
+                    .icon_size(IconSize::Small)
+                    .disabled(at_end)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(read_aloud) = this.read_aloud.clone() {
+                            read_aloud.update(cx, |read_aloud, cx| read_aloud.next_sentence(cx));
+                        }
+                    })),
+            )
+            .child(sentence_preview)
+            .child(
+                Label::new(counter)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("read-aloud-stop", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_read_aloud(cx);
+                    })),
+            )
         };
 
         Some(
@@ -1324,76 +1419,67 @@ impl ThreadView {
                         .left_0()
                         .right_0()
                         .justify_center()
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .py_1()
-                                .px_2()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(cx.theme().colors().border)
-                                .bg(cx.theme().colors().elevated_surface_background)
-                                .shadow_md()
-                                .child(
-                                    IconButton::new("read-aloud-previous", IconName::ChevronLeft)
-                                        .icon_size(IconSize::Small)
-                                        .disabled(at_start)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(read_aloud) = this.read_aloud.clone() {
-                                                read_aloud.update(cx, |read_aloud, cx| {
-                                                    read_aloud.previous_sentence(cx)
-                                                });
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("read-aloud-play-pause", play_pause_icon)
-                                        .icon_size(IconSize::Small)
-                                        .style(ui::ButtonStyle::Filled)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(read_aloud) = this.read_aloud.clone() {
-                                                read_aloud.update(cx, |read_aloud, cx| {
-                                                    read_aloud.toggle_pause(cx)
-                                                });
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("read-aloud-next", IconName::ChevronRight)
-                                        .icon_size(IconSize::Small)
-                                        .disabled(at_end)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(read_aloud) = this.read_aloud.clone() {
-                                                read_aloud.update(cx, |read_aloud, cx| {
-                                                    read_aloud.next_sentence(cx)
-                                                });
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    div().max_w(rems(16.)).child(
-                                        Label::new(state.sentence_text)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    ),
-                                )
-                                .child(
-                                    Label::new(counter)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    IconButton::new("read-aloud-stop", IconName::Close)
-                                        .icon_size(IconSize::Small)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.toggle_read_aloud(cx);
-                                        })),
-                                ),
-                        ),
+                        .child(pill),
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The markdown blocks of one assistant message, in reading order.
+    /// Thinking blocks are never spoken, and blank blocks render nothing.
+    fn assistant_message_markdowns(
+        entries: &[AgentThreadEntry],
+        entry_ix: usize,
+        cx: &App,
+    ) -> Vec<Entity<Markdown>> {
+        let Some(AgentThreadEntry::AssistantMessage(message)) = entries.get(entry_ix) else {
+            return Vec::new();
+        };
+        message
+            .chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
+                AssistantMessageChunk::Thought { .. } => None,
+            })
+            .filter(|markdown| !markdown.read(cx).source().trim().is_empty())
+            .collect()
+    }
+
+    /// The per-message speaker button: plays one assistant message from its
+    /// top, or stops if it is the one sounding. State is recomputed at click
+    /// time so a stale render cannot invert the action.
+    fn toggle_read_aloud_for_message(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        let message_markdowns =
+            Self::assistant_message_markdowns(self.thread.read(cx).entries(), entry_ix, cx);
+        let Some((first_block, rest)) = message_markdowns.split_first() else {
+            return;
+        };
+        let message_complete = self.thread.read(cx).status() != ThreadStatus::Generating;
+        read_aloud.update(cx, |read_aloud, cx| {
+            let is_reading_this = read_aloud
+                .playback_state(cx)
+                .is_some_and(|state| !state.stopped)
+                && read_aloud
+                    .speaking()
+                    .is_some_and(|speaking| message_markdowns.contains(speaking));
+            if is_reading_this {
+                read_aloud.stop(cx);
+                return;
+            }
+            // A block with another block after it is finished even while the
+            // turn still streams; only the trailing block can still grow.
+            read_aloud.play_from_top(first_block, message_complete || !rest.is_empty(), cx);
+            // The blocks after the first line up in the pending queue, so
+            // the whole message plays in order.
+            for (offset, block) in rest.iter().enumerate() {
+                let block_complete = message_complete || offset + 1 < rest.len();
+                read_aloud.enqueue_markdown(block, block_complete, cx);
+            }
+        });
     }
 
     /// Schedule a throttled save of the thread state (draft prompt, scroll position, etc.).
@@ -7114,6 +7200,45 @@ impl ThreadView {
                 }))
         });
 
+        let mut is_reading_response = false;
+        let read_aloud_button = self.read_aloud.as_ref().zip(copy_response_index).and_then(
+            |(read_aloud, response_index)| {
+                let message_markdowns = Self::assistant_message_markdowns(
+                    thread.read(cx).entries(),
+                    response_index,
+                    cx,
+                );
+                if message_markdowns.is_empty() {
+                    return None;
+                }
+                let reader = read_aloud.read(cx);
+                is_reading_response = reader
+                    .playback_state(cx)
+                    .is_some_and(|state| !state.stopped)
+                    && reader
+                        .speaking()
+                        .is_some_and(|speaking| message_markdowns.contains(speaking));
+                let (icon, tooltip) = if is_reading_response {
+                    (IconName::Stop, "Stop Reading")
+                } else {
+                    (IconName::AudioOn, "Read Aloud")
+                };
+                Some(
+                    IconButton::new(("read_aloud_response", entry_ix), icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(if is_reading_response {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        })
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_read_aloud_for_message(response_index, cx);
+                        })),
+                )
+            },
+        );
+
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
             IconName::UserArrowUp,
@@ -7234,7 +7359,9 @@ impl ThreadView {
             .py_1p5()
             .px_4()
             .justify_end()
-            .opacity(0.4)
+            // While this message is being read aloud, its speaker button must
+            // be findable without hovering — the whole row stays revealed.
+            .opacity(if is_reading_response { 1. } else { 0.4 })
             .hover(|s| s.opacity(1.))
             .when(
                 last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
@@ -7253,6 +7380,7 @@ impl ThreadView {
                 },
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+            .when_some(read_aloud_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
