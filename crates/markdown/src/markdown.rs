@@ -482,6 +482,8 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
     speaking_highlight: Option<Range<usize>>,
     speaking_word_highlight: Option<Range<usize>>,
+    speakable_ranges: Vec<Range<usize>>,
+    hover_highlight: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -679,6 +681,8 @@ impl Markdown {
             active_search_highlight: None,
             speaking_highlight: None,
             speaking_word_highlight: None,
+            speakable_ranges: Vec::new(),
+            hover_highlight: None,
         };
         this.parse(cx);
         this
@@ -1136,6 +1140,38 @@ impl Markdown {
 
     pub fn speaking_word_highlight(&self) -> Option<&Range<usize>> {
         self.speaking_word_highlight.as_ref()
+    }
+
+    /// Source ranges of the sentences read-aloud can seek to. While any are
+    /// set, hovering one previews it (see [`Self::hover_highlight`]) and the
+    /// cursor becomes a pointer, advertising click-to-seek.
+    pub fn set_speakable_ranges(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        if self.speakable_ranges == ranges {
+            return;
+        }
+        self.speakable_ranges = ranges;
+        // A hover computed against the old ranges may point at a sentence
+        // that no longer exists (or has shifted); drop it rather than let a
+        // stale band linger until the next mouse move.
+        if self
+            .hover_highlight
+            .as_ref()
+            .is_some_and(|hovered| !self.speakable_ranges.contains(hovered))
+        {
+            self.hover_highlight = None;
+        }
+        cx.notify();
+    }
+
+    pub fn speakable_ranges(&self) -> &[Range<usize>] {
+        &self.speakable_ranges
+    }
+
+    /// The speakable sentence currently under the pointer, if any. Maintained
+    /// by this entity's element from mouse-move events; painted as a faint
+    /// band beneath the speaking highlights to show where a click would seek.
+    pub fn hover_highlight(&self) -> Option<&Range<usize>> {
+        self.hover_highlight.as_ref()
     }
 
     fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
@@ -2058,40 +2094,64 @@ impl MarkdownElement {
         builder.pop_div();
     }
 
-    /// Draws the word being spoken as a rounded pill.
-    ///
-    /// Quads of its own rather than a background color in
-    /// [`MarkdownHighlights`], which the sentence wash uses: that channel paints
-    /// square text-run backgrounds, and this needs rounded corners and a little
-    /// air around the word to read as a pill riding on top of the wash.
-    fn paint_speaking_word_highlight(
+    /// Three layers, painted beneath the text: a faint band on the speakable
+    /// sentence under the pointer (showing where a click would seek), a
+    /// stronger accent wash across the whole sentence being spoken, and a
+    /// prominent accent pill on the single word currently sounding. Later
+    /// layers paint on top of earlier ones, and the karaoke effect comes from
+    /// the pill hopping word to word as playback advances. All three derive
+    /// from the same accent token so they read as one family.
+    fn paint_speaking_highlight(
         &self,
         rendered_text: &RenderedText,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(range) = self.markdown.read(cx).speaking_word_highlight.clone() else {
+        let markdown = self.markdown.read(cx);
+        let sentence = markdown.speaking_highlight.clone();
+        let word = markdown.speaking_word_highlight.clone();
+        let hover = markdown.hover_highlight.clone();
+        if sentence.is_none() && word.is_none() && hover.is_none() {
             return;
-        };
-        // Accent-derived so it clearly outranks the sentence wash in both light
-        // and dark themes; translucent so the glyphs stay legible.
-        let color = cx.theme().colors().text_accent.opacity(0.3);
-        for bounds in rendered_text.bounds_for_source_range(range) {
-            // Inflated so the pill hugs the word with a little air around it
-            // instead of tracing the bare text-line rect. The word can span
-            // layout lines on a wrap, producing one pill per line.
-            let bounds = Bounds {
-                origin: point(bounds.origin.x - px(1.), bounds.origin.y - px(1.5)),
-                size: size(bounds.size.width + px(2.), bounds.size.height + px(3.)),
-            };
-            window.paint_quad(quad(
-                bounds,
+        }
+        let accent = cx.theme().colors().text_accent;
+
+        if let Some(range) = hover {
+            paint_highlight_band(
+                rendered_text,
+                range,
+                accent.opacity(0.16),
                 px(3.),
-                color,
-                Edges::default(),
-                Hsla::transparent_black(),
-                BorderStyle::default(),
-            ));
+                px(2.),
+                window,
+            );
+        }
+
+        if let Some(range) = sentence {
+            paint_highlight_band(
+                rendered_text,
+                range,
+                accent.opacity(0.26),
+                px(3.),
+                px(2.),
+                window,
+            );
+        }
+
+        if let Some(range) = word {
+            let color = if cx.theme().appearance.is_light() {
+                // Dark glyphs sit on top, so the pill must stay a light
+                // tint: the same accent, at low alpha over a light surface.
+                accent.opacity(0.25)
+            } else {
+                // A strong, saturated fill. `text_accent` is a *text* color —
+                // light in dark themes — and near-white glyphs would wash out
+                // against it at full strength, so the lightness is capped
+                // (and the saturation floored) to keep the accent's hue while
+                // the pill stays dark enough for light glyphs to read.
+                gpui::hsla(accent.h, accent.s.max(0.5), accent.l.min(0.45), 0.78)
+            };
+            paint_highlight_band(rendered_text, range, color, px(4.), px(3.), window);
         }
     }
 
@@ -2119,6 +2179,14 @@ impl MarkdownElement {
                             || rendered_text
                                 .footnote_ref_for_source_index(source_index)
                                 .is_some()
+                            // A speakable sentence acts like a control too: a
+                            // click on it seeks read-aloud there.
+                            || self
+                                .markdown
+                                .read(cx)
+                                .speakable_ranges
+                                .iter()
+                                .any(|range| range.contains(&source_index))
                     }));
 
         if is_hovering_clickable {
@@ -2255,12 +2323,25 @@ impl MarkdownElement {
                     markdown.selection.set_head(source_index, &rendered_text);
                     markdown.autoscroll_code_block(source_index, event.position);
                     markdown.autoscroll_request = Some(source_index);
+                    // A drag-selection is not a seek preview.
+                    markdown.hover_highlight = None;
                     cx.notify();
                 } else {
                     let is_hitbox_hovered = hitbox.is_hovered(window);
                     let source_index = is_hitbox_hovered
                         .then(|| rendered_text.source_index_for_position(event.position).ok())
                         .flatten();
+                    let hovered_speakable = source_index.and_then(|source_index| {
+                        markdown
+                            .speakable_ranges
+                            .iter()
+                            .find(|range| range.contains(&source_index))
+                            .cloned()
+                    });
+                    if markdown.hover_highlight != hovered_speakable {
+                        markdown.hover_highlight = hovered_speakable;
+                        cx.notify();
+                    }
                     let hovered_url = is_hitbox_hovered
                         .then(|| rendered_text.image_link_for_position(event.position))
                         .flatten()
@@ -2430,9 +2511,6 @@ impl Element for MarkdownElement {
                         selection.start..selection.end,
                         self.style.selection_background_color,
                     )
-                }),
-                speaking: markdown.speaking_highlight.clone().map(|range| {
-                    (range, colors.editor_document_highlight_read_background)
                 }),
                 next_search_highlight_ix: 0,
             }
@@ -3204,11 +3282,41 @@ impl Element for MarkdownElement {
         });
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
-        // The pill goes under the glyphs — the text layout's bounds are already
+        // The bands go under the glyphs — the text layout's bounds are already
         // resolved by prepaint, so painting from them before the element itself
         // is safe.
-        self.paint_speaking_word_highlight(&rendered_markdown.text, window, cx);
+        self.paint_speaking_highlight(&rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+    }
+}
+
+/// Paints one rounded band per layout line covered by `range`, inflated past
+/// the bare text-line rect so the band hugs the text with a little air around
+/// it. A range that wraps produces one band per line.
+fn paint_highlight_band(
+    rendered_text: &RenderedText,
+    range: Range<usize>,
+    color: Hsla,
+    inflate_x: Pixels,
+    inflate_y: Pixels,
+    window: &mut Window,
+) {
+    for bounds in rendered_text.bounds_for_source_range(range) {
+        let bounds = Bounds {
+            origin: point(bounds.origin.x - inflate_x, bounds.origin.y - inflate_y),
+            size: size(
+                bounds.size.width + inflate_x * 2.,
+                bounds.size.height + inflate_y * 2.,
+            ),
+        };
+        window.paint_quad(quad(
+            bounds,
+            px(6.),
+            color,
+            Edges::default(),
+            Hsla::transparent_black(),
+            BorderStyle::default(),
+        ));
     }
 }
 
@@ -3537,9 +3645,6 @@ struct MarkdownHighlights {
     search_match_color: Hsla,
     active_search_match_color: Hsla,
     selection: Option<(Range<usize>, Hsla)>,
-    /// The range being read aloud, a channel of its own so find-in-thread keeps
-    /// working while audio plays.
-    speaking: Option<(Range<usize>, Hsla)>,
     /// Index of the first search highlight that may intersect the next line.
     next_search_highlight_ix: usize,
 }
@@ -3552,15 +3657,6 @@ impl MarkdownHighlights {
         source_range: Range<usize>,
     ) -> SmallVec<[(Range<usize>, Hsla); 1]> {
         let mut highlights = SmallVec::new();
-
-        // First, so a search match or the selection drawn over the same text
-        // still reads as itself.
-        if let Some((range, color)) = &self.speaking {
-            let clamped = range.start.max(source_range.start)..range.end.min(source_range.end);
-            if clamped.start < clamped.end {
-                highlights.push((clamped, *color));
-            }
-        }
 
         self.next_search_highlight_ix += self.search_highlights[self.next_search_highlight_ix..]
             .iter()
@@ -4968,6 +5064,58 @@ mod tests {
             );
             assert_eq!(markdown.speaking_highlight(), Some(&(0..13)));
         });
+    }
+
+    #[gpui::test]
+    fn test_hover_highlight_follows_speakable_ranges(cx: &mut TestAppContext) {
+        struct SpeakableTestView {
+            markdown: Entity<Markdown>,
+        }
+
+        impl Render for SpeakableTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(MarkdownElement::new(
+                    self.markdown.clone(),
+                    MarkdownStyle::default(),
+                ))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (view, cx) = cx.add_window_view(move |_, cx| SpeakableTestView {
+            markdown: cx.new(|cx| Markdown::new("First one. Second one.".into(), None, None, cx)),
+        });
+        cx.run_until_parked();
+        let markdown = view.read_with(cx, |view, _| view.markdown.clone());
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_speakable_ranges(vec![0..10, 11..22], cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_mouse_move(point(px(8.), px(8.)), None, gpui::Modifiers::default());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.hover_highlight().cloned()),
+            Some(0..10),
+            "pointing at the first sentence previews it"
+        );
+
+        cx.simulate_mouse_move(point(px(500.), px(500.)), None, gpui::Modifiers::default());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.hover_highlight().cloned()),
+            None,
+            "leaving the text clears the preview"
+        );
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_speakable_ranges(Vec::new(), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(px(8.), px(8.)), None, gpui::Modifiers::default());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.hover_highlight().cloned()),
+            None,
+            "without speakable ranges there is nothing to preview"
+        );
     }
 
     #[gpui::test]
