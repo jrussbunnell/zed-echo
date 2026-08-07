@@ -1,6 +1,7 @@
 mod agent_configuration;
 pub mod agent_connection_store;
 mod agent_diff;
+mod agent_panel_styling;
 mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
@@ -588,6 +589,7 @@ pub fn init(
 ) {
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
+    agent_panel_styling::AgentPanelStylingSettings::register(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
         let workspaces: Vec<_> = workspace::AppState::global(cx)

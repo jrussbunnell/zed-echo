@@ -607,6 +607,14 @@
     // buttons, mini player, and auto-play are unaffected.
     "click_to_seek": true
   },
+  // Custom styling for the agent panel's content types: "assistant_prose",
+  // "thinking", "tool_output" (tool cards, terminal output labels, diff
+  // text), "user_message", and "code_blocks" (fenced code in assistant
+  // messages). Each group accepts optional "font_family", "font_size"
+  // (pixels, clamped 8-32), "text_color", and "background" ("#RGB",
+  // "#RRGGBB", or "#RRGGBBAA" hex strings). Anything unset keeps the
+  // theme's appearance.
+  "agent_panel_styling": {},
   // Scrollbar related settings
   "scrollbar": {
     // When to show the scrollbar in the editor.

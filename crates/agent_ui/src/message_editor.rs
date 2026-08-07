@@ -1,5 +1,6 @@
 use crate::DEFAULT_THREAD_TITLE;
 use crate::SendImmediately;
+use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::{
     ChatWithFollow,
     completion_provider::{
@@ -25,8 +26,8 @@ use editor::{
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
-    TextStyle, WeakEntity,
+    Focusable, Image, ImageFormat, KeyContext, Refineable as _, SharedString, Subscription, Task,
+    TaskExt, TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
@@ -2016,8 +2017,11 @@ impl Render for MessageEditor {
             .flex_1()
             .child({
                 let settings = ThemeSettings::get_global(cx);
+                let styling = AgentPanelStylingSettings::get_global(cx)
+                    .user_message
+                    .clone();
 
-                let text_style = TextStyle {
+                let mut text_style = TextStyle {
                     color: cx.theme().colors().text,
                     font_family: settings.agent_buffer_font_family().clone(),
                     font_fallbacks: settings.buffer_font.fallbacks.clone(),
@@ -2027,11 +2031,14 @@ impl Render for MessageEditor {
                     line_height: relative(settings.buffer_line_height.value()),
                     ..Default::default()
                 };
+                text_style.refine(&styling.text_style_refinement());
 
                 EditorElement::new(
                     &self.editor,
                     EditorStyle {
-                        background: cx.theme().colors().editor_background,
+                        background: styling
+                            .background
+                            .unwrap_or(cx.theme().colors().editor_background),
                         local_player: cx.theme().players().local(),
                         text: text_style,
                         syntax: cx.theme().syntax().clone(),

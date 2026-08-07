@@ -22,6 +22,7 @@ use theme_settings::ThemeSettings;
 use ui::{Context, TextSize};
 use workspace::Workspace;
 
+use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of
@@ -460,6 +461,17 @@ impl EntryViewState {
                 });
     }
 
+    /// Re-renders the per-entry user-message editors: their text style is
+    /// derived from `agent_panel_styling` inside their own render, so a
+    /// styling change must notify them explicitly.
+    pub fn agent_panel_styling_changed(&mut self, cx: &mut App) {
+        for entry in self.entries.iter() {
+            if let Some(editor) = entry.message_editor() {
+                editor.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
     pub fn agent_ui_font_size_changed(&mut self, cx: &mut App) {
         for entry in self.entries.iter() {
             match entry {
@@ -692,13 +704,20 @@ fn create_editor_diff(
 }
 
 fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
+    // Diff text counts as tool output for `agent_panel_styling`; explicit
+    // overrides win over the derived default size.
+    let tool_output = AgentPanelStylingSettings::get_global(cx)
+        .tool_output
+        .clone();
     TextStyleRefinement {
-        font_size: Some(
+        font_size: Some(tool_output.font_size.map(Into::into).unwrap_or_else(|| {
             TextSize::Small
                 .rems(cx)
                 .to_pixels(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
-                .into(),
-        ),
+                .into()
+        })),
+        font_family: tool_output.font_family,
+        color: tool_output.text_color,
         ..Default::default()
     }
 }

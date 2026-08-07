@@ -111,8 +111,9 @@ pub fn resolve_pill_colors(colors: &[String]) -> Option<(Hsla, Hsla)> {
 
 /// `#RGB`, `#RRGGBB`, or `#RRGGBBAA`, case-insensitive, `#` optional. An
 /// alpha component is accepted but ignored: the highlight layers apply their
-/// own alphas so glyphs stay legible in both appearances.
-fn parse_hex_color(text: &str) -> Option<Hsla> {
+/// own alphas so glyphs stay legible in both appearances. Public so the
+/// agent-panel styling settings parse colors with identical semantics.
+pub fn parse_hex_color(text: &str) -> Option<Hsla> {
     let hex = text.trim().trim_start_matches('#');
     if !hex.chars().all(|character| character.is_ascii_hexdigit()) {
         return None;

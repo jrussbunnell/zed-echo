@@ -22,6 +22,7 @@ use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCo
 use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
+use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::message_editor::SharedSessionCapabilities;
 use crate::ui::{
@@ -656,6 +657,9 @@ pub struct ThreadView {
     /// The last-applied read-aloud settings, diffed against the global on
     /// every settings change so only what actually changed is re-applied.
     read_aloud_settings: read_aloud::ReadAloudSettings,
+    /// The last-applied `agent_panel_styling` settings, diffed the same way.
+    /// Render paths read this snapshot instead of the global.
+    agent_panel_styling: AgentPanelStylingSettings,
     /// Subscriptions owned by the current read-aloud activation (the thread
     /// auto-play subscription and the reader observation). Scoped apart from
     /// `_subscriptions` so disabling read aloud drops them and a later
@@ -1083,6 +1087,7 @@ impl ThreadView {
             read_aloud: None,
             read_aloud_watermark: 0,
             read_aloud_settings: read_aloud::ReadAloudSettings::get_global(cx).clone(),
+            agent_panel_styling: AgentPanelStylingSettings::get_global(cx).clone(),
             read_aloud_subscriptions: Vec::new(),
             read_aloud_activation: None,
             read_aloud_provider: None,
@@ -1094,6 +1099,7 @@ impl ThreadView {
         this._subscriptions
             .push(cx.observe_global::<SettingsStore>(|this, cx| {
                 this.read_aloud_settings_changed(cx);
+                this.agent_panel_styling_changed(cx);
             }));
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -1260,6 +1266,26 @@ impl ThreadView {
                 });
             }
         }
+        cx.notify();
+    }
+
+    /// Applies `agent_panel_styling` changes without a restart. Markdown
+    /// styles are rebuilt every render, so notifying this view covers
+    /// assistant prose, thinking, tool output, and code blocks. The
+    /// user-message editors derive their text style in their own render, so
+    /// they are notified individually (the composer here, the per-entry
+    /// editors via the entry view state). Diff editors re-refine through the
+    /// conversation view's existing settings observation.
+    fn agent_panel_styling_changed(&mut self, cx: &mut Context<Self>) {
+        let settings = AgentPanelStylingSettings::get_global(cx).clone();
+        if settings == self.agent_panel_styling {
+            return;
+        }
+        self.agent_panel_styling = settings;
+        self.entry_view_state.update(cx, |entry_view_state, cx| {
+            entry_view_state.agent_panel_styling_changed(cx);
+        });
+        self.message_editor.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 
@@ -6909,7 +6935,11 @@ impl ThreadView {
                                     .py_3()
                                     .px_2()
                                     .rounded_md()
-                                    .bg(cx.theme().colors().editor_background)
+                                    .bg(self
+                                        .agent_panel_styling
+                                        .user_message
+                                        .background
+                                        .unwrap_or(cx.theme().colors().editor_background))
                                     .border_1()
                                     .when(is_indented, |this| {
                                         this.py_2().px_2().when(opaque_window, |this| {
@@ -7032,6 +7062,12 @@ impl ThreadView {
                 // Always on — applying it only during playback would reflow
                 // the whole message the moment speech starts.
                 style.paragraph_line_height = Some(rems(1.45));
+                self.agent_panel_styling
+                    .assistant_prose
+                    .apply_to_markdown_style(&mut style);
+                self.agent_panel_styling
+                    .code_blocks
+                    .apply_to_code_blocks(&mut style);
                 let message_body = v_flex()
                     .w_full()
                     .gap_3()
@@ -8268,7 +8304,14 @@ impl ThreadView {
                                 .overflow_hidden()
                                 .child(self.render_markdown(
                                     chunk,
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                    {
+                                        let mut style =
+                                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                                        self.agent_panel_styling
+                                            .thinking
+                                            .apply_to_markdown_style(&mut style);
+                                        style
+                                    },
                                     cx,
                                 )),
                         )
@@ -8525,6 +8568,14 @@ impl ThreadView {
         style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
         style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
         style.height_is_multiple_of_line_height = true;
+        // The command renders as a fenced code block, so the tool-output
+        // overrides must land on the code-block refinement to take effect.
+        self.agent_panel_styling
+            .tool_output
+            .apply_text_to_markdown_style(&mut style);
+        self.agent_panel_styling
+            .tool_output
+            .apply_to_code_blocks(&mut style);
         // Soft-wrap the command instead of horizontally scrolling it: the card is
         // narrow, and in scroll mode a long command wraps anyway but its wrapped
         // lines don't pick up the code block's left padding. Wrap mode lays the
@@ -10832,10 +10883,15 @@ impl ThreadView {
                     .child(
                         self.render_markdown(
                             tool_call.label.clone(),
-                            MarkdownStyle {
-                                prevent_mouse_interaction: true,
-                                ..MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
-                                    .with_muted_text(cx)
+                            {
+                                let mut style =
+                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                                        .with_muted_text(cx);
+                                style.prevent_mouse_interaction = true;
+                                self.agent_panel_styling
+                                    .tool_output
+                                    .apply_text_to_markdown_style(&mut style);
+                                style
                             },
                             cx,
                         ),
@@ -10850,7 +10906,14 @@ impl ThreadView {
                     .w_full()
                     .child(self.render_markdown(
                         tool_call.label.clone(),
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                        {
+                            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                                .with_muted_text(cx);
+                            self.agent_panel_styling
+                                .tool_output
+                                .apply_text_to_markdown_style(&mut style);
+                            style
+                        },
                         cx,
                     ))
                     .into_any()
@@ -11166,7 +11229,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        self.agent_panel_styling
+            .tool_output
+            .apply_to_markdown_style(&mut markdown_style);
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),

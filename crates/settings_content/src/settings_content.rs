@@ -209,6 +209,9 @@ pub struct SettingsContent {
     /// Configuration for reading agent responses aloud.
     pub read_aloud: Option<ReadAloudSettingsContent>,
 
+    /// Custom styling for content types rendered in the agent panel.
+    pub agent_panel_styling: Option<AgentPanelStylingContent>,
+
     /// Whether or not to automatically check for updates.
     ///
     /// Default: true
@@ -619,6 +622,38 @@ pub struct ReadAloudSettingsContent {
     ///
     /// Default: true
     pub click_to_seek: Option<bool>,
+}
+
+/// Custom styling for the agent panel's content types. Every field is
+/// optional; anything left unset keeps the current theme-derived appearance.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct AgentPanelStylingContent {
+    /// Styling for assistant message prose.
+    pub assistant_prose: Option<AgentPanelContentStyle>,
+    /// Styling for thinking (reasoning) blocks.
+    pub thinking: Option<AgentPanelContentStyle>,
+    /// Styling for tool output: tool cards, terminal output labels, and diff
+    /// text.
+    pub tool_output: Option<AgentPanelContentStyle>,
+    /// Styling for user messages.
+    pub user_message: Option<AgentPanelContentStyle>,
+    /// Styling for fenced code blocks inside assistant messages.
+    pub code_blocks: Option<AgentPanelContentStyle>,
+}
+
+/// Style overrides shared by every agent-panel content type.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct AgentPanelContentStyle {
+    /// Font family name. Unknown families fall back to the theme's font.
+    pub font_family: Option<String>,
+    /// Font size in pixels, clamped to 8–32.
+    pub font_size: Option<f32>,
+    /// Text color as a hex string ("#RGB", "#RRGGBB", or "#RRGGBBAA").
+    pub text_color: Option<String>,
+    /// Background color as a hex string ("#RGB", "#RRGGBB", or "#RRGGBBAA").
+    pub background: Option<String>,
 }
 
 /// Control what info is collected by Zed.
