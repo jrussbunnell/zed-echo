@@ -231,6 +231,14 @@ pub struct ThemeSettingsContent {
     /// The name of the icon theme to use.
     pub icon_theme: Option<IconThemeSelection>,
 
+    /// The material used to blur what is behind the window, for themes whose
+    /// `window_background_appearance` is `blurred`.
+    ///
+    /// macOS only; ignored on other platforms.
+    ///
+    /// Default: default
+    pub window_blur_material: Option<WindowBlurMaterialContent>,
+
     /// UNSTABLE: Expect many elements to be broken.
     ///
     // Controls the density of the UI.
@@ -1371,6 +1379,41 @@ pub enum WindowBackgroundContent {
     Opaque,
     Transparent,
     Blurred,
+}
+
+/// The material used to blur what is behind the window, for themes whose
+/// `window_background_appearance` is `blurred`. macOS only; ignored elsewhere.
+///
+/// Which materials frost depends on the macOS version and on the SDK the app was built
+/// against, so this is selectable. A material that is unavailable at runtime falls back to
+/// `default`.
+#[derive(
+    Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowBlurMaterialContent {
+    /// Let Zed pick. Currently the `hud_window` material.
+    #[default]
+    Default,
+    /// The `hudWindow` material: a translucent floating-window chrome.
+    HudWindow,
+    /// The `fullScreenUI` material.
+    FullScreenUi,
+    /// The `menu` material.
+    Menu,
+    /// The `underWindowBackground` material: a heavier desktop blur.
+    UnderWindowBackground,
+    /// The `sidebar` material: a heavier desktop blur.
+    Sidebar,
+    /// The `selection` material, with its desktop tinting and saturation removed.
+    ///
+    /// This is what Zed used before the material became selectable. It stopped frosting in
+    /// builds linked against the macOS 26 SDK, where it leaves the window merely transparent.
+    Selection,
+    /// `NSGlassEffectView`, the Liquid Glass view added in macOS 26.
+    GlassEffect,
+    /// The window server's own background blur, rather than a material view.
+    WindowServer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]

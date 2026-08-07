@@ -1,10 +1,10 @@
 use gpui::{
     FontFeatures, FontStyle, FontWeight, Modifiers, Pixels, SharedString,
-    WindowBackgroundAppearance, px,
+    WindowBackgroundAppearance, WindowBlurMaterial, px,
 };
 use settings_content::{
     FontFamilyName, FontFeaturesContent, FontSize, FontStyleContent, FontWeightContent,
-    ModifiersContent, PixelSetting, WindowBackgroundContent,
+    ModifiersContent, PixelSetting, WindowBackgroundContent, WindowBlurMaterialContent,
 };
 use std::sync::Arc;
 
@@ -50,6 +50,26 @@ impl IntoGpui for WindowBackgroundContent {
             WindowBackgroundContent::Opaque => WindowBackgroundAppearance::Opaque,
             WindowBackgroundContent::Transparent => WindowBackgroundAppearance::Transparent,
             WindowBackgroundContent::Blurred => WindowBackgroundAppearance::Blurred,
+        }
+    }
+}
+
+impl IntoGpui for WindowBlurMaterialContent {
+    type Output = WindowBlurMaterial;
+
+    fn into_gpui(self) -> Self::Output {
+        match self {
+            WindowBlurMaterialContent::Default => WindowBlurMaterial::Default,
+            WindowBlurMaterialContent::HudWindow => WindowBlurMaterial::HudWindow,
+            WindowBlurMaterialContent::FullScreenUi => WindowBlurMaterial::FullScreenUi,
+            WindowBlurMaterialContent::Menu => WindowBlurMaterial::Menu,
+            WindowBlurMaterialContent::UnderWindowBackground => {
+                WindowBlurMaterial::UnderWindowBackground
+            }
+            WindowBlurMaterialContent::Sidebar => WindowBlurMaterial::Sidebar,
+            WindowBlurMaterialContent::Selection => WindowBlurMaterial::Selection,
+            WindowBlurMaterialContent::GlassEffect => WindowBlurMaterial::GlassEffect,
+            WindowBlurMaterialContent::WindowServer => WindowBlurMaterial::WindowServer,
         }
     }
 }

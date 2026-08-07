@@ -12,6 +12,23 @@
     "dark": "One Dark",
   },
   "icon_theme": "Zed (Default)",
+  // The material used to blur what is behind the window, for themes whose
+  // `window_background_appearance` is "blurred". macOS only; ignored elsewhere.
+  //
+  // This setting can take the following values:
+  //
+  // 1. "default": let Zed pick (currently "hud_window")
+  // 2. "hud_window"
+  // 3. "full_screen_ui"
+  // 4. "menu"
+  // 5. "under_window_background": a heavier desktop blur
+  // 6. "sidebar": a heavier desktop blur
+  // 7. "selection": what Zed used historically; does not frost on macOS 26 SDK builds
+  // 8. "glass_effect": the Liquid Glass view added in macOS 26
+  // 9. "window_server": the window server's own blur, rather than a material view
+  //
+  // A material that is unavailable on the running macOS falls back to "default".
+  "window_blur_material": "default",
   // The name of a base set of key bindings to use.
   // This setting can take the following values:
   //

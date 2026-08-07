@@ -12,12 +12,15 @@ use std::sync::Arc;
 
 use ::settings::{IntoGpui, Settings, SettingsStore};
 use anyhow::{Context as _, Result};
-use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
+use gpui::{
+    App, Font, HighlightStyle, Pixels, Refineable, WindowBackgroundAppearance, WindowBlurMaterial,
+    px,
+};
 use gpui_util::ResultExt;
 use theme::{
-    AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
-    GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors, SyntaxTheme,
-    SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
+    AccentColors, ActiveTheme as _, Appearance, AppearanceContent, DEFAULT_DARK_THEME,
+    DEFAULT_ICON_THEME_NAME, GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors,
+    SyntaxTheme, SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
     ThemeSettingsProvider, ThemeStyles, default_color_scales, try_parse_color,
 };
 
@@ -85,6 +88,8 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
     GlobalTheme::update_icon_theme(cx, icon_theme);
 
     let settings = ThemeSettings::get_global(cx);
+    let mut prev_window_blur_material = settings.window_blur_material;
+    cx.set_window_blur_material(prev_window_blur_material);
 
     let mut prev_buffer_font_size_settings = settings.buffer_font_size_settings();
     let mut prev_ui_font_size_settings = settings.ui_font_size_settings();
@@ -116,6 +121,7 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
             settings.experimental_theme_overrides.clone(),
             settings.theme_overrides.clone(),
         );
+        let window_blur_material = settings.window_blur_material;
 
         if buffer_font_size_settings != prev_buffer_font_size_settings {
             prev_buffer_font_size_settings = buffer_font_size_settings;
@@ -156,6 +162,11 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
         if icon_theme_name != prev_icon_theme_name {
             prev_icon_theme_name = icon_theme_name;
             reload_icon_theme(cx);
+        }
+
+        if window_blur_material != prev_window_blur_material {
+            prev_window_blur_material = window_blur_material;
+            set_window_blur_material(window_blur_material, cx);
         }
     })
     .detach();
@@ -208,12 +219,22 @@ pub fn reload_theme(cx: &mut App) {
     // or a `blurred`/`transparent` theme stays opaque until a settings change.
     let background_appearance = theme.window_background_appearance();
     GlobalTheme::update_theme(cx, theme);
-    // Deferred because a caller may hold a window lease — workspace reloads
-    // the theme from inside its window-appearance observer, and updating the
-    // leased window re-entrantly would fail, leaving that window stale after
-    // a system light/dark toggle. Once deferred, an update should only fail
-    // for a window closed in between; anything else is unexpected, so
-    // failures are logged rather than discarded.
+    reapply_window_background_appearance(background_appearance, cx);
+    cx.refresh_windows();
+}
+
+/// Pushes a background appearance to every open window.
+///
+/// Deferred because a caller may hold a window lease — workspace reloads the
+/// theme from inside its window-appearance observer, and updating the leased
+/// window re-entrantly would fail, leaving that window stale after a system
+/// light/dark toggle. Once deferred, an update should only fail for a window
+/// closed in between; anything else is unexpected, so failures are logged
+/// rather than discarded.
+fn reapply_window_background_appearance(
+    background_appearance: WindowBackgroundAppearance,
+    cx: &mut App,
+) {
     cx.defer(move |cx| {
         for window in cx.windows() {
             window
@@ -223,7 +244,14 @@ pub fn reload_theme(cx: &mut App) {
                 .log_err();
         }
     });
-    cx.refresh_windows();
+}
+
+/// Selects the material used to blur what is behind blurred-background windows,
+/// and re-applies the current background appearance so open windows swap to the
+/// new material without a restart.
+fn set_window_blur_material(material: WindowBlurMaterial, cx: &mut App) {
+    cx.set_window_blur_material(material);
+    reapply_window_background_appearance(cx.theme().window_background_appearance(), cx);
 }
 
 /// Reloads the current icon theme from settings.
@@ -463,4 +491,58 @@ pub fn increase_buffer_font_size(cx: &mut App) {
 /// This will be effective until the app is restarted.
 pub fn decrease_buffer_font_size(cx: &mut App) {
     adjust_buffer_font_size(cx, |size| size - px(1.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, UpdateGlobal as _};
+
+    // The JSON spelling of this setting is the contract with user settings files and with
+    // the settings UI, and a rename in either enum would silently change it.
+    #[gpui::test]
+    fn test_window_blur_material_is_read_from_json(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            init(LoadThemes::JustBase, cx);
+
+            assert_eq!(
+                ThemeSettings::get_global(cx).window_blur_material,
+                WindowBlurMaterial::Default,
+                "an unset window_blur_material should leave the platform default in place"
+            );
+
+            for (json_value, expected) in [
+                ("hud_window", WindowBlurMaterial::HudWindow),
+                ("full_screen_ui", WindowBlurMaterial::FullScreenUi),
+                ("menu", WindowBlurMaterial::Menu),
+                (
+                    "under_window_background",
+                    WindowBlurMaterial::UnderWindowBackground,
+                ),
+                ("sidebar", WindowBlurMaterial::Sidebar),
+                ("selection", WindowBlurMaterial::Selection),
+                ("glass_effect", WindowBlurMaterial::GlassEffect),
+                ("window_server", WindowBlurMaterial::WindowServer),
+                ("default", WindowBlurMaterial::Default),
+            ] {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store
+                        .set_user_settings(
+                            &format!("{{ \"window_blur_material\": \"{json_value}\" }}"),
+                            cx,
+                        )
+                        .result()
+                        .expect("window_blur_material should parse");
+                });
+
+                assert_eq!(
+                    ThemeSettings::get_global(cx).window_blur_material,
+                    expected,
+                    "for the setting value {json_value:?}"
+                );
+            }
+        });
+    }
 }

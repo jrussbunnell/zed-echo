@@ -5,7 +5,7 @@ use crate::{merge_accent_colors, merge_player_colors};
 use collections::HashMap;
 use gpui::{
     App, Context, Font, FontFallbacks, FontStyle, Global, Pixels, SharedString, Subscription,
-    Window, px,
+    Window, WindowBlurMaterial, px,
 };
 use refineable::Refineable;
 use schemars::JsonSchema;
@@ -91,6 +91,9 @@ pub struct ThemeSettings {
     pub theme_overrides: HashMap<String, settings::ThemeStyleContent>,
     /// The current icon theme selection.
     pub icon_theme: IconThemeSelection,
+    /// The material used to blur what is behind the window, for themes whose
+    /// `window_background_appearance` is `blurred`. macOS only.
+    pub window_blur_material: WindowBlurMaterial,
     /// The density of the UI.
     /// Note: This setting is still experimental. See [this tracking issue](
     pub ui_density: UiDensity,
@@ -760,6 +763,7 @@ impl settings::Settings for ThemeSettings {
             experimental_theme_overrides: content.experimental_theme_overrides.clone(),
             theme_overrides: content.theme_overrides.clone(),
             icon_theme: icon_theme_selection,
+            window_blur_material: content.window_blur_material.unwrap_or_default().into_gpui(),
             ui_density: ui_density_from_settings(content.ui_density.unwrap_or_default()),
             unnecessary_code_fade: content.unnecessary_code_fade.unwrap().0.clamp(0.0, 0.9),
         }
