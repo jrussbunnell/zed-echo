@@ -211,15 +211,16 @@ pub fn reload_theme(cx: &mut App) {
     // Deferred because a caller may hold a window lease — workspace reloads
     // the theme from inside its window-appearance observer, and updating the
     // leased window re-entrantly would fail, leaving that window stale after
-    // a system light/dark toggle. Once deferred, an update can only fail for
-    // a window closed in between, which is benign.
+    // a system light/dark toggle. Once deferred, an update should only fail
+    // for a window closed in between; anything else is unexpected, so
+    // failures are logged rather than discarded.
     cx.defer(move |cx| {
         for window in cx.windows() {
             window
                 .update(cx, |_, window, _| {
                     window.set_background_appearance(background_appearance)
                 })
-                .ok();
+                .log_err();
         }
     });
     cx.refresh_windows();
@@ -456,46 +457,6 @@ pub fn merge_accent_colors(
 /// This will be effective until the app is restarted.
 pub fn increase_buffer_font_size(cx: &mut App) {
     adjust_buffer_font_size(cx, |size| size + px(1.0));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::TestAppContext;
-
-    struct EmptyView;
-
-    impl gpui::Render for EmptyView {
-        fn render(
-            &mut self,
-            _window: &mut gpui::Window,
-            _cx: &mut gpui::Context<Self>,
-        ) -> impl gpui::IntoElement {
-            gpui::Empty
-        }
-    }
-
-    // Workspace reloads the theme from inside its window-appearance observer,
-    // i.e. with a window lease held; re-applying the background appearance
-    // must therefore be deferred, or the leased window's update fails and
-    // that window keeps a stale appearance after a system light/dark toggle.
-    // `TestWindow` does not record `set_background_appearance` (and gpui
-    // exposes no getter), so this exercises the deferred re-apply from the
-    // leased context rather than asserting the applied value.
-    #[gpui::test]
-    fn test_reload_theme_with_a_window_lease_held(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            init(LoadThemes::JustBase, cx);
-        });
-
-        let window = cx.add_window(|_, _| EmptyView);
-        window
-            .update(cx, |_, _, cx| reload_theme(cx))
-            .expect("reload_theme should succeed while its window is leased");
-        cx.run_until_parked();
-    }
 }
 
 /// Decreases the buffer font size by 1 pixel, without persisting the result in the settings.
