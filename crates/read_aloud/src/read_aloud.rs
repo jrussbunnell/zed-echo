@@ -337,6 +337,25 @@ impl ReadAloud {
         // controls have a message to preview and restart.
     }
 
+    /// A completeness signal that arrives outside the enqueue path: the turn
+    /// ended, so the tracked message — whichever it is — can no longer grow.
+    /// Re-segments it as complete so its withheld tail can speak and, once
+    /// the audio drains, the controls can hide, without starting anything a
+    /// latched stop or a dismissal is holding back. Needed because the
+    /// auto-play gate keeps the ordinary enqueue path from ever delivering
+    /// the turn-end flag when auto-play is off.
+    pub fn mark_tracked_message_complete(&mut self, cx: &mut Context<Self>) {
+        if self.speaking.is_none() || self.message_complete {
+            return;
+        }
+        if self.stopped_by_user {
+            self.track_quietly(true, cx);
+        } else {
+            self.refresh_current(true, cx);
+        }
+        cx.notify();
+    }
+
     /// Hides the player UI entirely: stops tracking, drops the parked
     /// utterances, and keeps the stop latch so passive streaming can bring
     /// back neither the controls nor audio. Purely playback-UI state — the
@@ -374,17 +393,23 @@ impl ReadAloud {
         });
     }
 
+    /// `message_complete` carries the caller's knowledge of whether this
+    /// message can still grow. It matters beyond segmentation: a message
+    /// left flagged incomplete keeps the controls visible after its audio
+    /// drains (the streaming-lull rule), and a clicked message often gets
+    /// no later enqueue to ever correct the flag.
     pub fn seek_to_source_index(
         &mut self,
         markdown: &Entity<Markdown>,
         source_index: usize,
+        message_complete: bool,
         cx: &mut Context<Self>,
     ) {
         // A click is explicit intent: whatever was waiting its turn is
         // overruled by it.
         self.pending.clear();
         if self.speaking.as_ref() != Some(markdown) {
-            self.switch_to(markdown.clone(), false, cx);
+            self.switch_to(markdown.clone(), message_complete, cx);
         }
 
         let target = self
@@ -405,6 +430,14 @@ impl ReadAloud {
             // does nothing audible, and must not quietly re-arm a message the
             // user stopped.
             self.stopped_by_user = false;
+            if message_complete && !self.message_complete {
+                // The click knows more than the last enqueue did: the
+                // message is done growing, so its withheld tail may speak
+                // and the controls may hide once the audio drains. Only ever
+                // upgraded — segmentation appends the tail, never reorders,
+                // so the target index stays valid.
+                self.refresh_current(true, cx);
+            }
             self.player
                 .update(cx, |player, cx| player.seek_to(index, cx));
             self.start_polling(cx);
@@ -412,7 +445,14 @@ impl ReadAloud {
     }
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
-        if self.is_speaking() {
+        // "Speaking", for stop purposes, is what the UI presents as active —
+        // not just whether the poll task is running. During an idle lull
+        // (speech outran a still-streaming message) the poll task has
+        // parked but the controls still show playback, and a toggle there
+        // must stop, not fall through to the restart arm and start the
+        // message over.
+        let presenting_playback = self.playback_state(cx).is_some_and(|state| !state.stopped);
+        if self.is_speaking() || presenting_playback {
             self.stop(cx);
         } else if self.speaking.is_some() {
             // Restart from the top. `stop` discarded the queue position, and
@@ -754,7 +794,7 @@ mod tests {
         // A click is explicit intent, so unlike a mid-speech enqueue it
         // switches immediately.
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.seek_to_source_index(&markdown_b, 0, cx);
+            read_aloud.seek_to_source_index(&markdown_b, 0, false, cx);
         });
         assert_eq!(
             sink.queued(),
@@ -860,7 +900,7 @@ mod tests {
 
         // Byte 13 falls inside "Second one."
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.seek_to_source_index(&markdown, 13, cx);
+            read_aloud.seek_to_source_index(&markdown, 13, false, cx);
         });
         cx.run_until_parked();
 
@@ -991,7 +1031,7 @@ mod tests {
         // last utterance and there is nothing to seek to.
         let dead_click = source.find("let x").expect("test source has a code block");
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.seek_to_source_index(&markdown, dead_click, cx);
+            read_aloud.seek_to_source_index(&markdown, dead_click, false, cx);
         });
         cx.run_until_parked();
         assert!(
@@ -1024,7 +1064,7 @@ mod tests {
             .find("Second one.")
             .expect("test source has a sentence");
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.seek_to_source_index(&markdown, live_click, cx);
+            read_aloud.seek_to_source_index(&markdown, live_click, false, cx);
         });
         cx.run_until_parked();
         assert!(
@@ -1177,7 +1217,7 @@ mod tests {
         // The user clicks a sentence: explicit intent overrides the queue.
         let click = source.find("Two.").expect("test source has a sentence");
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.seek_to_source_index(&markdown_a, click, cx);
+            read_aloud.seek_to_source_index(&markdown_a, click, false, cx);
         });
         cx.run_until_parked();
 
@@ -1603,8 +1643,7 @@ mod tests {
             cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
         cx.run_until_parked();
 
-        let read_aloud =
-            cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
+        let read_aloud = cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, true, cx);
         });
@@ -1742,6 +1781,163 @@ mod tests {
             read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
             None,
             "a naturally finished, complete message leaves nothing to control"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_click_into_another_message_of_a_completed_thread_hides_the_player_when_done(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown_a = cx.new(|cx| Markdown::new("One.\n".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("Alpha. Beta.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown_a, true, cx);
+        });
+        cx.run_until_parked();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "setup: the finished newest message hides the player"
+        );
+
+        // The thread is done generating; the user clicks a sentence in an
+        // *older* message. No thread event will ever enqueue again, so the
+        // click itself must carry the completeness.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.seek_to_source_index(&markdown_b, 0, true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .is_some_and(|state| !state.stopped),
+            "the clicked message plays"
+        );
+
+        sink.finish_one();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "when the clicked message finishes, the player must hide — not \
+             stand in at the last utterance forever"
+        );
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+    }
+
+    #[gpui::test]
+    async fn toggle_stops_instead_of_restarting_during_a_streaming_lull(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("First one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        // The lull: the poll task has parked, but the controls (with their
+        // X) are still presented.
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+        assert!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .is_some_and(|state| !state.stopped),
+            "setup: the lull keeps the controls visible"
+        );
+
+        let spoken_before = provider.spoken();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        assert_eq!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .map(|state| state.stopped),
+            Some(true),
+            "a toggle during the lull must stop into the reduced form, not restart"
+        );
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_speaking()));
+        assert_eq!(
+            provider.spoken(),
+            spoken_before,
+            "nothing may be resynthesized by a stop"
+        );
+    }
+
+    #[gpui::test]
+    async fn marking_the_tracked_message_complete_releases_the_tail_and_the_player(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Trailing tail".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["First one."]);
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            read_aloud
+                .read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx))
+                .is_some(),
+            "setup: still flagged incomplete, so the controls hold on"
+        );
+
+        // The turn ends. With auto-play off no enqueue ever delivers the
+        // flag, so this signal is all that stands between the player and
+        // an immortal pill (and an unspoken tail).
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.mark_tracked_message_complete(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken(),
+            vec!["First one.", "Trailing tail"],
+            "completion releases the withheld tail"
+        );
+
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            read_aloud.read_with(cx, |read_aloud, cx| read_aloud.playback_state(cx)),
+            None,
+            "and once the tail drains, the player hides"
         );
     }
 }

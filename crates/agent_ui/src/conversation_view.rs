@@ -7580,6 +7580,103 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression: with an *older* message tracked in an idle streaming lull,
+    /// the mini player's X (which routes through `toggle_read_aloud`) used to
+    /// fall through to "load the newest message" — pressing close started
+    /// reading a different message aloud. It must stop the tracked one.
+    #[gpui::test]
+    async fn test_read_aloud_toggle_stops_an_older_message_instead_of_playing_the_newest(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First message one.".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Say one thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let provider = read_aloud::FakeTts::new();
+        let sink = read_aloud::FakeSink::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| read_aloud::ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        thread_view.update(cx, |view, _cx| {
+            view.set_read_aloud_for_test(reader.clone());
+        });
+
+        // Load the first message, then let a second one arrive.
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        let older_markdown = reader
+            .read_with(cx, |reader, _| reader.speaking().cloned())
+            .expect("the reader should be holding the first message");
+
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Second message one.".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Say another", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Park the reader in an idle lull on the *older* message: flagged
+        // incomplete, audio drained, poll exited — exactly the state where
+        // the pill (and its X) is visible while `is_speaking()` is false.
+        reader.update(cx, |reader, cx| {
+            reader.play_from_top(&older_markdown, false, cx);
+        });
+        cx.run_until_parked();
+        sink.finish_one();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(!reader.read_with(cx, |reader, _| reader.is_speaking()));
+        assert!(
+            reader
+                .read_with(cx, |reader, cx| reader.playback_state(cx))
+                .is_some_and(|state| !state.stopped),
+            "setup: the lull presents the playing-form controls"
+        );
+
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+
+        assert!(
+            !provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Second message")),
+            "pressing X must never start reading a different message, got {:?}",
+            provider.spoken()
+        );
+        assert_eq!(
+            reader
+                .read_with(cx, |reader, cx| reader.playback_state(cx))
+                .map(|state| state.stopped),
+            Some(true),
+            "the X stops into the reduced replay form"
+        );
+        assert_eq!(
+            reader.read_with(cx, |reader, _| reader.speaking().cloned()),
+            Some(older_markdown),
+            "the tracked message is unchanged by the stop"
+        );
+    }
+
     #[gpui::test]
     async fn test_thread_search_dismiss_clears_highlights(cx: &mut TestAppContext) {
         init_test(cx);

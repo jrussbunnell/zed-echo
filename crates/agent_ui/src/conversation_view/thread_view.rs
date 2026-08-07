@@ -1127,6 +1127,16 @@ impl ThreadView {
                     // The message is complete: let the segmenter speak the
                     // trailing block, which it withholds while streaming.
                     this.enqueue_read_aloud(true, cx);
+                    // The enqueue above is gated on `auto_play`; completeness
+                    // must reach the reader regardless, or a message played
+                    // explicitly during the turn stays flagged incomplete
+                    // forever — leaving the mini player visible after its
+                    // audio drains, with its withheld tail unspoken.
+                    if let Some(read_aloud) = this.read_aloud.clone() {
+                        read_aloud.update(cx, |read_aloud, cx| {
+                            read_aloud.mark_tracked_message_complete(cx);
+                        });
+                    }
                 }
                 _ => {}
             },
@@ -1212,7 +1222,16 @@ impl ThreadView {
     /// message rather than searching further back: an older, already-finished
     /// message is never what the reader should pick up next.
     fn latest_assistant_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
-        let thread = self.thread.read(cx);
+        Self::latest_assistant_markdown_in(&self.thread, cx)
+    }
+
+    /// Associated form of [`Self::latest_assistant_markdown`] for callbacks
+    /// that hold the thread but not the view.
+    fn latest_assistant_markdown_in(
+        thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> Option<Entity<Markdown>> {
+        let thread = thread.read(cx);
         let message = thread
             .entries()
             .iter()
@@ -1257,7 +1276,19 @@ impl ThreadView {
             return;
         };
 
-        if read_aloud.read(cx).is_speaking() {
+        // "Speaking" here must match what the UI presents as active, not
+        // just whether the poll task runs: during an idle streaming lull the
+        // controls (and their X) are visible while the poll is parked, and
+        // a toggle there must stop — never fall through to the load/restart
+        // paths and start something.
+        let presenting_playback = {
+            let reader = read_aloud.read(cx);
+            reader.is_speaking()
+                || reader
+                    .playback_state(cx)
+                    .is_some_and(|state| !state.stopped)
+        };
+        if presenting_playback {
             read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle(cx));
             return;
         }
@@ -11931,6 +11962,7 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return element;
         };
+        let thread = self.thread.clone();
         element.on_source_click(move |source_index, click_count, _window, cx| {
             // Double and triple clicks are word and line selection; leave them be.
             if click_count > 1 {
@@ -11942,9 +11974,16 @@ impl ThreadView {
             // double-lease panic if done synchronously.
             let read_aloud = read_aloud.clone();
             let markdown = markdown.clone();
+            let thread = thread.clone();
             cx.defer(move |cx| {
+                // Only the newest assistant message of a still-generating
+                // turn can grow; anything else the user clicks is complete —
+                // and must be flagged so, or the player never hides after
+                // it finishes (no later enqueue corrects the flag).
+                let message_complete = thread.read(cx).status() != ThreadStatus::Generating
+                    || Self::latest_assistant_markdown_in(&thread, cx).as_ref() != Some(&markdown);
                 read_aloud.update(cx, |read_aloud, cx| {
-                    read_aloud.seek_to_source_index(&markdown, source_index, cx);
+                    read_aloud.seek_to_source_index(&markdown, source_index, message_complete, cx);
                 });
             });
             // Returning false leaves click-drag text selection working as normal.
