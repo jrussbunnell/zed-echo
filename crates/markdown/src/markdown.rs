@@ -489,6 +489,16 @@ pub struct Markdown {
     speaking_word_highlight: Option<Range<usize>>,
     speakable_ranges: Vec<Range<usize>>,
     hover_highlight: Option<Range<usize>>,
+    /// Armed on a primary mouse-down over prose when a seek handler exists.
+    /// The matching mouse-up fires the seek only if the gesture stayed a
+    /// true click — no drag past the slop and no selection — so starting a
+    /// click-drag to select text never seeks.
+    pending_seek: Option<PendingSeek>,
+}
+
+struct PendingSeek {
+    position: Point<Pixels>,
+    source_index: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -687,6 +697,7 @@ impl Markdown {
             speaking_highlight: None,
             speaking_word_highlight: None,
             speakable_ranges: Vec::new(),
+            pending_seek: None,
             hover_highlight: None,
         };
         this.parse(cx);
@@ -1591,6 +1602,10 @@ pub struct MarkdownElement {
     image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
+    /// Overrides the built-in purple→pink speaking-highlight palette.
+    /// `(start, end)` gradient stops, equal for a solid pill; the wash,
+    /// hover band, and outline derive from the start color.
+    speaking_highlight_colors: Option<(Hsla, Hsla)>,
     /// Test-only hook to observe the laid-out text when this element is
     /// rendered beneath a view, where the layout state isn't otherwise
     /// reachable.
@@ -1617,6 +1632,7 @@ impl MarkdownElement {
             image_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
+            speaking_highlight_colors: None,
             #[cfg(test)]
             on_render: None,
         }
@@ -1685,6 +1701,12 @@ impl MarkdownElement {
         handler: impl Fn(usize, usize, &mut Window, &mut App) -> bool + 'static,
     ) -> Self {
         self.on_source_click = Some(Box::new(handler));
+        self
+    }
+
+    /// Overrides the speaking-highlight palette (see the field docs).
+    pub fn speaking_highlight_colors(mut self, colors: Option<(Hsla, Hsla)>) -> Self {
+        self.speaking_highlight_colors = colors;
         self
     }
 
@@ -2107,9 +2129,10 @@ impl MarkdownElement {
     /// gradient pill on the single word currently sounding. Later layers
     /// paint on top of earlier ones, and the karaoke effect comes from the
     /// pill hopping word to word as playback advances. The palette is a
-    /// fixed purple→pink brand pair (user-directed, deliberately not a theme
-    /// token); only the pill's alpha adapts to the theme's appearance so the
-    /// glyphs on top stay legible.
+    /// purple→pink brand pair (user-directed, deliberately not a theme
+    /// token) unless overridden via `speaking_highlight_colors`; only the
+    /// pill's alpha adapts to the theme's appearance so the glyphs on top
+    /// stay legible.
     fn paint_speaking_highlight(
         &self,
         rendered_text: &RenderedText,
@@ -2119,18 +2142,31 @@ impl MarkdownElement {
         let markdown = self.markdown.read(cx);
         let sentence = markdown.speaking_highlight.clone();
         let word = markdown.speaking_word_highlight.clone();
-        let hover = markdown.hover_highlight.clone();
+        // The hover band advertises click-to-seek; without a click handler
+        // (seeking disabled or unavailable) it would promise nothing.
+        let hover = if self.on_source_click.is_some() {
+            markdown.hover_highlight.clone()
+        } else {
+            None
+        };
         if sentence.is_none() && word.is_none() && hover.is_none() {
             return;
         }
-        let purple: Hsla = rgb(0xA855F7).into();
-        let pink: Hsla = rgb(0xEC4899).into();
+        let word_alpha = if cx.theme().appearance.is_light() {
+            // Dark glyphs on a light surface only need a tint.
+            0.3
+        } else {
+            // Light glyphs need the fill strong enough to read as a
+            // pill without drowning them.
+            0.7
+        };
+        let palette = speaking_palette(self.speaking_highlight_colors, word_alpha);
 
         if let Some(range) = hover {
             paint_highlight_band(
                 rendered_text,
                 range,
-                purple.opacity(0.15).into(),
+                palette.hover.into(),
                 None,
                 px(3.),
                 px(2.),
@@ -2142,7 +2178,7 @@ impl MarkdownElement {
             paint_highlight_band(
                 rendered_text,
                 range,
-                purple.opacity(0.25).into(),
+                palette.sentence.into(),
                 None,
                 px(3.),
                 px(2.),
@@ -2151,25 +2187,16 @@ impl MarkdownElement {
         }
 
         if let Some(range) = word {
-            let alpha = if cx.theme().appearance.is_light() {
-                // Dark glyphs on a light surface only need a tint.
-                0.3
-            } else {
-                // Light glyphs need the fill strong enough to read as a
-                // pill without drowning them.
-                0.7
-            };
             let fill = linear_gradient(
                 90.,
-                linear_color_stop(purple.opacity(alpha), 0.),
-                linear_color_stop(pink.opacity(alpha), 1.),
+                linear_color_stop(palette.word_start, 0.),
+                linear_color_stop(palette.word_end, 1.),
             );
-            let outline = purple.opacity((alpha + 0.15).min(1.));
             paint_highlight_band(
                 rendered_text,
                 range,
                 fill,
-                Some(outline),
+                Some(palette.outline),
                 px(4.),
                 px(3.),
                 window,
@@ -2201,14 +2228,16 @@ impl MarkdownElement {
                             || rendered_text
                                 .footnote_ref_for_source_index(source_index)
                                 .is_some()
-                            // A speakable sentence acts like a control too: a
-                            // click on it seeks read-aloud there.
-                            || self
-                                .markdown
-                                .read(cx)
-                                .speakable_ranges
-                                .iter()
-                                .any(|range| range.contains(&source_index))
+                            // A speakable sentence acts like a control too —
+                            // a click on it seeks read-aloud there — but only
+                            // while a seek handler exists to receive it.
+                            || (self.on_source_click.is_some()
+                                && self
+                                    .markdown
+                                    .read(cx)
+                                    .speakable_ranges
+                                    .iter()
+                                    .any(|range| range.contains(&source_index)))
                     }));
 
         if is_hovering_clickable {
@@ -2220,6 +2249,7 @@ impl MarkdownElement {
         let on_open_url = self.on_url_click.take();
         let on_url_hover = self.on_url_hover.take();
         let on_source_click = self.on_source_click.take();
+        let has_source_click = on_source_click.is_some();
 
         self.on_mouse_event(window, cx, {
             let hitbox = hitbox.clone();
@@ -2266,16 +2296,20 @@ impl MarkdownElement {
                             let source_index = match position_result {
                                 Ok(ix) | Err(ix) => ix,
                             };
-                            if let Some(handler) = on_source_click.as_ref() {
-                                let blocked = handler(source_index, event.click_count, window, cx);
-                                if blocked {
-                                    markdown.selection = Selection::default();
-                                    markdown.pressed_link = None;
-                                    window.prevent_default();
-                                    cx.notify();
-                                    return;
-                                }
-                            }
+                            // Seeks fire on mouse-up, and only when the
+                            // gesture stayed a true click (see the
+                            // MouseUpEvent handler); arming here leaves the
+                            // selection machinery below untouched, so
+                            // click-drag select and copy never seek. Double
+                            // and triple clicks are word and line selection
+                            // and are never armed.
+                            markdown.pending_seek = (has_source_click
+                                && event.click_count == 1
+                                && !event.modifiers.shift)
+                                .then_some(PendingSeek {
+                                    position: event.position,
+                                    source_index,
+                                });
                             let (range, mode, reversed) = match event.click_count {
                                 1 if event.modifiers.shift => {
                                     let tail = markdown.selection.tail();
@@ -2324,6 +2358,7 @@ impl MarkdownElement {
                 } else if phase.capture() && event.button == MouseButton::Left {
                     markdown.selection = Selection::default();
                     markdown.pressed_link = None;
+                    markdown.pending_seek = None;
                     cx.notify();
                 }
             }
@@ -2353,13 +2388,17 @@ impl MarkdownElement {
                     let source_index = is_hitbox_hovered
                         .then(|| rendered_text.source_index_for_position(event.position).ok())
                         .flatten();
-                    let hovered_speakable = source_index.and_then(|source_index| {
-                        markdown
-                            .speakable_ranges
-                            .iter()
-                            .find(|range| range.contains(&source_index))
-                            .cloned()
-                    });
+                    let hovered_speakable = if has_source_click {
+                        source_index.and_then(|source_index| {
+                            markdown
+                                .speakable_ranges
+                                .iter()
+                                .find(|range| range.contains(&source_index))
+                                .cloned()
+                        })
+                    } else {
+                        None
+                    };
                     if markdown.hover_highlight != hovered_speakable {
                         markdown.hover_highlight = hovered_speakable;
                         cx.notify();
@@ -2395,6 +2434,7 @@ impl MarkdownElement {
             move |markdown, event: &MouseUpEvent, phase, window, cx| {
                 if phase.bubble() {
                     let source_index = rendered_text.source_index_for_position(event.position).ok();
+                    let pending_seek = markdown.pending_seek.take();
                     if let Some(pressed_footnote_ref) = markdown.pressed_footnote_ref.take()
                         && source_index
                             .and_then(|ix| rendered_text.footnote_ref_for_source_index(ix))
@@ -2414,6 +2454,21 @@ impl MarkdownElement {
                             open_url(pressed_link.destination_url, window, cx);
                         } else {
                             cx.open_url(&pressed_link.destination_url);
+                        }
+                    } else if let Some(pending_seek) = pending_seek {
+                        // A true click only: the pointer stayed within the
+                        // slop and the gesture selected nothing. (The
+                        // capture-phase branch below has already finalized
+                        // the selection by the time bubble runs, so its
+                        // emptiness is trustworthy here.)
+                        let slop = px(3.);
+                        let delta = event.position - pending_seek.position;
+                        let stayed_put = delta.x.abs() <= slop && delta.y.abs() <= slop;
+                        let selected = markdown.selection.start != markdown.selection.end;
+                        if stayed_put && !selected {
+                            if let Some(handler) = on_source_click.as_ref() {
+                                handler(pending_seek.source_index, event.click_count, window, cx);
+                            }
                         }
                     }
                 } else if markdown.selection.pending {
@@ -3303,12 +3358,39 @@ impl Element for MarkdownElement {
             }
         });
 
-        self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
-        // The bands go under the glyphs — the text layout's bounds are already
-        // resolved by prepaint, so painting from them before the element itself
-        // is safe.
+        // The speaking highlights go under the glyphs — the text layout's
+        // bounds are already resolved by prepaint, so painting from them
+        // before the element itself is safe. They must also paint before the
+        // mouse listeners are installed: installing them takes
+        // `on_source_click`, whose presence gates the hover band.
         self.paint_speaking_highlight(&rendered_markdown.text, window, cx);
+        self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+    }
+}
+
+/// The colors of the speaking-highlight family, all derived from the two
+/// gradient endpoints so one setting retints every layer.
+struct SpeakingPalette {
+    hover: Hsla,
+    sentence: Hsla,
+    word_start: Hsla,
+    word_end: Hsla,
+    outline: Hsla,
+}
+
+/// `custom` is `(start, end)` from the user's pill colors — equal for a
+/// solid pill — and `None` is the built-in purple→pink pair. `word_alpha`
+/// is the appearance-dependent pill strength; the hover band, sentence wash,
+/// and outline keep their fixed alpha treatments of the start color.
+fn speaking_palette(custom: Option<(Hsla, Hsla)>, word_alpha: f32) -> SpeakingPalette {
+    let (start, end) = custom.unwrap_or_else(|| (rgb(0xA855F7).into(), rgb(0xEC4899).into()));
+    SpeakingPalette {
+        hover: start.opacity(0.15),
+        sentence: start.opacity(0.25),
+        word_start: start.opacity(word_alpha),
+        word_end: end.opacity(word_alpha),
+        outline: start.opacity((word_alpha + 0.15).min(1.)),
     }
 }
 
@@ -5094,24 +5176,73 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_speaking_palette_derives_every_layer_from_the_custom_colors() {
+        let word_alpha = 0.7;
+
+        let default_palette = speaking_palette(None, word_alpha);
+        let purple: Hsla = rgb(0xA855F7).into();
+        let pink: Hsla = rgb(0xEC4899).into();
+        assert_eq!(default_palette.word_start, purple.opacity(word_alpha));
+        assert_eq!(default_palette.word_end, pink.opacity(word_alpha));
+
+        let custom_start: Hsla = rgb(0x10B981).into();
+        let custom_end: Hsla = rgb(0x3B82F6).into();
+        let palette = speaking_palette(Some((custom_start, custom_end)), word_alpha);
+        assert_eq!(palette.word_start, custom_start.opacity(word_alpha));
+        assert_eq!(palette.word_end, custom_end.opacity(word_alpha));
+        assert_eq!(
+            palette.hover,
+            custom_start.opacity(0.15),
+            "the hover band retints from the first color"
+        );
+        assert_eq!(
+            palette.sentence,
+            custom_start.opacity(0.25),
+            "the sentence wash retints from the first color"
+        );
+        assert_eq!(
+            palette.outline,
+            custom_start.opacity((word_alpha + 0.15).min(1.)),
+            "the outline is the first color at higher alpha"
+        );
+
+        let solid = speaking_palette(Some((custom_start, custom_start)), word_alpha);
+        assert_eq!(
+            solid.word_start, solid.word_end,
+            "equal stops paint a solid pill"
+        );
+    }
+
+    struct SpeakableTestView {
+        markdown: Entity<Markdown>,
+        with_seek_handler: bool,
+        seeks: Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl Render for SpeakableTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let element = MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default());
+            let element = if self.with_seek_handler {
+                let seeks = self.seeks.clone();
+                element.on_source_click(move |source_index, _, _, _| {
+                    seeks.borrow_mut().push(source_index);
+                    false
+                })
+            } else {
+                element
+            };
+            div().size_full().child(element)
+        }
+    }
+
     #[gpui::test]
     fn test_hover_highlight_follows_speakable_ranges(cx: &mut TestAppContext) {
-        struct SpeakableTestView {
-            markdown: Entity<Markdown>,
-        }
-
-        impl Render for SpeakableTestView {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().size_full().child(MarkdownElement::new(
-                    self.markdown.clone(),
-                    MarkdownStyle::default(),
-                ))
-            }
-        }
-
         ensure_theme_initialized(cx);
         let (view, cx) = cx.add_window_view(move |_, cx| SpeakableTestView {
             markdown: cx.new(|cx| Markdown::new("First one. Second one.".into(), None, None, cx)),
+            with_seek_handler: true,
+            seeks: Rc::default(),
         });
         cx.run_until_parked();
         let markdown = view.read_with(cx, |view, _| view.markdown.clone());
@@ -5143,6 +5274,78 @@ mod tests {
             markdown.read_with(cx, |markdown, _| markdown.hover_highlight().cloned()),
             None,
             "without speakable ranges there is nothing to preview"
+        );
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_speakable_ranges(vec![0..10, 11..22], cx);
+        });
+        view.update(cx, |view, cx| {
+            view.with_seek_handler = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(px(8.), px(8.)), None, gpui::Modifiers::default());
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.hover_highlight().cloned()),
+            None,
+            "without a seek handler the ranges advertise nothing — a disabled \
+             action gets no affordance"
+        );
+    }
+
+    #[gpui::test]
+    fn test_a_click_seeks_on_mouse_up_but_a_drag_select_never_does(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let seeks: Rc<std::cell::RefCell<Vec<usize>>> = Rc::default();
+        let (_view, cx) = cx.add_window_view({
+            let seeks = seeks.clone();
+            move |_, cx| SpeakableTestView {
+                markdown: cx
+                    .new(|cx| Markdown::new("First one. Second one.".into(), None, None, cx)),
+                with_seek_handler: true,
+                seeks,
+            }
+        });
+        cx.run_until_parked();
+
+        // A true click fires exactly once, on the up.
+        cx.simulate_mouse_down(
+            point(px(8.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert!(
+            seeks.borrow().is_empty(),
+            "the down alone must not seek — it may still become a drag"
+        );
+        cx.simulate_mouse_up(
+            point(px(8.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(seeks.borrow().len(), 1, "a clean click seeks once");
+
+        // Down, drag across the text to select, up: a copy gesture, not a
+        // seek. (The click above proves these coordinates land on prose.)
+        cx.simulate_mouse_down(
+            point(px(8.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(80.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(80.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            seeks.borrow().len(),
+            1,
+            "a drag-select must never trigger a seek"
         );
     }
 
