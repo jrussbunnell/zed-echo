@@ -1190,7 +1190,8 @@ fn render_fonts_section(
     let items = crate::page_data::ui_font_section()
         .into_iter()
         .chain(crate::page_data::buffer_font_section())
-        .chain(crate::page_data::agent_panel_font_section());
+        .chain(crate::page_data::agent_panel_font_section())
+        .chain(terminal_font_items());
 
     v_flex()
         .gap_1()
@@ -1202,6 +1203,57 @@ fn render_fonts_section(
             window,
             cx,
         ))
+}
+
+/// The terminal's own font settings, which live on the Terminal page rather
+/// than Appearance and so cannot be reused from there.
+fn terminal_font_items() -> [SettingsPageItem; 3] {
+    [
+        SettingsPageItem::SectionHeader("Terminal Font"),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "Font Family",
+            description: "Font family for terminal text. Falls back to the buffer font family.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("terminal.font_family"),
+                pick: |settings_content| {
+                    settings_content
+                        .terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.font_family.as_ref())
+                        .or(settings_content.theme.buffer_font_family.as_ref())
+                },
+                write: |settings_content, value, _| {
+                    settings_content
+                        .terminal
+                        .get_or_insert_default()
+                        .font_family = value;
+                },
+            }),
+            metadata: None,
+            files: USER,
+        }),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "Font Size",
+            description: "Font size for terminal text. Falls back to the buffer font size.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("terminal.font_size"),
+                pick: |settings_content| {
+                    settings_content
+                        .terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.font_size.as_ref())
+                        .or(settings_content.theme.buffer_font_size.as_ref())
+                },
+                write: |settings_content, value, _| {
+                    settings_content.terminal.get_or_insert_default().font_size = value;
+                },
+            }),
+            metadata: None,
+            files: USER,
+        }),
+    ]
 }
 
 // Element id bases keep the ad-hoc `SettingItem`s on this page from colliding
