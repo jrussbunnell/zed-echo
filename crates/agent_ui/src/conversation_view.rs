@@ -7520,6 +7520,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// Settings changes must land without a restart: the speaking rate
+    /// re-times the sink live, disabling stops playback and drops every
+    /// read-aloud surface, and re-enabling re-runs the activation path.
+    #[gpui::test]
+    async fn test_read_aloud_settings_apply_live(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("First one. Second one.".into()),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Say two sentences", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let provider = read_aloud::FakeTts::new();
+        let sink = read_aloud::FakeSink::new();
+        let reader = cx.new({
+            let sink = sink.clone();
+            |cx| read_aloud::ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        thread_view.update(cx, |view, _cx| {
+            view.set_read_aloud_for_test(reader.clone());
+        });
+        thread_view.update(cx, |view, cx| view.toggle_read_aloud(cx));
+        cx.run_until_parked();
+        assert!(reader.read_with(cx, |reader, _| reader.is_speaking()));
+
+        // Enabling in settings while a reader is already active adopts it
+        // rather than re-activating; this arms the live paths below.
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().enabled = Some(true);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            reader.read_with(cx, |reader, _| reader.is_speaking()),
+            "enabling with a reader already active must not disturb it"
+        );
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().speaking_rate = Some(2.0);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sink.speed(),
+            2.0,
+            "a speaking_rate change re-times playback live"
+        );
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().enabled = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !reader.read_with(cx, |reader, _| reader.is_speaking()),
+            "disabling must stop playback"
+        );
+        assert_eq!(
+            reader.read_with(cx, |reader, cx| reader.playback_state(cx)),
+            None,
+            "disabling leaves nothing for the mini player to render"
+        );
+        thread_view.read_with(cx, |view, _| {
+            assert!(
+                view.read_aloud_for_test().is_none(),
+                "the reader is dropped, so every read-aloud surface disappears"
+            );
+        });
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().enabled = Some(true);
+                });
+            });
+        });
+        thread_view.read_with(cx, |view, _| {
+            assert!(
+                view.read_aloud_activation_pending_for_test(),
+                "re-enabling must re-run the activation path without a restart"
+            );
+        });
+        cx.run_until_parked();
+    }
+
     /// Guards the latch this had at first: `toggle` alone only rewinds the
     /// utterance list the reader already holds, so with nothing re-segmenting
     /// it, anything that arrived after the last load would never be spoken.

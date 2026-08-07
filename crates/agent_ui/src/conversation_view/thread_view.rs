@@ -653,6 +653,24 @@ pub struct ThreadView {
     /// speaks prose that starts streaming while this view is live, so those
     /// are never enqueued (explicit clicks and buttons still play them).
     read_aloud_watermark: usize,
+    /// The last-applied read-aloud settings, diffed against the global on
+    /// every settings change so only what actually changed is re-applied.
+    read_aloud_settings: read_aloud::ReadAloudSettings,
+    /// Subscriptions owned by the current read-aloud activation (the thread
+    /// auto-play subscription and the reader observation). Scoped apart from
+    /// `_subscriptions` so disabling read aloud drops them and a later
+    /// re-enable does not stack duplicates.
+    read_aloud_subscriptions: Vec<Subscription>,
+    /// The in-flight activation (API-key resolution). Held so a mid-flight
+    /// disable cancels it instead of letting it install a reader afterwards.
+    read_aloud_activation: Option<Task<()>>,
+    /// The concrete Inworld provider, kept alongside the type-erased handle
+    /// inside `ReadAloud` so a settings change can re-target its voice.
+    read_aloud_provider: Option<Arc<read_aloud::InworldTts>>,
+    /// The provider's voice catalog, fetched lazily the first time the voice
+    /// menu opens and cached for this view's lifetime.
+    read_aloud_voices: Option<Vec<read_aloud::TtsVoice>>,
+    read_aloud_voices_task: Option<Task<()>>,
 }
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
@@ -1064,9 +1082,19 @@ impl ThreadView {
             thread_search_visible: false,
             read_aloud: None,
             read_aloud_watermark: 0,
+            read_aloud_settings: read_aloud::ReadAloudSettings::get_global(cx).clone(),
+            read_aloud_subscriptions: Vec::new(),
+            read_aloud_activation: None,
+            read_aloud_provider: None,
+            read_aloud_voices: None,
+            read_aloud_voices_task: None,
         };
 
         this.init_read_aloud(cx);
+        this._subscriptions
+            .push(cx.observe_global::<SettingsStore>(|this, cx| {
+                this.read_aloud_settings_changed(cx);
+            }));
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
@@ -1112,6 +1140,12 @@ impl ThreadView {
         if self.parent_session_id.is_some() {
             return;
         }
+        // Already active or activating: nothing to redo. Re-activation
+        // always passes through `shutdown_read_aloud` first, which clears
+        // both.
+        if self.read_aloud.is_some() || self.read_aloud_activation.is_some() {
+            return;
+        }
 
         self.subscribe_read_aloud(cx);
 
@@ -1120,12 +1154,13 @@ impl ThreadView {
         };
         let http_client = workspace.read(cx).client().http_client();
 
-        cx.spawn(async move |this, cx| {
+        self.read_aloud_activation = Some(cx.spawn(async move |this, cx| {
             let api_key = cx.update(|cx| read_aloud::resolve_api_key(cx)).await;
             let api_key = match api_key {
                 Ok(api_key) => api_key,
                 Err(error) => {
                     this.update(cx, |this, cx| {
+                        this.read_aloud_activation = None;
                         this.notify_read_aloud_disabled(
                             format!("no Inworld API key ({error:#})"),
                             cx,
@@ -1137,6 +1172,7 @@ impl ThreadView {
             };
 
             this.update(cx, |this, cx| {
+                this.read_aloud_activation = None;
                 let Some(player) = audio::Audio::connect_player(cx) else {
                     this.notify_read_aloud_disabled(
                         "no audio output device available".to_string(),
@@ -1146,34 +1182,100 @@ impl ThreadView {
                 };
 
                 let settings = read_aloud::ReadAloudSettings::get_global(cx);
-                let provider = read_aloud::InworldTts::new(
+                let provider = Arc::new(read_aloud::InworldTts::new(
                     http_client,
                     api_key,
                     settings.voice_id.clone(),
                     settings.model_id.clone(),
-                );
+                ));
                 let speaking_rate = settings.speaking_rate;
+                let click_to_seek = settings.click_to_seek;
 
                 let read_aloud = cx.new(|cx| {
                     let mut read_aloud = read_aloud::ReadAloud::new(
-                        Arc::new(provider),
+                        provider.clone(),
                         Box::new(read_aloud::RodioSink::new(player)),
                         cx,
                     );
                     read_aloud.set_speed(speaking_rate, cx);
+                    read_aloud.set_click_to_seek(click_to_seek, cx);
                     read_aloud
                 });
                 // The mini player renders off this entity's state; it already
                 // notifies on every playback transition, so observing it is
                 // what keeps the controls current without another timer.
-                this._subscriptions
+                this.read_aloud_subscriptions
                     .push(cx.observe(&read_aloud, |_, _, cx| cx.notify()));
+                this.read_aloud_provider = Some(provider);
                 this.read_aloud = Some(read_aloud);
                 cx.notify();
             })
             .log_err();
-        })
-        .detach();
+        }));
+    }
+
+    /// Applies `read_aloud.*` settings changes without a restart. Voice and
+    /// model re-target the provider (the next synthesis request speaks with
+    /// them), the speaking rate re-times current playback, click-to-seek
+    /// re-arms the affordance, and the enabled flag activates or deactivates
+    /// the whole feature. `auto_play` needs no handling here: the enqueue
+    /// path reads it live, so a toggle takes effect on the next turn by
+    /// itself. Pill colors feed the next render directly from the global.
+    fn read_aloud_settings_changed(&mut self, cx: &mut Context<Self>) {
+        let settings = read_aloud::ReadAloudSettings::get_global(cx).clone();
+        if settings == self.read_aloud_settings {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.read_aloud_settings, settings.clone());
+
+        if settings.enabled != previous.enabled {
+            if settings.enabled {
+                self.init_read_aloud(cx);
+            } else {
+                self.shutdown_read_aloud(cx);
+            }
+            // Activation snapshots the rest of the settings itself, and
+            // deactivation leaves nothing to re-apply to.
+            cx.notify();
+            return;
+        }
+        if !settings.enabled {
+            return;
+        }
+
+        if settings.voice_id != previous.voice_id || settings.model_id != previous.model_id {
+            if let Some(provider) = &self.read_aloud_provider {
+                provider.set_voice(settings.voice_id.clone(), settings.model_id.clone());
+            }
+        }
+        if let Some(read_aloud) = self.read_aloud.clone() {
+            if settings.speaking_rate != previous.speaking_rate {
+                read_aloud.update(cx, |read_aloud, cx| {
+                    read_aloud.set_speed(settings.speaking_rate, cx);
+                });
+            }
+            if settings.click_to_seek != previous.click_to_seek {
+                read_aloud.update(cx, |read_aloud, cx| {
+                    read_aloud.set_click_to_seek(settings.click_to_seek, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Tears read aloud down when settings disable it: playback stops, the
+    /// highlights clear, and every read-aloud surface (mini player, speaker
+    /// buttons, click affordance) disappears because the entity they all
+    /// render from is gone. Dropping the activation task covers the window
+    /// where the API key is still resolving; dropping the subscriptions
+    /// keeps a later re-enable from stacking duplicates.
+    fn shutdown_read_aloud(&mut self, cx: &mut Context<Self>) {
+        self.read_aloud_activation = None;
+        self.read_aloud_subscriptions.clear();
+        self.read_aloud_provider = None;
+        if let Some(read_aloud) = self.read_aloud.take() {
+            read_aloud.update(cx, |read_aloud, cx| read_aloud.dismiss(cx));
+        }
     }
 
     /// Installs the auto-play subscription, with the watermark that scopes
@@ -1184,7 +1286,7 @@ impl ThreadView {
     /// moment is the *previous* turn's message.
     fn subscribe_read_aloud(&mut self, cx: &mut Context<Self>) {
         self.read_aloud_watermark = self.thread.read(cx).entries().len();
-        self._subscriptions.push(cx.subscribe(
+        self.read_aloud_subscriptions.push(cx.subscribe(
             &self.thread,
             |this, thread, event: &AcpThreadEvent, cx| match event {
                 AcpThreadEvent::NewEntry => this.enqueue_read_aloud(false, cx),
@@ -1365,6 +1467,18 @@ impl ThreadView {
         self.read_aloud = Some(read_aloud);
     }
 
+    #[cfg(test)]
+    pub(super) fn read_aloud_for_test(&self) -> Option<&Entity<read_aloud::ReadAloud>> {
+        self.read_aloud.as_ref()
+    }
+
+    /// Whether an activation (API-key resolution) is in flight — the tests'
+    /// only evidence that a settings re-enable re-ran the activation path.
+    #[cfg(test)]
+    pub(super) fn read_aloud_activation_pending_for_test(&self) -> bool {
+        self.read_aloud_activation.is_some()
+    }
+
     /// Installs the real auto-play subscription (with its watermark), which
     /// `set_read_aloud_for_test` deliberately does not — most tests drive the
     /// reader explicitly and must not receive auto-play enqueues.
@@ -1390,6 +1504,7 @@ impl ThreadView {
                 .color(Color::Muted)
                 .truncate(),
         );
+        let voice_menu = self.render_read_aloud_voice_menu(cx);
 
         let pill = h_flex()
             .gap_1()
@@ -1415,6 +1530,7 @@ impl ThreadView {
                     })),
             )
             .child(sentence_preview)
+            .child(voice_menu)
             .child(
                 IconButton::new("read-aloud-dismiss", IconName::Close)
                     .icon_size(IconSize::Small)
@@ -1471,6 +1587,7 @@ impl ThreadView {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
+            .child(voice_menu)
             .child(
                 IconButton::new("read-aloud-stop", IconName::Close)
                     .icon_size(IconSize::Small)
@@ -1498,6 +1615,117 @@ impl ThreadView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The compact voice switcher on the mini player: a button naming the
+    /// current voice, opening the provider's catalog with that voice
+    /// checked. The catalog is fetched lazily on first open and cached for
+    /// the view; while it loads the menu shows a placeholder (reopening once
+    /// it lands shows the list), and a failed fetch falls back to a curated
+    /// list. Selecting a voice edits `read_aloud.voice_id` in the settings
+    /// file; the settings observation then re-targets the provider, so the
+    /// next synthesized sentence speaks with the new voice.
+    fn render_read_aloud_voice_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(project) = self.project.upgrade() else {
+            return div().into_any_element();
+        };
+        let current_voice_id = read_aloud::ReadAloudSettings::get_global(cx)
+            .voice_id
+            .clone();
+        let voice_name = self
+            .read_aloud_voices
+            .as_ref()
+            .and_then(|voices| {
+                voices
+                    .iter()
+                    .find(|voice| voice.id.as_ref() == current_voice_id)
+                    .map(|voice| voice.name.clone())
+            })
+            .unwrap_or_else(|| SharedString::from(current_voice_id.clone()));
+
+        let this = cx.entity().downgrade();
+        let fs = project.read(cx).fs().clone();
+        PopoverMenu::new("read-aloud-voice")
+            .trigger(
+                Button::new("read-aloud-voice-button", voice_name)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
+            .menu(move |window, cx| {
+                let voices = this
+                    .update(cx, |this, cx| {
+                        this.ensure_read_aloud_voices(cx);
+                        this.read_aloud_voices.clone()
+                    })
+                    .ok()
+                    .flatten();
+                let fs = fs.clone();
+                let current_voice_id = current_voice_id.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    let Some(voices) = voices else {
+                        return menu.header("Loading voices…");
+                    };
+                    for voice in voices {
+                        let checked = voice.id.as_ref() == current_voice_id;
+                        let voice_id = voice.id.to_string();
+                        let fs = fs.clone();
+                        menu = menu.toggleable_entry(
+                            voice.name.clone(),
+                            checked,
+                            IconPosition::Start,
+                            None,
+                            move |_window, cx| {
+                                let voice_id = voice_id.clone();
+                                update_settings_file(fs.clone(), cx, move |content, _| {
+                                    content.read_aloud.get_or_insert_default().voice_id =
+                                        Some(voice_id);
+                                });
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// Starts the lazy, once-per-view voice catalog fetch. A failure ends in
+    /// the curated fallback list rather than an error state, so the menu
+    /// always becomes usable.
+    fn ensure_read_aloud_voices(&mut self, cx: &mut Context<Self>) {
+        if self.read_aloud_voices.is_some() || self.read_aloud_voices_task.is_some() {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let http_client = workspace.read(cx).client().http_client();
+        self.read_aloud_voices_task = Some(cx.spawn(async move |this, cx| {
+            let api_key = cx.update(|cx| read_aloud::resolve_api_key(cx)).await;
+            let voices = match api_key {
+                Ok(api_key) => {
+                    cx.update(|cx| read_aloud::fetch_voices(http_client, api_key, cx))
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let voices = match voices {
+                Ok(voices) => voices,
+                Err(error) => {
+                    log::error!(
+                        "read_aloud: voice list fetch failed, using the fallback list: {error:#}"
+                    );
+                    read_aloud::fallback_voices()
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.read_aloud_voices = Some(voices);
+                this.read_aloud_voices_task = None;
+                cx.notify();
+            })
+            .log_err();
+        }));
     }
 
     /// The markdown blocks of one assistant message, in reading order.
@@ -12010,6 +12238,14 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return element;
         };
+        let settings = read_aloud::ReadAloudSettings::get_global(cx);
+        let element = element.speaking_highlight_colors(settings.pill_colors);
+        if !settings.click_to_seek {
+            // No handler at all: the element then shows no hover band or
+            // pointer cursor either — a disabled action gets no affordance.
+            // The speaker buttons and mini player are unaffected.
+            return element;
+        }
         let thread = self.thread.clone();
         element.on_source_click(move |source_index, click_count, _window, cx| {
             // Double and triple clicks are word and line selection; leave them be.
@@ -12035,7 +12271,9 @@ impl ThreadView {
                     read_aloud.seek_to_source_index(&markdown, source_index, message_complete, cx);
                 });
             });
-            // Returning false leaves click-drag text selection working as normal.
+            // The element already fires this only for true clicks (on the
+            // mouse-up, after ruling out drags and selections), so there is
+            // nothing left to block.
             false
         })
     }
