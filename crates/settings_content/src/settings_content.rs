@@ -632,6 +632,15 @@ pub struct ReadAloudSettingsContent {
     ///
     /// Default: true
     pub narrate_tool_calls: Option<bool>,
+    /// How much narration mode condenses. "steps" groups the agent's prose
+    /// with the tool calls it then made and speaks one line saying what it is
+    /// doing and why, then wraps the turn up at the end. "actions" speaks a
+    /// short templated line per tool call and per finished message, with no
+    /// model calls beyond the existing message summaries. Has no effect in
+    /// full mode.
+    ///
+    /// Default: steps
+    pub narration_detail: Option<NarrationDetail>,
     /// The language model that condenses a completed assistant message into
     /// the sentence or two narration mode speaks. Unset falls back to the
     /// inline assistant model, and then to speaking the message's first
@@ -662,6 +671,32 @@ pub enum ReadAloudMode {
     /// Speak a running summary of what the agent is doing and deciding,
     /// leaving the full text on screen to read later.
     Narration,
+}
+
+/// How much narration mode condenses what the agent is doing.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrationDetail {
+    /// One templated line per tool call, and a summary per finished message.
+    Actions,
+    /// One line per step — the agent's prose plus the tool calls it then
+    /// made — saying what it is doing and why, and a wrap-up when the turn
+    /// ends.
+    #[default]
+    Steps,
 }
 
 /// Custom styling for the agent panel's content types. Every field is

@@ -631,7 +631,15 @@
     "mode": "full",
     // Whether narration mode speaks each tool call ("Read player.rs").
     // Ignored in full mode.
-    "narrate_tool_calls": true
+    "narrate_tool_calls": true,
+    // How much narration mode condenses. "steps" groups the agent's prose
+    // with the tool calls it then made and speaks one line saying what it
+    // is doing and why ("Checking the sync design spec to see how the
+    // pipeline stages line up"), then wraps the whole turn up when it ends.
+    // "actions" speaks a short templated line per tool call ("Reading
+    // player") and a summary per finished message, with no extra model
+    // calls. Ignored in full mode.
+    "narration_detail": "steps"
     // "summary_model": { "provider": "anthropic", "model": "claude-haiku-4-5" }
     // The model that condenses a finished message for narration mode. Unset
     // uses the inline assistant model, and with no model at all narration
