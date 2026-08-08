@@ -21,10 +21,20 @@ pub const OPENING_SENTENCES: usize = 2;
 /// discarded in favor of the fallback.
 pub const MAX_SUMMARY_CHARS: usize = 600;
 
+/// The most a single step line may be. One spoken sentence of ambient
+/// status; anything longer is the model ignoring the brief, and the terse
+/// templated form beats a paragraph that arrives late.
+pub const MAX_STEP_LINE_CHARS: usize = 220;
+
 /// The most of a message that is worth sending to the summary model. Longer
 /// messages are truncated rather than skipped: the opening carries the
 /// decisions, and the tail is usually code or a recap.
 const MAX_SUMMARY_INPUT_CHARS: usize = 8_000;
+
+/// How many already-spoken lines a prompt carries. Enough for the model to
+/// avoid repeating itself over a burst of steps, short enough not to crowd
+/// out the material it is meant to condense.
+pub const RECENT_LINES: usize = 5;
 
 /// The tool families narration knows how to count. The owning view maps the
 /// agent protocol's own tool kinds onto these, so this crate needs no
@@ -134,6 +144,19 @@ pub(crate) struct NarrationQueue {
     /// immediately, so back-to-back duplicates are suppressed across the
     /// boundary between the queue and the player.
     last_tool_label: Option<SharedString>,
+    /// The kind of the last tool call accepted, so a run of the same kind
+    /// elides its verb ("Reading player. Then segmenter.") instead of
+    /// chanting it. Cleared by anything that is not a tool call, because the
+    /// elision only reads as continuation when it directly follows.
+    last_tool_kind: Option<NarrationKind>,
+    /// What narration has committed to saying, newest last, capped at
+    /// [`RECENT_LINES`]. Prompts carry this so a step line does not repeat
+    /// the one before it and the wrap-up does not recite the whole turn.
+    ///
+    /// Recorded when a line is *queued* rather than when it is spoken: a
+    /// prompt built while the queue drains has to know about lines that are
+    /// about to sound, or every step in a burst reads as the first one.
+    recent: std::collections::VecDeque<String>,
 }
 
 impl NarrationQueue {
@@ -149,18 +172,26 @@ impl NarrationQueue {
         if source.trim().is_empty() || self.last_tool_label.as_ref() == Some(&source) {
             return false;
         }
+        let continuing = self.last_tool_kind == Some(kind);
         self.last_tool_label = Some(source.clone());
-        let narration = match generated_phrase(&source, kind) {
-            Some(phrase) => Narration {
-                spoken: cx.new(|cx| Markdown::new(phrase.into(), None, None, cx)),
-                wash: vec![label],
-                progress: Some(Progress { kind, count: 1 }),
-            },
-            None => Narration {
-                spoken: label,
-                wash: Vec::new(),
-                progress: Some(Progress { kind, count: 1 }),
-            },
+        self.last_tool_kind = Some(kind);
+        let narration = match generated_phrase(&source, kind, continuing) {
+            Some(phrase) => {
+                self.remember(&phrase);
+                Narration {
+                    spoken: cx.new(|cx| Markdown::new(phrase.into(), None, None, cx)),
+                    wash: vec![label],
+                    progress: Some(Progress { kind, count: 1 }),
+                }
+            }
+            None => {
+                self.remember(&source);
+                Narration {
+                    spoken: label,
+                    wash: Vec::new(),
+                    progress: Some(Progress { kind, count: 1 }),
+                }
+            }
         };
         self.pending.push(narration);
         self.collapse_backlog(cx);
@@ -172,6 +203,8 @@ impl NarrationQueue {
     /// short enough that summarizing it would cost more than saying it.
     pub fn push_inline(&mut self, text: Entity<Markdown>, cx: &mut App) {
         self.last_tool_label = None;
+        self.last_tool_kind = None;
+        self.remember(&text.read(cx).source().clone());
         self.pending.push(Narration {
             spoken: text,
             wash: Vec::new(),
@@ -181,9 +214,9 @@ impl NarrationQueue {
         self.enforce_cap();
     }
 
-    /// Queues text that exists nowhere on screen (a model summary, or a
-    /// message's opening sentences), alongside the blocks to wash so the
-    /// listener can find what it is about.
+    /// Queues text that exists nowhere on screen (a model summary, a step
+    /// line, a turn wrap-up, or a message's opening sentences), alongside the
+    /// blocks to wash so the listener can find what it is about.
     pub fn push_summary(
         &mut self,
         spoken: Entity<Markdown>,
@@ -191,6 +224,8 @@ impl NarrationQueue {
         cx: &mut App,
     ) {
         self.last_tool_label = None;
+        self.last_tool_kind = None;
+        self.remember(&spoken.read(cx).source().clone());
         self.pending.push(Narration {
             spoken,
             wash: message,
@@ -217,6 +252,34 @@ impl NarrationQueue {
     pub fn clear(&mut self) {
         self.pending.clear();
         self.last_tool_label = None;
+        self.last_tool_kind = None;
+    }
+
+    /// The lines narration has recently committed to saying, oldest first.
+    pub fn recent_lines(&self) -> Vec<String> {
+        self.recent.iter().cloned().collect()
+    }
+
+    /// Drops the narrator's memory of what it has said. Called when the
+    /// story restarts — a new turn, a different thread, a mode switch —
+    /// because "do not repeat this" is only useful about the same story.
+    ///
+    /// Deliberately separate from [`Self::clear`]: dropping stale queued
+    /// status at the end of a turn must not also make the wrap-up forget
+    /// what it is not supposed to repeat.
+    pub fn forget_recent(&mut self) {
+        self.recent.clear();
+    }
+
+    fn remember(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        while self.recent.len() >= RECENT_LINES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(line.to_string());
     }
 
     #[cfg(test)]
@@ -307,36 +370,281 @@ impl NarrationQueue {
 }
 
 /// The phrase to speak in place of a label that does not read aloud well on
-/// its own. `None` — the common case — means the label speaks for itself
-/// and is spoken, and highlighted, in place.
+/// its own. `None` means the label speaks for itself and is spoken, and
+/// highlighted, in place.
 ///
-/// Two labels need this. A terminal call's label is the raw command, and
-/// `acp_thread` hands it over as plain text (links only), which the
-/// segmenter has nothing to say about at all. An edit or write call's label
-/// is nothing but a file path, with no verb, and reads out one path
-/// component at a time.
+/// Four kinds need a phrase of their own:
 ///
-/// Both go into the phrase as a code span, so the substitute rules that
-/// already turn `player.rs` into "player" and `cargo test -p read_aloud`
-/// into "cargo test p read" in prose do the same work here — no new
-/// speech logic, and the terse form is the point.
-fn generated_phrase(label: &str, kind: NarrationKind) -> Option<String> {
+/// * **Read** — the label is `Read file \`path\` (lines 3-9)`. Read out it
+///   is "read file player (lines 3-9)": the verb is past tense, the line
+///   range is noise, and after a burst it chants.
+/// * **Edit** — the label is nothing but a markdown-escaped file path, with
+///   no verb at all, and reads out one path component at a time.
+/// * **Execute** — the label is the raw command, and `acp_thread` hands it
+///   over as plain text (links only), which the segmenter produces *no*
+///   utterances from. Reciting a whole command line reads badly besides
+///   ("cd slash users slash…"), so only the program and its most meaningful
+///   argument are spoken.
+/// * **Fetch** — the label is `Fetch <url>` with the URL markdown-escaped,
+///   and the escapes defeat the URL substitute ("Fetch example_b").
+///
+/// Search, Move, Delete and the rest already read as verb-led prose
+/// ("Rename thread view to conversation view") and are left in place, where
+/// they keep their sentence and word highlighting.
+///
+/// Everything a phrase names goes in as a code span, so the substitute rules
+/// that already turn `player.rs` into "player" and a URL into its host do
+/// the work — no new speech logic, and the terse form is the point.
+///
+/// `continuing` means the previous narration was a tool call of this same
+/// kind. The verb is elided then ("Reading player. Then segmenter."), which
+/// is what keeps a run of reads from chanting.
+fn generated_phrase(label: &str, kind: NarrationKind, continuing: bool) -> Option<String> {
     let label = label.trim();
-    // A backtick would close the code span early and speak the remainder
-    // as prose; the label is better off spoken as it stands.
-    if label.is_empty() || label.contains('`') {
+    if label.is_empty() {
         return None;
     }
-    if kind == NarrationKind::Execute {
-        return Some(format!("{} `{label}`.", kind.verb()));
+    let lead = |target: &str| {
+        if continuing {
+            format!("Then `{target}`.")
+        } else {
+            format!("{} `{target}`.", kind.verb())
+        }
+    };
+    match kind {
+        NarrationKind::Execute => Some(match spoken_command(label) {
+            Some(command) => lead(&command),
+            // Silence is the one thing this must never be: an Execute label
+            // reaches the segmenter as plain text and says nothing at all.
+            None => "Running a command.".to_string(),
+        }),
+        NarrationKind::Read | NarrationKind::Edit => Some(match label_path(label) {
+            Some(path) => lead(&path),
+            // Only reachable from a placeholder label ("Read file"), which
+            // reads as the bare past-tense fragment the listener complained
+            // about. Saying less is better than saying that.
+            None => format!("{} a file.", kind.verb()),
+        }),
+        NarrationKind::Fetch => label_url(label).map(|url| lead(&url)),
+        _ => None,
     }
-    if label.contains(char::is_whitespace) || !label.contains(['/', '\\', '.']) {
-        return None;
+}
+
+/// The path a Read or Edit label is about. Read labels carry it in a code
+/// span (`Read file \`crates/read_aloud/src/player.rs\``); Edit labels *are*
+/// the path, markdown-escaped. `None` when the label carries no path — a
+/// placeholder that arrived before the tool's input finished streaming.
+fn label_path(label: &str) -> Option<String> {
+    if let Some(span) = code_span(label) {
+        let span = span.trim();
+        if !span.is_empty() && !span.contains(char::is_whitespace) {
+            return Some(span.to_string());
+        }
     }
-    // Edit titles reach us markdown-escaped, and a backslash inside the
-    // code span would be spoken rather than ignored.
-    let path = unescape_markdown_punctuation(label);
-    Some(format!("{} `{path}`.", kind.verb()))
+    // No code span: either the label *is* the path (an edit title), or an
+    // agent wrote it inline. Take the last path-like token either way,
+    // rather than only accepting a label that is nothing else — a label
+    // with a stray word in it should still name the file.
+    unescape_markdown_punctuation(label)
+        .split_whitespace()
+        .rev()
+        .find(|token| is_path_like(token))
+        .map(|token| {
+            token
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .to_string()
+        })
+        .filter(|token| !token.is_empty() && !token.contains('`'))
+}
+
+/// Whether a token names a file: it has a directory separator, or an
+/// extension short enough to be one.
+fn is_path_like(token: &str) -> bool {
+    if token.contains(['/', '\\']) {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, extension)) => {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 5
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// The URL a Fetch label is about, with the markdown escaping undone so the
+/// URL substitute recognizes it.
+fn label_url(label: &str) -> Option<String> {
+    let unescaped = unescape_markdown_punctuation(label);
+    let url = unescaped
+        .split_whitespace()
+        .find(|token| token.contains("://"))?;
+    (!url.contains('`')).then(|| url.to_string())
+}
+
+/// One tool call as a *prompt* should see it, which is not how it should be
+/// spoken: the model gets more out of the real path or the real command than
+/// out of the terse form the listener hears, and the prompts forbid it from
+/// reading either out. Only the kinds whose label does not name its own
+/// action get a verb added.
+pub(crate) fn tool_call_description(label: &str, kind: NarrationKind) -> String {
+    let label = label.trim();
+    match kind {
+        NarrationKind::Execute => format!("ran the command `{label}`"),
+        NarrationKind::Edit => format!("edited {}", unescape_markdown_punctuation(label)),
+        _ => label.to_string(),
+    }
+}
+
+/// The content of a label's first inline code span.
+fn code_span(label: &str) -> Option<&str> {
+    let (_, after) = label.split_once('`')?;
+    let (span, _) = after.split_once('`')?;
+    (!span.trim().is_empty()).then(|| span.trim())
+}
+
+/// How many tokens of a command are worth saying. "cargo test", "npm run
+/// build" — enough to name the job, short enough that a pipeline is not
+/// recited.
+const MAX_COMMAND_TOKENS: usize = 3;
+
+/// The sayable part of a shell command: the program and its most meaningful
+/// arguments, stopping at the first flag, quoted argument, or shell
+/// operator. `cd … && cargo test -p read_aloud` becomes "cargo test";
+/// `ps aux | grep zed` becomes "ps aux"; `grep -rn "x" crates/` becomes
+/// "grep".
+///
+/// `None` when nothing sayable survives, which the caller turns into
+/// "Running a command." rather than silence.
+fn spoken_command(command: &str) -> Option<String> {
+    let mut words = tokenize_command(strip_directory_change(command.trim()));
+    // Environment assignments in front of the program name are setup, not
+    // the job: `RUST_LOG=debug cargo test` is "cargo test".
+    while words
+        .first()
+        .is_some_and(|first| is_environment_assignment(first))
+    {
+        words.remove(0);
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    for word in words {
+        if tokens.len() >= MAX_COMMAND_TOKENS || !is_sayable_command_token(&word) {
+            break;
+        }
+        match spoken_command_token(&word) {
+            Some(token) => tokens.push(token),
+            // A token that reduces to nothing (a bare `.`, a glob) is not
+            // worth saying, but the program in front of it still is.
+            None => break,
+        }
+    }
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// Drops any number of `cd <somewhere> &&` (or `;`) prefixes, which are
+/// scaffolding an agent adds and nobody wants read out.
+fn strip_directory_change(command: &str) -> &str {
+    let mut rest = command.trim();
+    loop {
+        let Some(after_cd) = rest
+            .strip_prefix("cd ")
+            .or_else(|| rest.strip_prefix("pushd "))
+        else {
+            return rest;
+        };
+        let Some(separator) = after_cd.find("&&").or_else(|| after_cd.find(';')) else {
+            return rest;
+        };
+        let skip = if after_cd[separator..].starts_with("&&") {
+            2
+        } else {
+            1
+        };
+        let Some(next) = after_cd.get(separator + skip..) else {
+            return rest;
+        };
+        rest = next.trim();
+    }
+}
+
+/// Splits a command on whitespace, keeping a quoted argument together as one
+/// token (still quoted, so the caller can tell it apart from a bare word).
+fn tokenize_command(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for character in command.chars() {
+        match quote {
+            Some(open) => {
+                current.push(character);
+                if character == open {
+                    quote = None;
+                }
+            }
+            None if character == '"' || character == '\'' => {
+                quote = Some(character);
+                current.push(character);
+            }
+            None if character.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_environment_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }
+        None => false,
+    }
+}
+
+/// Whether a token is still part of naming the job. A flag, a quoted
+/// argument, a shell operator, a redirection, a glob, or a variable all mean
+/// the interesting part is over.
+fn is_sayable_command_token(token: &str) -> bool {
+    if token.starts_with('-') || token.starts_with('"') || token.starts_with('\'') {
+        return false;
+    }
+    !token.contains([
+        '|', '&', ';', '>', '<', '*', '$', '(', ')', '{', '}', '[', ']', '`', '\\',
+    ])
+}
+
+/// One command token as a person would say it: a path reduced to its final
+/// component, an extension dropped. `None` when nothing is left.
+fn spoken_command_token(token: &str) -> Option<String> {
+    let token = token.trim_start_matches("./");
+    let component = token.rsplit('/').find(|piece| !piece.is_empty())?;
+    let component = match component.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 4
+                && extension.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            stem
+        }
+        _ => component,
+    };
+    let sayable = component
+        .chars()
+        .any(|character| character.is_alphanumeric());
+    sayable.then(|| component.to_string())
 }
 
 /// Drops the backslashes markdown escaping added, leaving the path as the
@@ -393,6 +701,115 @@ pub fn summary_prompt(message: &str) -> String {
     )
 }
 
+/// The already-said block every narration prompt carries, or an empty string
+/// when there is nothing to avoid repeating. This is the single biggest
+/// lever on whether a run of lines sounds like one person talking rather
+/// than a log being read out.
+fn already_said(recent: &[String]) -> String {
+    if recent.is_empty() {
+        return String::new();
+    }
+    let lines = recent
+        .iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("You have already said this out loud, and must not repeat it:\n{lines}\n\n")
+}
+
+/// The prompt for one step — the prose the agent wrote plus the tool calls it
+/// then made — condensed into the single line a colleague would say while
+/// doing it.
+///
+/// The shape is deliberate: action first, reason second ("Checking the sync
+/// design spec to see how the pipeline stages line up"), because ambient
+/// status is only useful if the first two words already say what is
+/// happening.
+pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> String {
+    let prose = truncate_chars(prose.trim(), MAX_SUMMARY_INPUT_CHARS);
+    let wrote = if prose.is_empty() {
+        String::new()
+    } else {
+        format!("What it wrote:\n---\n{prose}\n---\n\n")
+    };
+    let did = if tool_lines.is_empty() {
+        String::new()
+    } else {
+        format!("What it then did:\n{}\n\n", bulleted(tool_lines))
+    };
+    format!(
+        "You are narrating a coding agent's work out loud, the way a colleague sitting \
+         next to someone would talk them through what they are doing.\n\n\
+         Say what the agent is doing right now and why.\n\n\
+         Rules:\n\
+         - One sentence, under twenty words, present tense.\n\
+         - Start with the action, then the reason: \"Checking the sync design spec to see \
+         how the pipeline stages line up.\"\n\
+         - Spoken English only. No markdown, no code, no backticks, no command lines, no \
+         file paths — name a file the way you would say it aloud (\"the sync design spec\", \
+         not \"docs/sync_design.md\").\n\
+         - No preamble, no sign-off, no quotes around the reply.\n\n\
+         {already}{wrote}{did}\
+         Reply with the one sentence and nothing else.",
+        already = already_said(recent),
+    )
+}
+
+/// The prompt for the turn wrap-up: what was done, what was found, and what
+/// the listener has to act on.
+///
+/// `message` is the closing message *so far* — this is issued speculatively,
+/// before the turn-end event, so that the audio is ready the instant the turn
+/// ends rather than a round trip after it. The prompt says so, because a
+/// model told it is seeing a partial message writes a wrap-up that still
+/// stands up when the last sentence never arrives.
+pub fn wrap_up_prompt(
+    message: &str,
+    activity: &[String],
+    recent: &[String],
+    still_streaming: bool,
+) -> String {
+    let message = truncate_chars(message.trim(), MAX_SUMMARY_INPUT_CHARS);
+    let closing = if message.is_empty() {
+        String::new()
+    } else {
+        let caveat = if still_streaming {
+            " (it may still be being written; work with what is here)"
+        } else {
+            ""
+        };
+        format!("Its closing message{caveat}:\n---\n{message}\n---\n\n")
+    };
+    let did = if activity.is_empty() {
+        String::new()
+    } else {
+        format!("What it did this turn:\n{}\n\n", bulleted(activity))
+    };
+    format!(
+        "You are narrating a coding agent's work out loud to someone who is not looking at \
+         the screen. The turn is finishing, so give them the wrap-up.\n\n\
+         Say what was done, what was found or decided, and anything they have to act on.\n\n\
+         Rules:\n\
+         - Two or three short sentences. Two is usually enough.\n\
+         - Spoken English only. No markdown, no code, no backticks, no command lines, no \
+         lists, no file paths spelled out.\n\
+         - Build on what you have already said rather than repeating it — \"that's done, \
+         and the tests pass\", not the whole story again.\n\
+         - No preamble, no sign-off, no quotes around the reply.\n\n\
+         {already}{did}{closing}\
+         Reply with the wrap-up and nothing else.",
+        already = already_said(recent),
+    )
+}
+
+fn bulleted(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Makes a model reply speakable, or rejects it. Line structure and
 /// wrapping punctuation are stripped so the text segments as the one or two
 /// sentences it claims to be; an empty or over-long reply is no summary at
@@ -417,6 +834,24 @@ pub fn clean_summary(reply: &str) -> Option<String> {
         log::warn!(
             "read_aloud: the summary model replied with {} characters, past the {MAX_SUMMARY_CHARS} \
              a summary may be; speaking the message's opening instead",
+            cleaned.chars().count()
+        );
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// Makes a step line speakable, or rejects it. Same cleaning as
+/// [`clean_summary`] against a much tighter bound: a step line is one
+/// sentence of ambient status, and a model that answers with a paragraph has
+/// reintroduced the verbosity narration exists to escape — the templated
+/// fallback says less and says it now.
+pub fn clean_step_line(reply: &str) -> Option<String> {
+    let cleaned = clean_summary(reply)?;
+    if cleaned.chars().count() > MAX_STEP_LINE_CHARS {
+        log::warn!(
+            "read_aloud: the summary model answered a step with {} characters, past the \
+             {MAX_STEP_LINE_CHARS} a status line may be; speaking the templated form instead",
             cleaned.chars().count()
         );
         return None;
@@ -596,8 +1031,9 @@ mod tests {
             newest
                 .spoken
                 .read_with(cx, |markdown, _| markdown.source().to_string()),
-            "Read file_4.rs",
-            "what the agent is doing right now is worth naming"
+            "Then `file_4.rs`.",
+            "what the agent is doing right now is worth naming, and a run of \
+             the same kind elides the verb rather than chanting it"
         );
     }
 
@@ -798,5 +1234,148 @@ mod tests {
     fn an_empty_or_enormous_reply_is_no_summary() {
         assert_eq!(clean_summary("   \n  "), None);
         assert_eq!(clean_summary(&"word ".repeat(MAX_SUMMARY_CHARS)), None);
+    }
+
+    #[test]
+    fn a_step_line_that_is_really_a_paragraph_is_rejected() {
+        assert_eq!(
+            clean_step_line("Checking the sync design spec.").as_deref(),
+            Some("Checking the sync design spec.")
+        );
+        // Between the step bound and the summary bound, so this exercises
+        // the step's own cap rather than the one it inherits.
+        let paragraph = "word ".repeat(MAX_STEP_LINE_CHARS / 4);
+        assert!(paragraph.chars().count() > MAX_STEP_LINE_CHARS);
+        assert!(paragraph.chars().count() < MAX_SUMMARY_CHARS);
+        assert!(clean_summary(&paragraph).is_some());
+        assert_eq!(clean_step_line(&paragraph), None);
+    }
+
+    #[test]
+    fn the_step_prompt_asks_for_the_action_and_the_reason() {
+        let prompt = step_prompt(
+            "Now I need to see how the pipeline stages line up.",
+            &["Read file `docs/sync-design.md`".to_string()],
+            &["Reading the migration notes.".to_string()],
+        );
+        assert!(prompt.contains("Now I need to see how the pipeline stages line up."));
+        assert!(prompt.contains("docs/sync-design.md"));
+        assert!(prompt.contains("Reading the migration notes."));
+        assert!(prompt.contains("already said"));
+        assert!(prompt.contains("One sentence"));
+        assert!(prompt.contains("then the reason"));
+    }
+
+    #[test]
+    fn the_wrap_up_prompt_says_when_the_message_is_unfinished() {
+        let streaming = wrap_up_prompt("The tests all pass now", &[], &[], true);
+        assert!(streaming.contains("still be being written"));
+        let finished = wrap_up_prompt("The tests all pass now.", &[], &[], false);
+        assert!(!finished.contains("still be being written"));
+    }
+
+    #[test]
+    fn the_wrap_up_prompt_carries_the_turn_and_forbids_repeating_it() {
+        let prompt = wrap_up_prompt(
+            "Everything is wired up.",
+            &["ran the command `cargo test -p read_aloud`".to_string()],
+            &["Running cargo test.".to_string()],
+            false,
+        );
+        assert!(prompt.contains("cargo test -p read_aloud"));
+        assert!(prompt.contains("Running cargo test."));
+        assert!(prompt.contains("must not repeat"));
+        assert!(prompt.contains("Build on what you have already said"));
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_said_yet_carries_no_empty_section() {
+        let prompt = step_prompt("Some prose.", &[], &[]);
+        assert!(!prompt.contains("already said"));
+        assert!(!prompt.contains("What it then did"));
+    }
+
+    /// A run of the same kind elides its verb rather than chanting it. The
+    /// listener hears "Reading player. Then segmenter.", which is how a
+    /// person would say it.
+    #[gpui::test]
+    async fn a_run_of_the_same_kind_elides_the_verb(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let first = markdown("Read file `crates/read_aloud/src/player.rs`", cx);
+        let second = markdown("Read file `crates/read_aloud/src/segmenter.rs`", cx);
+        let command = markdown("cargo test", cx);
+        let third = markdown("Read file `crates/read_aloud/src/sink.rs`", cx);
+        cx.run_until_parked();
+
+        // Popped as they go, the way the player drains them: four queued at
+        // once would collapse into a count instead.
+        let mut spoken = Vec::new();
+        for (label, kind) in [
+            (first, NarrationKind::Read),
+            (second, NarrationKind::Read),
+            (command, NarrationKind::Execute),
+            (third, NarrationKind::Read),
+        ] {
+            cx.update(|cx| queue.push_tool_call(label, kind, cx));
+            let narration = queue.pop().expect("the call was queued");
+            spoken.push(
+                narration
+                    .spoken
+                    .read_with(cx, |markdown, _| markdown.source().to_string()),
+            );
+        }
+        assert_eq!(
+            spoken,
+            vec![
+                "Reading `crates/read_aloud/src/player.rs`.".to_string(),
+                "Then `crates/read_aloud/src/segmenter.rs`.".to_string(),
+                "Running `cargo test`.".to_string(),
+                "Reading `crates/read_aloud/src/sink.rs`.".to_string(),
+            ],
+            "the verb comes back once something else has been said in between"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_narrator_remembers_what_it_committed_to_saying(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let label = markdown("Read file `crates/read_aloud/src/player.rs`", cx);
+        let summary = markdown("It moved the poll loop onto a timer.", cx);
+        let message = markdown("Long message body.", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            queue.push_tool_call(label, NarrationKind::Read, cx);
+            queue.push_summary(summary, vec![message], cx);
+        });
+        assert_eq!(
+            queue.recent_lines(),
+            vec![
+                "Reading `crates/read_aloud/src/player.rs`.".to_string(),
+                "It moved the poll loop onto a timer.".to_string(),
+            ]
+        );
+
+        // Dropping stale status at the end of a turn must not also make the
+        // wrap-up forget what it is not supposed to repeat.
+        queue.clear();
+        assert_eq!(queue.recent_lines().len(), 2);
+        queue.forget_recent();
+        assert!(queue.recent_lines().is_empty());
+    }
+
+    #[gpui::test]
+    async fn the_narrators_memory_is_bounded(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let labels: Vec<_> = (0..RECENT_LINES + 4)
+            .map(|index| markdown(&format!("Read file `crates/a/file_{index}.rs`"), cx))
+            .collect();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            for label in labels {
+                queue.push_tool_call(label, NarrationKind::Read, cx);
+            }
+        });
+        assert_eq!(queue.recent_lines().len(), RECENT_LINES);
     }
 }
