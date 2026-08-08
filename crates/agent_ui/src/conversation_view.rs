@@ -8278,6 +8278,81 @@ pub(crate) mod tests {
         );
     }
 
+    /// The settle timer, on its own.
+    ///
+    /// Every other tool-call test is shadowed by one of the two
+    /// short-circuits — a terminal status, or the turn-end sweep — so if the
+    /// timer path regressed, narration would quietly slip to completion time
+    /// and every suite would stay green. Here the turn never ends and the
+    /// call never leaves `InProgress`, so quiescence is the only thing that
+    /// can speak. The thread is driven directly rather than through a prompt
+    /// for exactly that reason: a prompt would end and sweep.
+    #[gpui::test]
+    async fn test_read_aloud_narration_speaks_once_a_label_settles_mid_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        // The call appears with the placeholder its tool produces before the
+        // input parses.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_tool_call(
+                    acp::ToolCall::new("tool1", "Read file")
+                        .kind(acp::ToolKind::Read)
+                        .status(acp::ToolCallStatus::Pending),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        assert!(
+            provider.spoken().is_empty(),
+            "a placeholder is never spoken, got {:?}",
+            provider.spoken()
+        );
+
+        // The real label arrives. The call is running, not finished, so the
+        // terminal short-circuit cannot fire.
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_tool_call(
+                    acp::ToolCallUpdate::new(
+                        acp::ToolCallId::new("tool1"),
+                        acp::ToolCallUpdateFields::new()
+                            .title("Read file `crates/read_aloud/src/segmenter.rs`")
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        assert!(
+            provider.spoken().is_empty(),
+            "and a label that has only just moved has not settled yet, got {:?}",
+            provider.spoken()
+        );
+
+        // Nothing has ended and nothing is terminal: only the timer is left.
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec!["Reading segmenter.".to_string()],
+            "quiescence alone must be able to narrate, or the feature \
+             silently degrades to speaking at completion time"
+        );
+    }
+
     /// The other half of the same rule: a call that arrives complete and
     /// never refines its title must still be narrated. Waiting for an update
     /// that is not coming would be silence.
