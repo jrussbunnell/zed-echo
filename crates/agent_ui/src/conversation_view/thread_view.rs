@@ -1718,6 +1718,23 @@ impl ThreadView {
         });
     }
 
+    /// Called when this view stops being the active thread. A backgrounded
+    /// view keeps its entity, its thread subscription, and its handle on the
+    /// one shared audio player, so without this it keeps talking about a
+    /// conversation the user is no longer looking at — and, in narration
+    /// mode, a summary already being generated lands afterwards and washes a
+    /// message that is off screen entirely.
+    ///
+    /// `stop` rather than a quiet halt: leaving a thread is explicit intent,
+    /// so the stop latch is right, and coming back leaves the controls one
+    /// click from replaying.
+    pub(crate) fn read_aloud_deactivated(&mut self, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.stop(cx));
+    }
+
     #[cfg(test)]
     pub(super) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
         self.read_aloud = Some(read_aloud);

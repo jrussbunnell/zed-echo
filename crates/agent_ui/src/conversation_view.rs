@@ -705,7 +705,22 @@ impl ConversationView {
             return;
         };
 
+        // The view being left behind keeps running — its thread
+        // subscription, its tasks, and its share of the one audio player all
+        // outlive the navigation — so read aloud has to be told the user
+        // moved on, or it narrates a thread that is no longer on screen.
+        // Only when the navigation actually lands: `navigate_to_thread` is a
+        // no-op for an unknown session, and re-selecting the current thread
+        // must not silence it.
+        let previous_id = connected.active_id.clone();
         connected.navigate_to_thread(session_id);
+        let outgoing = previous_id
+            .filter(|previous_id| connected.active_id.as_ref() != Some(previous_id))
+            .and_then(|previous_id| connected.threads.get(&previous_id))
+            .cloned();
+        if let Some(outgoing) = outgoing {
+            outgoing.update(cx, |view, cx| view.read_aloud_deactivated(cx));
+        }
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
         }
@@ -8100,6 +8115,96 @@ pub(crate) mod tests {
         assert!(
             spoken.contains(&"I moved the poll loop onto a timer.".to_string()),
             "and must leave message narration alone, got {spoken:?}"
+        );
+    }
+
+    /// Regression: a backgrounded thread view keeps its subscriptions, its
+    /// tasks, and its share of the one audio player, so it went on narrating
+    /// a conversation the user had left — and in narration mode a summary
+    /// already being generated would land afterwards and wash a message that
+    /// is no longer on screen.
+    #[gpui::test]
+    async fn test_read_aloud_leaving_a_thread_cancels_its_narration(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Read file")),
+            "setup: this thread is narrating, got {:?}",
+            provider.spoken()
+        );
+
+        // Register the same view under a second session id so the navigation
+        // has somewhere to land; what is under test is the outgoing half.
+        let leaving_session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let arriving_session_id = acp::SessionId::new("second-thread");
+        conversation_view.update(cx, |view, _| {
+            if let Some(connected) = view.as_connected_mut() {
+                connected
+                    .threads
+                    .insert(arriving_session_id.clone(), thread_view.clone());
+            }
+        });
+
+        // Re-selecting the thread already showing must not silence it.
+        let reader = thread_view.read_with(cx, |view, _| {
+            view.read_aloud_for_test()
+                .expect("the reader is installed")
+                .clone()
+        });
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(leaving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            reader.read_with(cx, |reader, cx| reader
+                .playback_state(cx)
+                .is_none_or(|state| !state.stopped)),
+            "re-selecting the active thread must leave read aloud alone"
+        );
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(arriving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        let spoken_when_left = provider.spoken();
+
+        // The thread the user walked away from keeps working.
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool2", "Read file `crates/read_aloud/src/segmenter.rs`")
+                .kind(acp::ToolKind::Read)
+                .status(acp::ToolCallStatus::InProgress),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Keep going", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_left,
+            "a thread the user has left must not keep narrating, got {:?}",
+            provider.spoken()
         );
     }
 
