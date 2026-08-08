@@ -1349,6 +1349,11 @@ impl ReadAloud {
         {
             return;
         }
+        // A tool call *existing* is what makes the prose in front of it a
+        // step; naming it is a separate question, and a slower one. The
+        // agent's own words do not have to wait on the label, and waiting
+        // would put the whole settle delay on the time to the first word.
+        self.speak_step_opening(cx);
         self.arm_step_idle_timer(cx);
     }
 
@@ -5555,6 +5560,32 @@ mod tests {
                 .contains(&"Checking the player to see how it is timed.".to_string()),
             "and the fused line still happens, got {:?}",
             provider.spoken()
+        );
+    }
+
+    /// The agent's own words must not wait on the slow question. A tool call
+    /// *existing* is what makes the prose in front of it a step; naming it
+    /// takes a settle window on top, and putting that on the path to the
+    /// first word is most of the latency this design exists to remove.
+    #[gpui::test]
+    async fn the_opening_does_not_wait_for_a_tool_label_to_settle(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let message = markdown_entity(&long_message_source(), cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+            // A call has appeared; its label is still arriving, so there is
+            // nothing sayable about it yet.
+            read_aloud.note_tool_call_pending(cx);
+        });
+        cx.run_until_parked();
+
+        // Not one tick of any timer has passed.
+        assert_eq!(
+            provider.spoken(),
+            vec!["I moved the poll loop onto a timer.".to_string()],
+            "the opening goes out on the call appearing, not on it being named"
         );
     }
 
