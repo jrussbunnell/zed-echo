@@ -7952,6 +7952,209 @@ pub(crate) mod tests {
         );
     }
 
+    /// Long enough to be worth condensing, with a recognizable opening and a
+    /// recognizable tail so a test can tell "narrated" from "read out".
+    fn read_aloud_long_message() -> String {
+        format!(
+            "I moved the poll loop onto a timer. {}It ends on the last sentence.",
+            "It also keeps the stop latch exactly as it was. ".repeat(5)
+        )
+    }
+
+    /// Installs a reader with the thread subscription, in narration mode, on
+    /// a view whose settings have narration on. Returns the fake provider so
+    /// tests can read back what was actually spoken.
+    async fn setup_read_aloud_narration(
+        thread_view: &Entity<ThreadView>,
+        narrate_tool_calls: bool,
+        cx: &mut VisualTestContext,
+    ) -> (read_aloud::FakeTts, read_aloud::FakeSink) {
+        let provider = read_aloud::FakeTts::new();
+        let sink = read_aloud::FakeSink::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| read_aloud::ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        thread_view.update(cx, |view, cx| {
+            view.set_read_aloud_for_test(reader);
+            view.subscribe_read_aloud_for_test(cx);
+        });
+        // Enabling adopts the reader already installed. It has to land on
+        // its own: an enable is handled by (re)activation, which snapshots
+        // the rest of the settings itself, so the mode below reaches the
+        // reader through the ordinary live-settings path instead.
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().enabled = Some(true);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    let read_aloud = content.read_aloud.get_or_insert_default();
+                    read_aloud.mode = Some(read_aloud::ReadAloudMode::Narration);
+                    read_aloud.narrate_tool_calls = Some(narrate_tool_calls);
+                });
+            });
+        });
+        cx.run_until_parked();
+        (provider, sink)
+    }
+
+    /// Drains the fake sink so queued narrations get their turn: the player
+    /// only speaks one utterance at a time, and narration is a FIFO behind
+    /// it.
+    fn drain_read_aloud(sink: &read_aloud::FakeSink, cx: &mut VisualTestContext) {
+        for _ in 0..10 {
+            sink.finish_one();
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+    }
+
+    fn read_aloud_narration_updates(message: &str) -> Vec<acp::SessionUpdate> {
+        vec![
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(message.into())),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool1", "Read file `crates/read_aloud/src/player.rs`")
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::InProgress),
+            ),
+        ]
+    }
+
+    /// Narration mode: the tool call is spoken as it happens, and the message
+    /// it interrupted is condensed rather than read out. No model is
+    /// configured in tests, so this also exercises the opening-sentences
+    /// fallback — the shape the feature has to degrade to.
+    #[gpui::test]
+    async fn test_read_aloud_narration_speaks_tool_calls_and_condenses_prose(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert!(
+            spoken.contains(&"Read file player".to_string()),
+            "the tool call must be narrated as it happens, got {spoken:?}"
+        );
+        assert!(
+            spoken.contains(&"I moved the poll loop onto a timer.".to_string()),
+            "the message must be condensed to its opening, got {spoken:?}"
+        );
+        assert!(
+            !spoken
+                .iter()
+                .any(|text| text.contains("It ends on the last sentence")),
+            "narration must not read the whole message out, got {spoken:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_aloud_narrate_tool_calls_off_leaves_the_summary(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, false, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert!(
+            !spoken.iter().any(|text| text.contains("Read file")),
+            "narrate_tool_calls: false must silence tool calls, got {spoken:?}"
+        );
+        assert!(
+            spoken.contains(&"I moved the poll loop onto a timer.".to_string()),
+            "and must leave message narration alone, got {spoken:?}"
+        );
+    }
+
+    /// The other half of the mode: with the default `full`, the same thread
+    /// reads the prose out and says nothing about the tool call.
+    #[gpui::test]
+    async fn test_read_aloud_full_mode_reads_the_prose_and_ignores_tool_calls(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let provider = read_aloud::FakeTts::new();
+        let sink = read_aloud::FakeSink::new();
+        let reader = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| read_aloud::ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        thread_view.update(cx, |view, cx| {
+            view.set_read_aloud_for_test(reader);
+            view.subscribe_read_aloud_for_test(cx);
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // The player only synthesizes a little ahead of the sink, so the
+        // tail of a seven-sentence message needs the audio to drain.
+        drain_read_aloud(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert!(
+            spoken
+                .iter()
+                .any(|text| text.contains("It ends on the last sentence")),
+            "full mode must still read the whole message, got {spoken:?}"
+        );
+        assert!(
+            !spoken.iter().any(|text| text.contains("Read file")),
+            "and must say nothing about tool calls, got {spoken:?}"
+        );
+    }
+
     #[gpui::test]
     async fn test_thread_search_dismiss_clears_highlights(cx: &mut TestAppContext) {
         init_test(cx);

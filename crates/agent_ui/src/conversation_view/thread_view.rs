@@ -7,6 +7,7 @@ use crate::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -32,13 +33,15 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
+use futures::StreamExt as _;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
 use heapless::Vec as ArrayVec;
 use language_model::{
-    FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
-    LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
+    CompletionIntent, ConfiguredModel, FastModeConfirmation, LanguageModel,
+    LanguageModelEffortLevel, LanguageModelId, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage, Role, Speed,
 };
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
@@ -680,6 +683,79 @@ pub struct ThreadView {
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
 /// another instead of stacking, even across thread views.
 struct ReadAloudDisabled;
+
+/// What a `NewEntry` event brought in, as far as narration cares.
+enum NewEntryKind {
+    UserMessage,
+    ToolCall,
+    Other,
+}
+
+/// Maps the agent protocol's tool kinds onto the families narration counts a
+/// burst by, so the read-aloud crate needs no dependency on the protocol.
+fn narration_kind(kind: &acp::ToolKind) -> read_aloud::NarrationKind {
+    match kind {
+        acp::ToolKind::Read => read_aloud::NarrationKind::Read,
+        acp::ToolKind::Edit => read_aloud::NarrationKind::Edit,
+        acp::ToolKind::Delete => read_aloud::NarrationKind::Delete,
+        acp::ToolKind::Move => read_aloud::NarrationKind::Move,
+        acp::ToolKind::Search => read_aloud::NarrationKind::Search,
+        acp::ToolKind::Execute => read_aloud::NarrationKind::Execute,
+        acp::ToolKind::Fetch => read_aloud::NarrationKind::Fetch,
+        _ => read_aloud::NarrationKind::Other,
+    }
+}
+
+/// Runs narration's message summaries through Zed's model registry. Held by
+/// the reader, which owns the cancellation: dropping its task drops this
+/// request with it.
+struct ReadAloudSummaryModel {
+    model: Arc<dyn LanguageModel>,
+    provider: Arc<dyn LanguageModelProvider>,
+    temperature: Option<f32>,
+}
+
+impl read_aloud::SummaryModel for ReadAloudSummaryModel {
+    fn complete(&self, prompt: String, cx: &mut App) -> Task<anyhow::Result<String>> {
+        let model = self.model.clone();
+        let provider = self.provider.clone();
+        let temperature = self.temperature;
+        cx.spawn(async move |cx| {
+            if let Some(authenticate) =
+                cx.update(|cx| (!provider.is_authenticated(cx)).then(|| provider.authenticate(cx)))
+            {
+                // A failure here is not fatal on its own — the completion
+                // below reports the real problem — but it is worth seeing.
+                authenticate.await.log_err();
+            }
+            let request = LanguageModelRequest {
+                thread_id: None,
+                prompt_id: None,
+                intent: Some(CompletionIntent::ThreadSummarization),
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![prompt.into()],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                tools: Vec::new(),
+                tool_choice: None,
+                stop: Vec::new(),
+                temperature,
+                thinking_allowed: false,
+                thinking_effort: None,
+                speed: None,
+                compact_at_tokens: None,
+            };
+            let mut completion = model.stream_completion_text(request, cx).await?;
+            let mut summary = String::new();
+            while let Some(chunk) = completion.stream.next().await {
+                summary.push_str(&chunk?);
+            }
+            Ok(summary)
+        })
+    }
+}
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1196,6 +1272,7 @@ impl ThreadView {
                 ));
                 let speaking_rate = settings.speaking_rate;
                 let click_to_seek = settings.click_to_seek;
+                let mode = settings.mode;
 
                 let read_aloud = cx.new(|cx| {
                     let mut read_aloud = read_aloud::ReadAloud::new(
@@ -1205,6 +1282,7 @@ impl ThreadView {
                     );
                     read_aloud.set_speed(speaking_rate, cx);
                     read_aloud.set_click_to_seek(click_to_seek, cx);
+                    read_aloud.set_mode(mode, cx);
                     read_aloud
                 });
                 // The mini player renders off this entity's state; it already
@@ -1224,9 +1302,11 @@ impl ThreadView {
     /// model re-target the provider (the next synthesis request speaks with
     /// them), the speaking rate re-times current playback, click-to-seek
     /// re-arms the affordance, and the enabled flag activates or deactivates
-    /// the whole feature. `auto_play` needs no handling here: the enqueue
-    /// path reads it live, so a toggle takes effect on the next turn by
-    /// itself. Pill colors feed the next render directly from the global.
+    /// the whole feature, and the mode switches full ↔ narration. `auto_play`
+    /// and `narrate_tool_calls` need no handling here: the enqueue and
+    /// narration paths read them live, so a toggle takes effect on the next
+    /// turn by itself. `summary_model` is resolved per message, for the same
+    /// reason. Pill colors feed the next render directly from the global.
     fn read_aloud_settings_changed(&mut self, cx: &mut Context<Self>) {
         let settings = read_aloud::ReadAloudSettings::get_global(cx).clone();
         if settings == self.read_aloud_settings {
@@ -1263,6 +1343,11 @@ impl ThreadView {
             if settings.click_to_seek != previous.click_to_seek {
                 read_aloud.update(cx, |read_aloud, cx| {
                     read_aloud.set_click_to_seek(settings.click_to_seek, cx);
+                });
+            }
+            if settings.mode != previous.mode {
+                read_aloud.update(cx, |read_aloud, cx| {
+                    read_aloud.set_mode(settings.mode, cx);
                 });
             }
         }
@@ -1315,7 +1400,39 @@ impl ThreadView {
         self.read_aloud_subscriptions.push(cx.subscribe(
             &self.thread,
             |this, thread, event: &AcpThreadEvent, cx| match event {
-                AcpThreadEvent::NewEntry => this.enqueue_read_aloud(false, cx),
+                AcpThreadEvent::NewEntry => {
+                    let (entry_index, new_entry) = {
+                        let entries = thread.read(cx).entries();
+                        (
+                            entries.len().saturating_sub(1),
+                            match entries.last() {
+                                Some(AgentThreadEntry::UserMessage(_)) => NewEntryKind::UserMessage,
+                                Some(AgentThreadEntry::ToolCall(_)) => NewEntryKind::ToolCall,
+                                _ => NewEntryKind::Other,
+                            },
+                        )
+                    };
+                    match new_entry {
+                        NewEntryKind::UserMessage => {
+                            // A new turn: status the user has not heard yet
+                            // is about the turn they just moved on from.
+                            if let Some(read_aloud) = this.read_aloud.clone() {
+                                read_aloud
+                                    .update(cx, |read_aloud, cx| read_aloud.cancel_narration(cx));
+                            }
+                        }
+                        NewEntryKind::ToolCall => {
+                            // A tool call interrupting a message is the
+                            // signal that the message is done growing.
+                            if let Some(previous) = entry_index.checked_sub(1) {
+                                this.narrate_read_aloud_message(previous, cx);
+                            }
+                            this.narrate_read_aloud_tool_call(entry_index, cx);
+                        }
+                        NewEntryKind::Other => {}
+                    }
+                    this.enqueue_read_aloud(false, cx);
+                }
                 AcpThreadEvent::EntryUpdated(entry_ix) => {
                     // Tool calls and terminals fire this continuously while
                     // they stream; re-segmenting the whole message for each
@@ -1341,6 +1458,15 @@ impl ThreadView {
                         read_aloud.update(cx, |read_aloud, cx| {
                             read_aloud.mark_tracked_message_complete(cx);
                         });
+                    }
+                    // The turn's last assistant message can no longer grow,
+                    // so narration mode may now summarize it. Earlier
+                    // messages of the turn were summarized when the tool
+                    // call that ended them arrived.
+                    if let Some((entry_index, _)) =
+                        Self::latest_assistant_markdown_in(&this.thread, cx)
+                    {
+                        this.narrate_read_aloud_message(entry_index, cx);
                     }
                 }
                 AcpThreadEvent::EntriesRemoved(range) => {
@@ -1410,7 +1536,14 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        if !read_aloud::ReadAloudSettings::get_global(cx).auto_play {
+        let settings = read_aloud::ReadAloudSettings::get_global(cx);
+        if !settings.auto_play {
+            return;
+        }
+        if settings.mode == read_aloud::ReadAloudMode::Narration {
+            // Narration mode speaks status, not prose. Explicitly asking for
+            // a message — the speaker buttons, a sentence click, the Toggle
+            // action — still reads it in full.
             return;
         }
         let Some((entry_index, markdown)) = Self::latest_assistant_markdown_in(&self.thread, cx)
@@ -1428,6 +1561,103 @@ impl ThreadView {
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, message_complete, cx);
         });
+    }
+
+    /// Speaks one tool call's label as ambient status, the first time the
+    /// call appears. Later status changes and label edits are deliberately
+    /// not narrated: a second line about a call the agent has already moved
+    /// past costs the listener more than it tells them.
+    fn narrate_read_aloud_tool_call(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        let settings = read_aloud::ReadAloudSettings::get_global(cx);
+        if settings.mode != read_aloud::ReadAloudMode::Narration || !settings.narrate_tool_calls {
+            return;
+        }
+        if entry_index < self.read_aloud_watermark {
+            return;
+        }
+        let Some(AgentThreadEntry::ToolCall(tool_call)) =
+            self.thread.read(cx).entries().get(entry_index)
+        else {
+            return;
+        };
+        // A call the user refused, or that the turn's cancellation took
+        // down, never happened; saying so is noise.
+        if matches!(
+            tool_call.status,
+            ToolCallStatus::Rejected | ToolCallStatus::Canceled
+        ) {
+            return;
+        }
+        let label = tool_call.label.clone();
+        let kind = narration_kind(&tool_call.kind);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_tool_call(&label, kind, cx);
+        });
+    }
+
+    /// Hands one finished assistant message to narration. Only ever called
+    /// for a message that can no longer grow — a tool call has interrupted
+    /// it, or the turn has stopped.
+    fn narrate_read_aloud_message(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        if read_aloud::ReadAloudSettings::get_global(cx).mode
+            != read_aloud::ReadAloudMode::Narration
+        {
+            return;
+        }
+        if entry_index < self.read_aloud_watermark {
+            // Restored history is never narrated, for the same reason it is
+            // never auto-played.
+            return;
+        }
+        let blocks =
+            Self::assistant_message_markdowns(self.thread.read(cx).entries(), entry_index, cx);
+        if blocks.is_empty() {
+            return;
+        }
+        // Resolved per message rather than cached: models finish loading
+        // after the panel opens, and an install that had none at startup
+        // would otherwise be stuck on the fallback for the whole session.
+        let summary_model = self.read_aloud_summary_model(cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_summary_model(summary_model);
+            read_aloud.narrate_message(blocks, cx);
+        });
+    }
+
+    /// Resolves the model narration condenses messages with:
+    /// `read_aloud.summary_model` when it names one that is actually
+    /// available, else the inline assistant's model — the panel's existing
+    /// "small, fast, already configured" choice. `None` leaves narration on
+    /// its no-model fallback.
+    fn read_aloud_summary_model(&self, cx: &App) -> Option<Rc<dyn read_aloud::SummaryModel>> {
+        let registry = LanguageModelRegistry::try_read_global(cx)?;
+        let configured = read_aloud::ReadAloudSettings::get_global(cx)
+            .summary_model
+            .as_ref()
+            .and_then(|selection| {
+                let provider = registry
+                    .provider(&LanguageModelProviderId::from(selection.provider.0.clone()))?;
+                let model_id = LanguageModelId::from(selection.model.clone());
+                let model = provider
+                    .provided_models(cx)
+                    .iter()
+                    .find(|model| model.id() == model_id)?
+                    .clone();
+                Some(ConfiguredModel { provider, model })
+            })
+            .or_else(|| registry.inline_assistant_model())?;
+        let temperature = AgentSettings::temperature_for_model(&configured.model, cx);
+        Some(Rc::new(ReadAloudSummaryModel {
+            model: configured.model,
+            provider: configured.provider,
+            temperature,
+        }))
     }
 
     /// Starts, stops, or restarts reading aloud.
@@ -1522,7 +1752,33 @@ impl ThreadView {
     /// behavior stays identical to the keyboard.
     fn render_read_aloud_mini_player(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let read_aloud = self.read_aloud.as_ref()?;
-        let state = read_aloud.read(cx).playback_state(cx)?;
+        let mode_toggle = self.render_read_aloud_mode_toggle(cx);
+        let Some(state) = read_aloud.read(cx).playback_state(cx) else {
+            // Nothing to control, but the mode toggle still has to be here:
+            // full versus narration is a choice about how the *next* turn
+            // will sound, so it must be reachable before one starts. A quiet
+            // pill holds it and a speaker that reads the newest message.
+            return Some(Self::float_above_composer(
+                h_flex()
+                    .gap_0p5()
+                    .p_0p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().elevated_surface_background)
+                    .opacity(0.6)
+                    .hover(|style| style.opacity(1.0))
+                    .child(
+                        IconButton::new("read-aloud-start", IconName::AudioOn)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Read Aloud"))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_read_aloud(cx))),
+                    )
+                    .children(mode_toggle)
+                    .into_any_element(),
+            ));
+        };
 
         let sentence_preview = div().max_w(rems(16.)).child(
             Label::new(state.sentence_text.clone())
@@ -1557,6 +1813,7 @@ impl ThreadView {
             )
             .child(sentence_preview)
             .child(voice_menu)
+            .children(mode_toggle)
             .child(
                 IconButton::new("read-aloud-dismiss", IconName::Close)
                     .icon_size(IconSize::Small)
@@ -1614,6 +1871,7 @@ impl ThreadView {
                     .color(Color::Muted),
             )
             .child(voice_menu)
+            .children(mode_toggle)
             .child(
                 IconButton::new("read-aloud-stop", IconName::Close)
                     .icon_size(IconSize::Small)
@@ -1623,22 +1881,60 @@ impl ThreadView {
             )
         };
 
+        Some(Self::float_above_composer(pill.into_any_element()))
+    }
+
+    /// A zero-height anchor: read-aloud controls float above the composer
+    /// without shifting the layout when they appear.
+    fn float_above_composer(controls: AnyElement) -> AnyElement {
+        div()
+            .relative()
+            .w_full()
+            .h_0()
+            .child(
+                h_flex()
+                    .absolute()
+                    .bottom_2()
+                    .left_0()
+                    .right_0()
+                    .justify_center()
+                    .child(controls),
+            )
+            .into_any_element()
+    }
+
+    /// The full ↔ narration switch. Shows the mode that is on, and writes
+    /// the other one to `read_aloud.mode` through the standard targeted
+    /// settings edit; the settings observation then applies it live.
+    fn render_read_aloud_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let project = self.project.upgrade()?;
+        let fs = project.read(cx).fs().clone();
+        let narrating = read_aloud::ReadAloudSettings::get_global(cx).mode
+            == read_aloud::ReadAloudMode::Narration;
+        let (icon, tooltip) = if narrating {
+            (IconName::ListCollapse, "Narrate Progress")
+        } else {
+            (IconName::FileTextOutlined, "Read Full Response")
+        };
         Some(
-            // A zero-height anchor: the pill floats above the composer
-            // without shifting the layout when it appears.
-            div()
-                .relative()
-                .w_full()
-                .h_0()
-                .child(
-                    h_flex()
-                        .absolute()
-                        .bottom_2()
-                        .left_0()
-                        .right_0()
-                        .justify_center()
-                        .child(pill),
-                )
+            IconButton::new("read-aloud-mode", icon)
+                .icon_size(IconSize::Small)
+                .icon_color(if narrating {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                })
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, _, cx| {
+                    let mode = if narrating {
+                        read_aloud::ReadAloudMode::Full
+                    } else {
+                        read_aloud::ReadAloudMode::Narration
+                    };
+                    update_settings_file(fs.clone(), cx, move |content, _| {
+                        content.read_aloud.get_or_insert_default().mode = Some(mode);
+                    });
+                })
                 .into_any_element(),
         )
     }
@@ -1688,30 +1984,34 @@ impl ThreadView {
                     .flatten();
                 let fs = fs.clone();
                 let current_voice_id = current_voice_id.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                    let Some(voices) = voices else {
-                        return menu.header("Loading voices…");
-                    };
-                    for voice in voices {
-                        let checked = voice.id.as_ref() == current_voice_id;
-                        let voice_id = voice.id.to_string();
-                        let fs = fs.clone();
-                        menu = menu.toggleable_entry(
-                            voice.name.clone(),
-                            checked,
-                            IconPosition::Start,
-                            None,
-                            move |_window, cx| {
-                                let voice_id = voice_id.clone();
-                                update_settings_file(fs.clone(), cx, move |content, _| {
-                                    content.read_aloud.get_or_insert_default().voice_id =
-                                        Some(voice_id);
-                                });
-                            },
-                        );
-                    }
-                    menu
-                }))
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, _cx| {
+                        let Some(voices) = voices else {
+                            return menu.header("Loading voices…");
+                        };
+                        for voice in voices {
+                            let checked = voice.id.as_ref() == current_voice_id;
+                            let voice_id = voice.id.to_string();
+                            let fs = fs.clone();
+                            menu = menu.toggleable_entry(
+                                voice.name.clone(),
+                                checked,
+                                IconPosition::Start,
+                                None,
+                                move |_window, cx| {
+                                    let voice_id = voice_id.clone();
+                                    update_settings_file(fs.clone(), cx, move |content, _| {
+                                        content.read_aloud.get_or_insert_default().voice_id =
+                                            Some(voice_id);
+                                    });
+                                },
+                            );
+                        }
+                        menu
+                    },
+                ))
             })
             .into_any_element()
     }
@@ -10880,22 +11180,19 @@ impl ThreadView {
                             this.text_color(cx.theme().colors().text_muted)
                         }
                     })
-                    .child(
-                        self.render_markdown(
-                            tool_call.label.clone(),
-                            {
-                                let mut style =
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
-                                        .with_muted_text(cx);
-                                style.prevent_mouse_interaction = true;
-                                self.agent_panel_styling
-                                    .tool_output
-                                    .apply_text_to_markdown_style(&mut style);
-                                style
-                            },
-                            cx,
-                        ),
-                    )
+                    .child(self.render_markdown(
+                        tool_call.label.clone(),
+                        {
+                            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                                .with_muted_text(cx);
+                            style.prevent_mouse_interaction = true;
+                            self.agent_panel_styling
+                                .tool_output
+                                .apply_text_to_markdown_style(&mut style);
+                            style
+                        },
+                        cx,
+                    ))
                     .tooltip(Tooltip::text("Go to File"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_tool_call_location(entry_ix, 0, window, cx);
