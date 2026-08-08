@@ -678,6 +678,22 @@ pub struct ThreadView {
     /// menu opens and cached for this view's lifetime.
     read_aloud_voices: Option<Vec<read_aloud::TtsVoice>>,
     read_aloud_voices_task: Option<Task<()>>,
+    /// What narration knows about each tool call of the current turn. A tool
+    /// call's real label — the path, the command — arrives *after* the entry
+    /// does, so narration has to wait for it; this is what tells "not said
+    /// yet" from "already said" without re-narrating a call whose label is
+    /// later refined again. Cleared at the start of every turn.
+    read_aloud_tool_calls: HashMap<acp::ToolCallId, ToolCallNarration>,
+}
+
+/// One tool call's narration state. See
+/// [`ThreadView::note_read_aloud_tool_call`] for why both fields are needed.
+struct ToolCallNarration {
+    /// The label the entry carried when it first appeared, which for a
+    /// streaming tool call is a generic placeholder ("Read file",
+    /// "Terminal"). A label that differs from this one is the real thing.
+    first_label: SharedString,
+    narrated: bool,
 }
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
@@ -1169,6 +1185,7 @@ impl ThreadView {
             read_aloud_provider: None,
             read_aloud_voices: None,
             read_aloud_voices_task: None,
+            read_aloud_tool_calls: HashMap::default(),
         };
 
         this.init_read_aloud(cx);
@@ -1273,6 +1290,7 @@ impl ThreadView {
                 let speaking_rate = settings.speaking_rate;
                 let click_to_seek = settings.click_to_seek;
                 let mode = settings.mode;
+                let narration_detail = settings.narration_detail;
 
                 let read_aloud = cx.new(|cx| {
                     let mut read_aloud = read_aloud::ReadAloud::new(
@@ -1283,6 +1301,7 @@ impl ThreadView {
                     read_aloud.set_speed(speaking_rate, cx);
                     read_aloud.set_click_to_seek(click_to_seek, cx);
                     read_aloud.set_mode(mode, cx);
+                    read_aloud.set_narration_detail(narration_detail, cx);
                     read_aloud
                 });
                 // The mini player renders off this entity's state; it already
@@ -1348,6 +1367,11 @@ impl ThreadView {
             if settings.mode != previous.mode {
                 read_aloud.update(cx, |read_aloud, cx| {
                     read_aloud.set_mode(settings.mode, cx);
+                });
+            }
+            if settings.narration_detail != previous.narration_detail {
+                read_aloud.update(cx, |read_aloud, cx| {
+                    read_aloud.set_narration_detail(settings.narration_detail, cx);
                 });
             }
         }
@@ -1416,6 +1440,7 @@ impl ThreadView {
                         NewEntryKind::UserMessage => {
                             // A new turn: status the user has not heard yet
                             // is about the turn they just moved on from.
+                            this.read_aloud_tool_calls.clear();
                             if let Some(read_aloud) = this.read_aloud.clone() {
                                 read_aloud
                                     .update(cx, |read_aloud, cx| read_aloud.cancel_narration(cx));
@@ -1427,7 +1452,7 @@ impl ThreadView {
                             if let Some(previous) = entry_index.checked_sub(1) {
                                 this.narrate_read_aloud_message(previous, cx);
                             }
-                            this.narrate_read_aloud_tool_call(entry_index, cx);
+                            this.note_read_aloud_tool_call(entry_index, false, cx);
                         }
                         NewEntryKind::Other => {}
                     }
@@ -1443,6 +1468,15 @@ impl ThreadView {
                     );
                     if updated_assistant_message {
                         this.enqueue_read_aloud(false, cx);
+                        // Closing prose streaming as the last entry means
+                        // the agent has stopped calling tools and is winding
+                        // up; that is the cue to start generating the turn's
+                        // wrap-up, so its audio is ready when the turn ends.
+                        if *entry_ix + 1 == thread.read(cx).entries().len() {
+                            this.speculate_read_aloud_wrap_up(*entry_ix, cx);
+                        }
+                    } else {
+                        this.note_read_aloud_tool_call(*entry_ix, false, cx);
                     }
                 }
                 AcpThreadEvent::Stopped(_) => {
@@ -1459,14 +1493,19 @@ impl ThreadView {
                             read_aloud.mark_tracked_message_complete(cx);
                         });
                     }
+                    // A call whose label never refined, and whose status
+                    // never left pending, still happened: narrate it now
+                    // rather than going silent waiting for an update that is
+                    // no longer coming.
+                    this.flush_read_aloud_tool_calls(cx);
                     // The turn's last assistant message can no longer grow,
-                    // so narration mode may now summarize it. Earlier
-                    // messages of the turn were summarized when the tool
+                    // so narration mode may now wrap the turn up. Earlier
+                    // messages of the turn reached narration when the tool
                     // call that ended them arrived.
                     if let Some((entry_index, _)) =
                         Self::latest_assistant_markdown_in(&this.thread, cx)
                     {
-                        this.narrate_read_aloud_message(entry_index, cx);
+                        this.finish_read_aloud_turn(entry_index, cx);
                     }
                 }
                 AcpThreadEvent::EntriesRemoved(range) => {
@@ -1475,6 +1514,11 @@ impl ThreadView {
                     // turn's indices would silently disable auto-play for
                     // every turn until the count grew past it again.
                     this.read_aloud_watermark = this.read_aloud_watermark.min(range.start);
+                    // Tool-call ids are scoped to the message they belong to,
+                    // so a regenerated turn can reuse one. Remembering that
+                    // the *removed* call was narrated would silence its
+                    // replacement.
+                    this.read_aloud_tool_calls.clear();
                 }
                 _ => {}
             },
@@ -1563,11 +1607,39 @@ impl ThreadView {
         });
     }
 
-    /// Speaks one tool call's label as ambient status, the first time the
-    /// call appears. Later status changes and label edits are deliberately
-    /// not narrated: a second line about a call the agent has already moved
-    /// past costs the listener more than it tells them.
-    fn narrate_read_aloud_tool_call(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+    /// Hands one tool call to narration, once, as soon as its label is worth
+    /// saying — and never before.
+    ///
+    /// A tool call reaches the thread in two stages. It appears while the
+    /// model is still streaming the tool's input, so its title is whatever
+    /// the tool can say with nothing to go on ("Read file", "Terminal"), and
+    /// the real title — the path, the command — lands in a later update
+    /// once the input parses. Narrating on appearance therefore speaks the
+    /// placeholder forever, which is exactly the "read file. running
+    /// terminal." the listener heard.
+    ///
+    /// A call is ready when either of two things is true:
+    ///
+    /// * its label differs from the one it appeared with — the refinement
+    ///   has landed, and this is the update that carries it; or
+    /// * its status has left `Pending` — the tool has actually started, so
+    ///   its input parsed, so its label is already final. This covers the
+    ///   call that arrives complete in one piece and never updates its
+    ///   title at all.
+    ///
+    /// `force` is the turn-end sweep: a call that never refined *and* never
+    /// left pending still happened, and silence about it is worse than a
+    /// generic line.
+    ///
+    /// Dedupe is per tool-call id, not per label, so a call refined a second
+    /// time (a streaming terminal retitling itself) never produces a second
+    /// utterance.
+    fn note_read_aloud_tool_call(
+        &mut self,
+        entry_index: usize,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
@@ -1593,9 +1665,58 @@ impl ThreadView {
         }
         let label = tool_call.label.clone();
         let kind = narration_kind(&tool_call.kind);
+        let source = label.read(cx).source().clone();
+        let pending = matches!(tool_call.status, ToolCallStatus::Pending);
+
+        let state = self
+            .read_aloud_tool_calls
+            .entry(tool_call.id.clone())
+            .or_insert_with(|| ToolCallNarration {
+                first_label: source.clone(),
+                narrated: false,
+            });
+        if state.narrated {
+            return;
+        }
+        if !force && pending && state.first_label == source {
+            return;
+        }
+        state.narrated = true;
+
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_tool_call(&label, kind, cx);
         });
+    }
+
+    /// Narrates every tool call of this turn that is still waiting for a
+    /// refinement that is not coming. Called when the turn ends.
+    fn flush_read_aloud_tool_calls(&mut self, cx: &mut Context<Self>) {
+        if self
+            .read_aloud_tool_calls
+            .values()
+            .all(|state| state.narrated)
+        {
+            return;
+        }
+        let waiting: Vec<usize> = {
+            let entries = self.thread.read(cx).entries();
+            entries
+                .iter()
+                .enumerate()
+                .skip(self.read_aloud_watermark)
+                .filter_map(|(entry_index, entry)| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => self
+                        .read_aloud_tool_calls
+                        .get(&tool_call.id)
+                        .is_some_and(|state| !state.narrated)
+                        .then_some(entry_index),
+                    _ => None,
+                })
+                .collect()
+        };
+        for entry_index in waiting {
+            self.note_read_aloud_tool_call(entry_index, true, cx);
+        }
     }
 
     /// Hands one finished assistant message to narration. Only ever called
@@ -1627,6 +1748,67 @@ impl ThreadView {
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.set_summary_model(summary_model);
             read_aloud.narrate_message(blocks, cx);
+        });
+    }
+
+    /// The turn is over: narration wraps it up rather than reporting one
+    /// more piece of status.
+    fn finish_read_aloud_turn(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        if read_aloud::ReadAloudSettings::get_global(cx).mode
+            != read_aloud::ReadAloudMode::Narration
+        {
+            return;
+        }
+        if entry_index < self.read_aloud_watermark {
+            return;
+        }
+        let blocks =
+            Self::assistant_message_markdowns(self.thread.read(cx).entries(), entry_index, cx);
+        if blocks.is_empty() {
+            return;
+        }
+        let summary_model = self.read_aloud_summary_model(cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_summary_model(summary_model);
+            read_aloud.finish_turn(blocks, cx);
+        });
+    }
+
+    /// Asks narration to start the turn's wrap-up while the agent is still
+    /// writing its closing message, so the audio is ready the instant the
+    /// turn ends rather than a model round trip afterwards.
+    ///
+    /// This runs on every streamed chunk of that message, so the cheap
+    /// question (`wants_wrap_up`, a handful of comparisons) is asked before
+    /// the expensive one: resolving a model walks the provider registry.
+    fn speculate_read_aloud_wrap_up(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        if read_aloud::ReadAloudSettings::get_global(cx).mode
+            != read_aloud::ReadAloudMode::Narration
+        {
+            return;
+        }
+        if entry_index < self.read_aloud_watermark {
+            return;
+        }
+        let blocks =
+            Self::assistant_message_markdowns(self.thread.read(cx).entries(), entry_index, cx);
+        let message_chars: usize = blocks
+            .iter()
+            .map(|block| block.read(cx).source().len())
+            .sum();
+        if !read_aloud.read(cx).wants_wrap_up(message_chars) {
+            return;
+        }
+        let summary_model = self.read_aloud_summary_model(cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_summary_model(summary_model);
+            read_aloud.speculate_wrap_up(blocks, message_chars, cx);
         });
     }
 

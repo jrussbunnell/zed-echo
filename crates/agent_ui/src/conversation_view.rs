@@ -8109,7 +8109,7 @@ pub(crate) mod tests {
 
         let spoken = provider.spoken();
         assert!(
-            spoken.contains(&"Read file player".to_string()),
+            spoken.contains(&"Reading player.".to_string()),
             "the tool call must be narrated as it happens, got {spoken:?}"
         );
         assert!(
@@ -8147,12 +8147,105 @@ pub(crate) mod tests {
 
         let spoken = provider.spoken();
         assert!(
-            !spoken.iter().any(|text| text.contains("Read file")),
+            !spoken.iter().any(|text| text.contains("Reading player")),
             "narrate_tool_calls: false must silence tool calls, got {spoken:?}"
         );
         assert!(
             spoken.contains(&"I moved the poll loop onto a timer.".to_string()),
             "and must leave message narration alone, got {spoken:?}"
+        );
+    }
+
+    /// Regression: a tool call reaches the thread in two stages. It appears
+    /// while the model is still streaming the tool's input, so its title is
+    /// the generic placeholder the tool can produce with nothing to go on
+    /// ("Read file"), and the real title lands in a later update. Narration
+    /// fired on the first appearance, and its label-string dedupe then
+    /// suppressed the refinement — so the listener heard "read file" forever,
+    /// which is exactly what was reported.
+    #[gpui::test]
+    async fn test_read_aloud_narration_waits_for_a_tool_calls_real_label(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            // Stage one: the input has not finished streaming, so the tool
+            // can only say what kind of thing it is about to do.
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool1", "Read file")
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::Pending),
+            ),
+            // Stage two: the input parsed, so the title becomes the real one.
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new()
+                    .title("Read file `crates/read_aloud/src/segmenter.rs`")
+                    .status(acp::ToolCallStatus::InProgress),
+            )),
+            // Stage three: it finishes. This must not speak a second time.
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        ]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert_eq!(
+            spoken,
+            vec!["Reading segmenter.".to_string()],
+            "exactly one utterance, and it is the real label — not the \
+             placeholder, and not both, got {spoken:?}"
+        );
+    }
+
+    /// The other half of the same rule: a call that arrives complete and
+    /// never refines its title must still be narrated. Waiting for an update
+    /// that is not coming would be silence.
+    #[gpui::test]
+    async fn test_read_aloud_narration_speaks_a_tool_call_that_never_refines(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool1", "Read file `crates/read_aloud/src/sink.rs`")
+                .kind(acp::ToolKind::Read)
+                .status(acp::ToolCallStatus::Pending),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec!["Reading sink.".to_string()],
+            "a call that never updates is still narrated, got {:?}",
+            provider.spoken()
         );
     }
 
@@ -8185,7 +8278,7 @@ pub(crate) mod tests {
             provider
                 .spoken()
                 .iter()
-                .any(|text| text.contains("Read file")),
+                .any(|text| text.contains("Reading player")),
             "setup: this thread is narrating, got {:?}",
             provider.spoken()
         );
@@ -8300,7 +8393,7 @@ pub(crate) mod tests {
             provider
                 .spoken()
                 .iter()
-                .any(|text| text.contains("Read file segmenter")),
+                .any(|text| text.contains("Reading segmenter")),
             "and it must be the new turn's status, got {:?}",
             provider.spoken()
         );
@@ -8434,7 +8527,7 @@ pub(crate) mod tests {
             provider
                 .spoken()
                 .iter()
-                .any(|text| text.contains("Read file")),
+                .any(|text| text.contains("Reading player")),
             "setup: the visible panel narrates, got {:?}",
             provider.spoken()
         );
@@ -8483,7 +8576,7 @@ pub(crate) mod tests {
             provider
                 .spoken()
                 .iter()
-                .any(|text| text.contains("Read file sink")),
+                .any(|text| text.contains("Reading sink")),
             "showing the panel again must let the next turn speak, got {:?}",
             provider.spoken()
         );
