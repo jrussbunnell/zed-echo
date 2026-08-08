@@ -1725,14 +1725,25 @@ impl ThreadView {
     /// mode, a summary already being generated lands afterwards and washes a
     /// message that is off screen entirely.
     ///
-    /// `stop` rather than a quiet halt: leaving a thread is explicit intent,
-    /// so the stop latch is right, and coming back leaves the controls one
-    /// click from replaying.
+    /// Silence lasts only as long as the user is away: `deactivate` parks
+    /// playback the way a stop does but records the latch as the
+    /// navigation's, so [`Self::read_aloud_activated`] can hand the user
+    /// their own intent back. Leaving a thread should not disarm read aloud
+    /// for the next turn you start on it.
     pub(crate) fn read_aloud_deactivated(&mut self, cx: &mut Context<Self>) {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        read_aloud.update(cx, |read_aloud, cx| read_aloud.stop(cx));
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.deactivate(cx));
+    }
+
+    /// Called when this view becomes the active thread again. Nothing
+    /// resumes on its own — the next turn is simply allowed to speak.
+    pub(crate) fn read_aloud_activated(&mut self, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.reactivate(cx));
     }
 
     #[cfg(test)]

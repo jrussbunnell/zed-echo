@@ -720,6 +720,11 @@ impl ConversationView {
             .cloned();
         if let Some(outgoing) = outgoing {
             outgoing.update(cx, |view, cx| view.read_aloud_deactivated(cx));
+            // The thread being arrived at may itself have been parked by an
+            // earlier navigation; coming back lifts that.
+            if let Some(incoming) = self.active_thread().cloned() {
+                incoming.update(cx, |view, cx| view.read_aloud_activated(cx));
+            }
         }
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
@@ -8031,6 +8036,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// Gives the conversation a second thread to navigate to: a real,
+    /// distinct `ThreadView` (over the same underlying thread, which is all
+    /// these tests need) registered under a second session id. It must be a
+    /// separate entity — a stand-in that is both the outgoing and the
+    /// incoming view would deactivate and immediately reactivate itself.
+    /// Returns `(leaving, arriving)`.
+    fn register_second_read_aloud_thread(
+        conversation_view: &Entity<ConversationView>,
+        cx: &mut VisualTestContext,
+    ) -> (acp::SessionId, acp::SessionId) {
+        let arriving_session_id = acp::SessionId::new("second-thread");
+        let leaving_session_id = conversation_view.update_in(cx, |view, window, cx| {
+            let connected = view.as_connected().expect("the server is connected");
+            let leaving_session_id = connected.active_id.clone().expect("a thread is showing");
+            let thread = connected
+                .threads
+                .get(&leaving_session_id)
+                .expect("the showing thread has a view")
+                .read(cx)
+                .thread
+                .clone();
+            let conversation = connected.conversation.clone();
+            let second_view = view.new_thread_view(thread, conversation, false, None, window, cx);
+            if let Some(connected) = view.as_connected_mut() {
+                connected
+                    .threads
+                    .insert(arriving_session_id.clone(), second_view);
+            }
+            leaving_session_id
+        });
+        (leaving_session_id, arriving_session_id)
+    }
+
     fn read_aloud_narration_updates(message: &str) -> Vec<acp::SessionUpdate> {
         vec![
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(message.into())),
@@ -8152,17 +8190,8 @@ pub(crate) mod tests {
             provider.spoken()
         );
 
-        // Register the same view under a second session id so the navigation
-        // has somewhere to land; what is under test is the outgoing half.
-        let leaving_session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
-        let arriving_session_id = acp::SessionId::new("second-thread");
-        conversation_view.update(cx, |view, _| {
-            if let Some(connected) = view.as_connected_mut() {
-                connected
-                    .threads
-                    .insert(arriving_session_id.clone(), thread_view.clone());
-            }
-        });
+        let (leaving_session_id, arriving_session_id) =
+            register_second_read_aloud_thread(&conversation_view, cx);
 
         // Re-selecting the thread already showing must not silence it.
         let reader = thread_view.read_with(cx, |view, _| {
@@ -8204,6 +8233,258 @@ pub(crate) mod tests {
             provider.spoken(),
             spoken_when_left,
             "a thread the user has left must not keep narrating, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// Regression: parking a thread on the way out used to set the
+    /// session-wide user-stop latch with nothing to clear it, so coming back
+    /// and starting a fresh turn was silent — in both modes, and with the
+    /// ordinary idle pill on screen giving no hint that anything was
+    /// latched. Alternating between two threads disarmed read aloud on the
+    /// one you left.
+    #[gpui::test]
+    async fn test_read_aloud_returning_to_a_thread_lets_the_next_turn_speak(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let (leaving_session_id, arriving_session_id) =
+            register_second_read_aloud_thread(&conversation_view, cx);
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(arriving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(leaving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        let spoken_on_return = provider.spoken();
+
+        // A fresh turn on the thread the user came back to.
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool2", "Read file `crates/read_aloud/src/segmenter.rs`")
+                .kind(acp::ToolKind::Read)
+                .status(acp::ToolCallStatus::InProgress),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Keep going", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert!(
+            provider.spoken().len() > spoken_on_return.len(),
+            "coming back and starting a turn must speak again, got {:?}",
+            provider.spoken()
+        );
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Read file segmenter")),
+            "and it must be the new turn's status, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// The other half: leaving is not consent to start talking again, so a
+    /// stop the user actually asked for has to survive the round trip.
+    #[gpui::test]
+    async fn test_read_aloud_a_user_stop_survives_leaving_and_returning(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let reader = thread_view.read_with(cx, |view, _| {
+            view.read_aloud_for_test()
+                .expect("the reader is installed")
+                .clone()
+        });
+        reader.update(cx, |reader, cx| reader.stop(cx));
+        cx.run_until_parked();
+
+        let (leaving_session_id, arriving_session_id) =
+            register_second_read_aloud_thread(&conversation_view, cx);
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(arriving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(leaving_session_id, window, cx);
+        });
+        cx.run_until_parked();
+        let spoken_when_stopped = provider.spoken();
+
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool2", "Read file `crates/read_aloud/src/segmenter.rs`")
+                .kind(acp::ToolKind::Read)
+                .status(acp::ToolCallStatus::InProgress),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Keep going", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_stopped,
+            "returning must hand back the user's own stop, not lift it, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// Regression: a hidden panel keeps its threads, their subscriptions,
+    /// and their share of the audio player, so it went on narrating a
+    /// conversation nobody could see — the same problem leaving a thread
+    /// had, one level up.
+    #[gpui::test]
+    async fn test_read_aloud_hiding_the_panel_stops_and_showing_it_resumes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace_handle
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| crate::AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::new(connection.clone())),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let conversation_view = panel.read_with(cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .cloned()
+                .expect("the panel is showing a conversation")
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Read file")),
+            "setup: the visible panel narrates, got {:?}",
+            provider.spoken()
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            workspace::Panel::set_active(panel, false, window, cx);
+        });
+        cx.run_until_parked();
+        let spoken_when_hidden = provider.spoken();
+
+        let next_turn = |connection: &StubAgentConnection, id: &'static str, file: &'static str| {
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(id, format!("Read file `crates/read_aloud/src/{file}.rs`"))
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::InProgress),
+            )]);
+        };
+
+        next_turn(&connection, "tool2", "segmenter");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Keep going", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            spoken_when_hidden,
+            "a hidden panel must not keep narrating, got {:?}",
+            provider.spoken()
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            workspace::Panel::set_active(panel, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        next_turn(&connection, "tool3", "sink");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("And again", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            provider
+                .spoken()
+                .iter()
+                .any(|text| text.contains("Read file sink")),
+            "showing the panel again must let the next turn speak, got {:?}",
             provider.spoken()
         );
     }

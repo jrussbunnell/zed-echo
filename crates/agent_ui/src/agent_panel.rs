@@ -5021,6 +5021,23 @@ impl Panel for AgentPanel {
         if active {
             self.ensure_thread_initialized(window, cx);
         }
+        // A hidden panel keeps its threads, their subscriptions, and their
+        // share of the audio player, so without this it goes on reading a
+        // conversation nobody is looking at. Hiding parks read aloud the
+        // same way navigating away from a thread does, and showing the panel
+        // again hands the user their own intent back.
+        if let Some(thread_view) = self
+            .active_conversation_view()
+            .and_then(|conversation_view| conversation_view.read(cx).active_thread().cloned())
+        {
+            thread_view.update(cx, |thread_view, cx| {
+                if active {
+                    thread_view.read_aloud_activated(cx);
+                } else {
+                    thread_view.read_aloud_deactivated(cx);
+                }
+            });
+        }
     }
 
     fn remote_id() -> Option<proto::PanelId> {
