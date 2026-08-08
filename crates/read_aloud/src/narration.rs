@@ -26,6 +26,12 @@ pub const MAX_SUMMARY_CHARS: usize = 600;
 /// templated form beats a paragraph that arrives late.
 pub const MAX_STEP_LINE_CHARS: usize = 220;
 
+/// The most a turn wrap-up may be. A wrap-up is a sign-off, not a speech:
+/// at spoken pace this is about ten seconds, and the prompt asks for half
+/// that. Past it the model has written an essay, and the message's own
+/// opening is a better use of the listener's attention.
+pub const MAX_WRAP_UP_CHARS: usize = 300;
+
 /// The most of a message that is worth sending to the summary model. Longer
 /// messages are truncated rather than skipped: the opening carries the
 /// decisions, and the tail is usually code or a recap.
@@ -701,6 +707,52 @@ pub fn summary_prompt(message: &str) -> String {
     )
 }
 
+/// What a model is told to reply when the step's prose has already said
+/// everything worth saying.
+pub const NOTHING_TO_ADD: &str = "nothing to add";
+
+/// Words too common to count as content when deciding whether one line
+/// merely restates another.
+const FILLER_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "before", "but", "by", "for", "from", "how", "i",
+    "if", "in", "into", "is", "it", "its", "let", "me", "of", "on", "or", "so", "that", "the",
+    "then", "there", "this", "to", "up", "was", "what", "when", "where", "which", "will", "with",
+];
+
+/// Whether `line` would only say again what `already_said` already said.
+///
+/// Two spoken sentences in a row that carry the same information is the
+/// "choppy and repetitive" failure in its other form, and it is easy to hit
+/// now that a step's own prose goes out before its fused line. The model is
+/// asked to say so itself ([`NOTHING_TO_ADD`]); this is the backstop for
+/// when it does not, and it is deliberately conservative — a line is only
+/// dropped when *almost all* of its content words were already spoken.
+pub fn adds_nothing(line: &str, already_said: &str) -> bool {
+    let content = |text: &str| -> Vec<String> {
+        text.split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .filter(|word| word.len() > 2 && !FILLER_WORDS.contains(&word.as_str()))
+            .collect()
+    };
+    let line_words = content(line);
+    if line_words.is_empty() {
+        return true;
+    }
+    if line
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .eq_ignore_ascii_case(NOTHING_TO_ADD)
+    {
+        return true;
+    }
+    let said = content(already_said);
+    let repeated = line_words.iter().filter(|word| said.contains(word)).count();
+    // Three quarters, rather than all of it: a line that adds one new word
+    // to a sentence the listener just heard is still a repetition.
+    repeated * 4 >= line_words.len() * 3
+}
+
 /// The already-said block every narration prompt carries, or an empty string
 /// when there is nothing to avoid repeating. This is the single biggest
 /// lever on whether a run of lines sounds like one person talking rather
@@ -740,14 +792,18 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
     format!(
         "You are narrating a coding agent's work out loud, the way a colleague sitting \
          next to someone would talk them through what they are doing.\n\n\
-         Say what the agent is doing right now and why.\n\n\
+         The agent's own words have usually just been read out already. Say what it is \
+         actually *doing* now — the files, the commands — and why, without saying those \
+         words again.\n\n\
          Rules:\n\
-         - One sentence, under twenty words, present tense.\n\
+         - One sentence, under fifteen words, present tense.\n\
          - Start with the action, then the reason: \"Checking the sync design spec to see \
          how the pipeline stages line up.\"\n\
          - Spoken English only. No markdown, no code, no backticks, no command lines, no \
          file paths — name a file the way you would say it aloud (\"the sync design spec\", \
          not \"docs/sync_design.md\").\n\
+         - If everything worth saying is already in what you have said out loud, reply \
+         with exactly: {NOTHING_TO_ADD}\n\
          - No preamble, no sign-off, no quotes around the reply.\n\n\
          {already}{wrote}{did}\
          Reply with the one sentence and nothing else.",
@@ -790,7 +846,8 @@ pub fn wrap_up_prompt(
          the screen. The turn is finishing, so give them the wrap-up.\n\n\
          Say what was done, what was found or decided, and anything they have to act on.\n\n\
          Rules:\n\
-         - Two or three short sentences. Two is usually enough.\n\
+         - Two sentences at most, and under twenty-five words in total. This is a \
+         sign-off, not a recap.\n\
          - Spoken English only. No markdown, no code, no backticks, no command lines, no \
          lists, no file paths spelled out.\n\
          - Build on what you have already said rather than repeating it — \"that's done, \
@@ -834,6 +891,23 @@ pub fn clean_summary(reply: &str) -> Option<String> {
         log::warn!(
             "read_aloud: the summary model replied with {} characters, past the {MAX_SUMMARY_CHARS} \
              a summary may be; speaking the message's opening instead",
+            cleaned.chars().count()
+        );
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// Makes a turn wrap-up speakable, or rejects it. Same cleaning as
+/// [`clean_summary`] against a tighter bound: a wrap-up the listener has to
+/// sit through is the verbosity this mode exists to escape, arriving at the
+/// one moment they are actually waiting.
+pub fn clean_wrap_up(reply: &str) -> Option<String> {
+    let cleaned = clean_summary(reply)?;
+    if cleaned.chars().count() > MAX_WRAP_UP_CHARS {
+        log::warn!(
+            "read_aloud: the summary model answered the wrap-up with {} characters, past the \
+             {MAX_WRAP_UP_CHARS} a sign-off may be; speaking the message's opening instead",
             cleaned.chars().count()
         );
         return None;
@@ -1252,6 +1326,46 @@ mod tests {
     }
 
     #[test]
+    fn a_wrap_up_that_is_really_a_speech_is_rejected() {
+        let sign_off = "That is the bug. The fix is a flush on shutdown, and that is your call.";
+        assert_eq!(clean_wrap_up(sign_off).as_deref(), Some(sign_off));
+        let speech = "word ".repeat(MAX_WRAP_UP_CHARS / 4);
+        assert!(speech.chars().count() > MAX_WRAP_UP_CHARS);
+        assert!(speech.chars().count() < MAX_SUMMARY_CHARS);
+        assert!(
+            clean_summary(&speech).is_some(),
+            "this exercises the wrap-up's own bound, not the one it inherits"
+        );
+        assert_eq!(clean_wrap_up(&speech), None);
+    }
+
+    #[test]
+    fn a_line_that_only_restates_what_was_said_adds_nothing() {
+        let said = "I moved the poll loop onto a timer.";
+        assert!(adds_nothing("It moved the poll loop onto a timer.", said));
+        assert!(adds_nothing("Moving the poll loop to a timer.", said));
+        assert!(adds_nothing(NOTHING_TO_ADD, said));
+        assert!(adds_nothing("Nothing to add.", said));
+        assert!(adds_nothing("   ", said));
+    }
+
+    #[test]
+    fn a_line_that_names_the_work_is_kept() {
+        let said = "Let me look at how the sync pipeline is put together before guessing.";
+        assert!(!adds_nothing(
+            "Reading the sync design and the batcher to see how batches are formed.",
+            said
+        ));
+        assert!(!adds_nothing("Running the sync tests.", said));
+        // The check is conservative: adding one word to a sentence the
+        // listener just heard is still a repetition.
+        assert!(adds_nothing(
+            "Looking at how the sync pipeline is put together.",
+            said
+        ));
+    }
+
+    #[test]
     fn the_step_prompt_asks_for_the_action_and_the_reason() {
         let prompt = step_prompt(
             "Now I need to see how the pipeline stages line up.",
@@ -1262,8 +1376,12 @@ mod tests {
         assert!(prompt.contains("docs/sync-design.md"));
         assert!(prompt.contains("Reading the migration notes."));
         assert!(prompt.contains("already said"));
-        assert!(prompt.contains("One sentence"));
+        assert!(prompt.contains("One sentence, under fifteen words"));
         assert!(prompt.contains("then the reason"));
+        assert!(
+            prompt.contains(NOTHING_TO_ADD),
+            "the model is given a way to say the prose already covered it"
+        );
     }
 
     #[test]
@@ -1286,6 +1404,10 @@ mod tests {
         assert!(prompt.contains("Running cargo test."));
         assert!(prompt.contains("must not repeat"));
         assert!(prompt.contains("Build on what you have already said"));
+        assert!(
+            prompt.contains("under twenty-five words"),
+            "a wrap-up is a sign-off, not a speech"
+        );
     }
 
     #[test]

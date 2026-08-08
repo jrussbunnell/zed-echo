@@ -9,8 +9,8 @@ pub use inworld::{
     INWORLD_CREDENTIALS_URL, InworldTts, fallback_voices, fetch_voices, resolve_api_key,
 };
 pub use narration::{
-    MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, NarrationKind, SummaryModel, TRIVIAL_MESSAGE_CHARS,
-    step_prompt, summary_prompt, wrap_up_prompt,
+    MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, MAX_WRAP_UP_CHARS, NOTHING_TO_ADD, NarrationKind,
+    SummaryModel, TRIVIAL_MESSAGE_CHARS, step_prompt, summary_prompt, wrap_up_prompt,
 };
 pub use player::{Player, PlayerEvent};
 pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
@@ -189,12 +189,17 @@ const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the agent has to go quiet before an open step is considered
-/// finished. Short enough that a step line lands while it is still true;
-/// long enough to hold a burst of tool calls together rather than splitting
-/// one thought into four lines. Tool calls in a burst arrive tens of
-/// milliseconds apart, and the gap between one step and the next is the
-/// model's own thinking time, which is far longer than this.
-const STEP_IDLE_WINDOW: Duration = Duration::from_millis(1_500);
+/// finished.
+///
+/// This window is deliberately *not* on the critical path: a step's line is
+/// generated as soon as the step has prose and its first real tool call, so
+/// closing a step no longer gates any audio — it only decides which
+/// generation gets spoken. That is what lets it be this short. Tool calls in
+/// a burst arrive tens of milliseconds apart (Zed's agent emits every
+/// `tool_use` block of one message back to back), so 800ms is an order of
+/// magnitude more than it needs to bridge, while the gap between one step
+/// and the next is the model's own thinking time — seconds.
+const STEP_IDLE_WINDOW: Duration = Duration::from_millis(800);
 
 /// How long a step's line may take before narration stops waiting and says
 /// the templated form instead. A step's line is status: two seconds after
@@ -205,6 +210,11 @@ const STEP_IDLE_WINDOW: Duration = Duration::from_millis(1_500);
 /// and be discarded — same guarantee ("never speak both"), one fewer token
 /// spent.
 const STEP_FALLBACK_DELAY: Duration = Duration::from_secs(2);
+
+/// How many generations one step may spend. Two, for the same reason the
+/// wrap-up gets two: the first is issued the moment there is something to
+/// say, and the second picks up the tool calls that joined while it ran.
+const MAX_STEP_LINE_ISSUES: usize = 2;
 
 /// How long a turn wrap-up may take. Longer than a step's budget because a
 /// wrap-up is issued speculatively, while the closing message is still
@@ -250,6 +260,32 @@ struct OpenStep {
     /// per-message summary from saying them a second time.
     prose_heads: Vec<EntityId>,
     tool_calls: Vec<StepToolCall>,
+    /// The agent's own words, already spoken. The prose is the intent, it is
+    /// already written, and it needs no model call — so it goes out the
+    /// moment the step is real rather than waiting for the fused line. What
+    /// was said is kept here so the fused line can be dropped if it would
+    /// only say it again.
+    spoken_prose: Option<String>,
+    line: StepLine,
+}
+
+/// A step's fused line, generated speculatively while the step is still open
+/// so that closing the step costs no round trip. Mirrors [`WrapUp`]: the
+/// answer is held until there is a place to say it.
+#[derive(Default)]
+struct StepLine {
+    /// How many generations this step has spent, capped at
+    /// [`MAX_STEP_LINE_ISSUES`].
+    issues: usize,
+    /// How many tool calls the step had at the last generation, so a
+    /// re-issue only happens once there is genuinely more to describe.
+    issued_calls: usize,
+    generating: bool,
+    /// A finished line waiting for the step to close.
+    ready: Option<String>,
+    /// No line is coming: the model failed, timed out, said it had nothing
+    /// to add, or there was none to ask.
+    exhausted: bool,
 }
 
 /// The turn's closing summary, generated speculatively so that the audio is
@@ -287,10 +323,10 @@ impl WrapUp {
 enum ParkedMessageNarration {
     /// Condense it with the summary model, falling back to its opening.
     Summarize,
-    /// Speak its opening sentences, with no model call — the form used when
-    /// a model has already been tried and failed, or when a step's template
-    /// is standing in for one.
-    Plainly,
+    /// Speak its opening `sentences` sentences, with no model call — the
+    /// form used when a step opens and the agent's own words go straight
+    /// out, and when a model has already been tried and failed.
+    Plainly { sentences: usize },
 }
 
 /// A snapshot of the player, thin enough to derive on every render, for the
@@ -368,6 +404,11 @@ pub struct ReadAloud {
     narration: NarrationQueue,
     /// The step being accumulated, `None` between steps.
     step: Option<OpenStep>,
+    /// Steps that have closed while their line was still being generated.
+    /// They wait here rather than being spoken as templates immediately,
+    /// because the generation was started early enough that it is usually
+    /// about to answer.
+    closing_steps: HashMap<usize, OpenStep>,
     /// Closes the open step once the agent has gone quiet. Re-armed on
     /// every piece of activity, so it only ever fires on a real lull.
     step_idle_task: Option<Task<()>>,
@@ -461,6 +502,7 @@ impl ReadAloud {
             detail: NarrationDetail::default(),
             narration: NarrationQueue::default(),
             step: None,
+            closing_steps: HashMap::new(),
             step_idle_task: None,
             step_tasks: HashMap::new(),
             next_step_number: 0,
@@ -963,17 +1005,33 @@ impl ReadAloud {
                 // is spoken now, in its templated form — the same timely,
                 // free line `actions` gives, and the same one the queue's
                 // collapse rules fold into a count when a burst arrives.
-                let Some(step) = self.step.as_mut().filter(|step| !step.prose.is_empty()) else {
+                if self.step.as_ref().is_none_or(|step| step.prose.is_empty()) {
                     if self.narration.push_tool_call(label.clone(), kind, cx) {
                         self.start_next_narration_if_idle(cx);
                     }
                     return;
-                };
-                step.tool_calls.push(StepToolCall {
-                    label: label.clone(),
-                    kind,
-                    description,
-                });
+                }
+                // The first tool call is what makes the prose in front of it
+                // a *step* rather than a message. That is the moment the
+                // agent's own words are worth saying, and saying them costs
+                // nothing: they are already written, so there is no round
+                // trip between the agent deciding something and the listener
+                // hearing it.
+                let first_call = self
+                    .step
+                    .as_ref()
+                    .is_some_and(|step| step.tool_calls.is_empty());
+                if let Some(step) = self.step.as_mut() {
+                    step.tool_calls.push(StepToolCall {
+                        label: label.clone(),
+                        kind,
+                        description,
+                    });
+                }
+                if first_call {
+                    self.speak_step_opening(cx);
+                }
+                self.maybe_generate_step_line(cx);
                 self.arm_step_idle_timer(cx);
             }
         }
@@ -1094,6 +1152,7 @@ impl ReadAloud {
     #[cfg(test)]
     fn narration_progress_is_idle(&self) -> bool {
         self.step.is_none()
+            && self.closing_steps.is_empty()
             && self.step_idle_task.is_none()
             && self.step_tasks.is_empty()
             && self.turn_activity.is_empty()
@@ -1107,6 +1166,7 @@ impl ReadAloud {
     /// stale status this mode exists to avoid.
     fn drop_narration_progress(&mut self) {
         self.step = None;
+        self.closing_steps.clear();
         self.step_idle_task = None;
         self.step_tasks.clear();
         self.turn_activity.clear();
@@ -1143,7 +1203,9 @@ impl ReadAloud {
                         ParkedMessageNarration::Summarize => {
                             this.narrate_message_summary(blocks, cx)
                         }
-                        ParkedMessageNarration::Plainly => this.narrate_message_plainly(blocks, cx),
+                        ParkedMessageNarration::Plainly { sentences } => {
+                            this.narrate_message_plainly(blocks, sentences, cx)
+                        }
                     }
                 })
             })
@@ -1159,7 +1221,12 @@ impl ReadAloud {
     /// model: both callers reach it because a model has just failed or is
     /// standing aside, and a second round trip would add seconds to a line
     /// that is already late.
-    fn narrate_message_plainly(&mut self, blocks: Vec<Entity<Markdown>>, cx: &mut Context<Self>) {
+    fn narrate_message_plainly(
+        &mut self,
+        blocks: Vec<Entity<Markdown>>,
+        sentences: usize,
+        cx: &mut Context<Self>,
+    ) {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }
@@ -1170,7 +1237,7 @@ impl ReadAloud {
             return;
         }
         if !blocks.iter().all(|block| Self::parse_is_current(block, cx)) {
-            self.wait_for_message_parse(blocks, ParkedMessageNarration::Plainly, cx);
+            self.wait_for_message_parse(blocks, ParkedMessageNarration::Plainly { sentences }, cx);
             return;
         }
         self.summarized_messages.insert(first_block.entity_id());
@@ -1185,7 +1252,7 @@ impl ReadAloud {
             self.start_next_narration_if_idle(cx);
             return;
         }
-        let Some(opening) = Self::opening_sentences(&blocks, cx) else {
+        let Some(opening) = Self::opening_sentences(&blocks, sentences, cx) else {
             return;
         };
         self.narrate_summary(opening, blocks, cx);
@@ -1201,6 +1268,8 @@ impl ReadAloud {
                 prose: Vec::new(),
                 prose_heads: Vec::new(),
                 tool_calls: Vec::new(),
+                spoken_prose: None,
+                line: StepLine::default(),
             });
         }
         self.step
@@ -1253,17 +1322,18 @@ impl ReadAloud {
         }));
     }
 
-    /// Turns the open step into the one line that says what the agent is
-    /// doing and why. A no-op when no step is open.
+    /// Closes the open step. A no-op when no step is open.
+    ///
+    /// Closing costs no round trip: the line was issued when the step got
+    /// its first tool call, so by now it is usually already sitting in
+    /// `ready`. A step whose generation is still in flight waits in
+    /// `closing_steps` rather than falling straight to the template — the
+    /// generation has its own two-second budget, which started early.
     fn close_step(&mut self, cx: &mut Context<Self>) {
         self.step_idle_task = None;
         let Some(step) = self.step.take() else {
             return;
         };
-        self.generate_step_line(step, cx);
-    }
-
-    fn generate_step_line(&mut self, step: OpenStep, cx: &mut Context<Self>) {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }
@@ -1276,17 +1346,80 @@ impl ReadAloud {
             self.narrate_message_summary(step.prose, cx);
             return;
         }
+        if let Some(line) = step.line.ready.clone() {
+            self.speak_step_line(line, step, cx);
+            return;
+        }
+        if step.line.generating {
+            self.closing_steps.insert(step.number, step);
+            return;
+        }
+        self.speak_step_template(step, cx);
+    }
+
+    /// Speaks the agent's own opening words for the step that has just
+    /// become real, straight away and with no model call.
+    ///
+    /// This is what gets the first word out inside a couple of seconds: the
+    /// prose *is* the intent, it is already written, and a listener would
+    /// rather hear the agent's own sentence now than a better one later. A
+    /// message short enough to stand alone is spoken verbatim (which also
+    /// keeps its word highlight); a longer one gives up its first sentence.
+    fn speak_step_opening(&mut self, cx: &mut Context<Self>) {
+        let Some(step) = self.step.as_ref() else {
+            return;
+        };
+        if step.spoken_prose.is_some() || step.prose.is_empty() {
+            return;
+        }
+        let prose = step.prose.clone();
+        let source = Self::message_source(&prose, cx);
+        // Mirror what `narrate_message_plainly` is about to say, so the
+        // suppression check compares against the real thing.
+        let opening = if source.chars().count() <= TRIVIAL_MESSAGE_CHARS {
+            source
+        } else {
+            Self::opening_sentences(&prose, 1, cx).unwrap_or(source)
+        };
+        if let Some(step) = self.step.as_mut() {
+            step.spoken_prose = Some(opening);
+        }
+        self.narrate_message_plainly(prose, 1, cx);
+    }
+
+    /// Starts a step's line as soon as there is something to say, rather
+    /// than when the step closes. The quiet window then only decides *when*
+    /// the answer is spoken, never when the work starts — the same
+    /// speculative shape the turn wrap-up uses.
+    ///
+    /// A re-issue waits for the first generation to answer: a burst of tool
+    /// calls arriving milliseconds apart would otherwise spend both of a
+    /// step's generations inside a tenth of a second and describe neither.
+    fn maybe_generate_step_line(&mut self, cx: &mut Context<Self>) {
+        if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
+            return;
+        }
+        let Some(step) = self.step.as_ref() else {
+            return;
+        };
+        if step.tool_calls.is_empty()
+            || step.prose.is_empty()
+            || step.line.generating
+            || step.line.exhausted
+            || step.line.issues >= MAX_STEP_LINE_ISSUES
+            || step.tool_calls.len() <= step.line.issued_calls
+        {
+            return;
+        }
         let prose = Self::message_source(&step.prose, cx);
         let Some(model) = self
             .summary_model
             .clone()
             .filter(|_| !prose.trim().is_empty())
         else {
-            // Without prose there is no *why* for a model to add — it could
-            // only rephrase the label it was handed, at the cost of a round
-            // trip and a second of staleness. The template says it now, and
-            // the queue's collapse rules still turn a burst into a count.
-            self.speak_step_template(step, cx);
+            if let Some(step) = self.step.as_mut() {
+                step.line.exhausted = true;
+            }
             return;
         };
         let tool_lines: Vec<String> = step
@@ -1294,8 +1427,9 @@ impl ReadAloud {
             .iter()
             .map(|call| call.description.clone())
             .collect();
-        let prompt = narration::step_prompt(&prose, &tool_lines, &self.narration.recent_lines());
         let number = step.number;
+        let calls = step.tool_calls.len();
+        let prompt = narration::step_prompt(&prose, &tool_lines, &self.narration.recent_lines());
         let task = cx.spawn(async move |this, cx| {
             let completion = cx.update(|cx| model.complete(prompt, cx));
             let fallback = cx.background_executor().timer(STEP_FALLBACK_DELAY);
@@ -1309,21 +1443,60 @@ impl ReadAloud {
             };
             this.update(cx, |this, cx| {
                 this.step_tasks.remove(&number);
-                match reply
+                let line = reply
                     .log_err()
-                    .and_then(|reply| narration::clean_step_line(&reply))
-                {
-                    Some(line) => this.speak_step_line(line, step, cx),
-                    None => this.speak_step_template(step, cx),
-                }
+                    .and_then(|reply| narration::clean_step_line(&reply));
+                this.deliver_step_line(number, line, cx);
             })
             .log_err();
         });
         self.step_tasks.insert(number, task);
+        if let Some(step) = self.step.as_mut() {
+            step.line.generating = true;
+            step.line.issues += 1;
+            step.line.issued_calls = calls;
+        }
+    }
+
+    /// Takes a step generation's answer. The step is either still open — in
+    /// which case the answer waits for it to close, and may yet be replaced
+    /// by a re-issue covering the calls that have joined since — or it has
+    /// already closed and is waiting in `closing_steps` to be spoken.
+    fn deliver_step_line(&mut self, number: usize, line: Option<String>, cx: &mut Context<Self>) {
+        if let Some(step) = self.step.as_mut().filter(|step| step.number == number) {
+            step.line.generating = false;
+            match line {
+                Some(line) => step.line.ready = Some(line),
+                None => step.line.exhausted = true,
+            }
+            // More calls may have joined while that ran; if so, the answer
+            // in hand describes only part of the step.
+            self.maybe_generate_step_line(cx);
+            return;
+        }
+        let Some(mut step) = self.closing_steps.remove(&number) else {
+            return;
+        };
+        step.line.generating = false;
+        match line {
+            Some(line) => self.speak_step_line(line, step, cx),
+            None => self.speak_step_template(step, cx),
+        }
     }
 
     fn speak_step_line(&mut self, line: String, step: OpenStep, cx: &mut Context<Self>) {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
+            return;
+        }
+        // The agent's own words have usually gone out already. A fused line
+        // that only says them again is the "choppy, repetitive" failure in
+        // its other form, so it gives way to the tool calls' terse template,
+        // which at least names what is actually happening.
+        if let Some(spoken) = step.spoken_prose.as_deref()
+            && narration::adds_nothing(&line, spoken)
+        {
+            log::debug!("read_aloud: a step line only restated prose already spoken; skipping it");
+            self.speak_step_template(step, cx);
             return;
         }
         self.mark_narrated(&step);
@@ -1338,13 +1511,17 @@ impl ReadAloud {
     /// templated lines. This is exactly the shape narration had before steps
     /// existed, which is what makes "no model configured" degrade to a
     /// working feature rather than to silence.
+    ///
+    /// When the step already spoke its opening, `narrate_message_plainly` is
+    /// a no-op for it — the message is marked — so only the tool calls are
+    /// added, which is exactly what is left to say.
     fn speak_step_template(&mut self, step: OpenStep, cx: &mut Context<Self>) {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }
         // Reason before action: it is the order a person tells it in.
         if !step.prose.is_empty() {
-            self.narrate_message_plainly(step.prose, cx);
+            self.narrate_message_plainly(step.prose, narration::OPENING_SENTENCES, cx);
         }
         for call in step.tool_calls {
             self.narration.push_tool_call(call.label, call.kind, cx);
@@ -1441,7 +1618,7 @@ impl ReadAloud {
                 let awaiting_turn_end = wrap_up.awaiting_turn_end;
                 match reply
                     .log_err()
-                    .and_then(|reply| narration::clean_summary(&reply))
+                    .and_then(|reply| narration::clean_wrap_up(&reply))
                 {
                     Some(line) => {
                         wrap_up.ready = Some(line);
@@ -1459,7 +1636,7 @@ impl ReadAloud {
                         // that has already ended, from a model that has just
                         // failed to answer.
                         this.wrap_up = Some(WrapUp::exhausted());
-                        this.narrate_message_plainly(blocks, cx);
+                        this.narrate_message_plainly(blocks, narration::OPENING_SENTENCES, cx);
                     }
                     None => {}
                 }
@@ -1513,8 +1690,11 @@ impl ReadAloud {
         }
         self.step_idle_task = None;
         // A step line generated after the turn ended would be status about
-        // work the wrap-up is about to describe.
+        // work the wrap-up is about to describe. Steps that closed waiting
+        // on one go with them: their tool calls are in `turn_activity`, so
+        // the wrap-up still knows about them.
         self.step_tasks.clear();
+        let closed_waiting: Vec<OpenStep> = self.closing_steps.drain().map(|(_, s)| s).collect();
 
         if self.turn_activity.is_empty() {
             // The agent wrote and did nothing: there is no turn to wrap up,
@@ -1536,15 +1716,19 @@ impl ReadAloud {
             // the wrap-up covers it, and a status line in front of it would
             // delay the thing the listener is waiting for.
             self.step = None;
+            drop(closed_waiting);
             self.deliver_wrap_up(blocks, cx);
             return;
         }
 
-        // Nothing to say yet, so the last step is spoken in its cheap
-        // templated form rather than dropped. It keeps the audio flowing
-        // while the wrap-up generates, and `deliver_wrap_up` drops it again
-        // if it is still queued when the wrap-up lands. Silence here is the
-        // "lagged and choppy" failure this mode is trying to fix.
+        // Nothing to say yet, so the last steps are spoken in their cheap
+        // templated form rather than dropped. They keep the audio flowing
+        // while the wrap-up generates, and `deliver_wrap_up` drops them
+        // again if they are still queued when the wrap-up lands. Silence
+        // here is the "lagged and choppy" failure this mode is trying to fix.
+        for step in closed_waiting {
+            self.speak_step_template(step, cx);
+        }
         if let Some(step) = self.step.take() {
             self.speak_step_template(step, cx);
         }
@@ -1601,7 +1785,8 @@ impl ReadAloud {
                  ({reason}); logged once per reader"
             );
         }
-        let Some(opening) = Self::opening_sentences(&blocks, cx) else {
+        let Some(opening) = Self::opening_sentences(&blocks, narration::OPENING_SENTENCES, cx)
+        else {
             return;
         };
         self.narrate_summary(opening, blocks, cx);
@@ -1619,7 +1804,7 @@ impl ReadAloud {
     /// The message's first [`narration::OPENING_SENTENCES`] spoken
     /// sentences, as source text so the substitute rules apply to it once
     /// (rather than to already-substituted text).
-    fn opening_sentences(blocks: &[Entity<Markdown>], cx: &App) -> Option<String> {
+    fn opening_sentences(blocks: &[Entity<Markdown>], wanted: usize, cx: &App) -> Option<String> {
         let mut opening = String::new();
         let mut sentences = 0;
         for block in blocks {
@@ -1636,11 +1821,11 @@ impl ReadAloud {
                 }
                 opening.push_str(text);
                 sentences += 1;
-                if sentences >= narration::OPENING_SENTENCES {
+                if sentences >= wanted {
                     break;
                 }
             }
-            if sentences >= narration::OPENING_SENTENCES {
+            if sentences >= wanted {
                 break;
             }
         }
@@ -4388,9 +4573,9 @@ mod tests {
         }
     }
 
-    /// The heart of the feature: one spoken line that carries both what the
-    /// agent is doing and the reason it gave for doing it, rather than a
-    /// summary of the prose followed by a bare label.
+    /// The heart of the feature. The agent's own words go out the moment
+    /// the step is real — no model, no waiting — and the fused line that
+    /// names what it is actually doing follows once the step closes.
     #[gpui::test]
     async fn a_step_joins_the_prose_to_the_tool_calls_it_explains(cx: &mut TestAppContext) {
         let provider = FakeTts::new();
@@ -4408,14 +4593,18 @@ mod tests {
             read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
         });
         cx.run_until_parked();
-        assert!(
-            provider.spoken().is_empty(),
-            "a step is not spoken a piece at a time, got {:?}",
-            provider.spoken()
+        assert_eq!(
+            provider.spoken(),
+            vec!["I moved the poll loop onto a timer.".to_string()],
+            "the agent's own words are already written, so they are spoken \
+             at once rather than held for the fused line"
         );
-
-        let_the_step_close(cx);
-        assert_eq!(model.prompts().len(), 1, "one model call per step");
+        assert_eq!(
+            model.prompts().len(),
+            1,
+            "and the fused line is already being generated, before the quiet \
+             window rather than after it"
+        );
         let prompt = &model.prompts()[0];
         assert!(
             prompt.contains("I moved the poll loop onto a timer."),
@@ -4425,10 +4614,16 @@ mod tests {
             prompt.contains("crates/read_aloud/src/player.rs"),
             "and the tool call it then made is the *what*"
         );
+
+        let_the_step_close(cx);
+        drain_narration(&sink, cx);
         assert_eq!(
             provider.spoken(),
-            vec!["Checking the poll loop to see how it is timed.".to_string()],
-            "one line, not a summary plus a label"
+            vec![
+                "I moved the poll loop onto a timer.".to_string(),
+                "Checking the poll loop to see how it is timed.".to_string(),
+            ],
+            "closing the step costs no round trip: the line was ready"
         );
     }
 
@@ -4481,10 +4676,15 @@ mod tests {
             read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
         });
         cx.run_until_parked();
-        assert!(provider.spoken().is_empty(), "the step is still open");
+        assert_eq!(
+            provider.spoken(),
+            vec!["I moved the poll loop onto a timer.".to_string()],
+            "the opening goes out at once even with no model at all"
+        );
 
         // No model at all, so this also pins the whole fallback chain: the
-        // message's opening sentences, then the templated tool line.
+        // opening already spoken, then the templated tool line — and the
+        // opening is not said a second time.
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.finish_turn(vec![message], cx);
         });
@@ -4494,10 +4694,167 @@ mod tests {
             provider.spoken(),
             vec![
                 "I moved the poll loop onto a timer.".to_string(),
-                "It also keeps the stop latch exactly as it was.".to_string(),
                 "Reading player.".to_string(),
             ],
             "with no model the turn still says what happened, reason first"
+        );
+    }
+
+    /// The quiet window must not be on the critical path. A step's line is
+    /// generated the moment the step is real, so closing the step costs no
+    /// round trip — and a step that never goes quiet still has one ready.
+    #[gpui::test]
+    async fn the_step_line_is_generated_before_the_quiet_window(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Reading the player to see how it is timed.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+        });
+        cx.run_until_parked();
+
+        // Not one tick of the quiet window has passed.
+        assert_eq!(
+            model.prompts().len(),
+            1,
+            "the generation starts with the step, not with its close"
+        );
+        read_aloud.read_with(cx, |read_aloud, _| {
+            assert!(
+                read_aloud
+                    .step
+                    .as_ref()
+                    .is_some_and(|step| step.line.ready.is_some()),
+                "and its answer is waiting for the step to close"
+            );
+        });
+    }
+
+    /// A burst of calls arriving milliseconds apart must not spend both of a
+    /// step's generations before either has answered.
+    #[gpui::test]
+    async fn a_burst_does_not_burn_both_step_generations(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Reading through the crate.");
+        model.hold();
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+        });
+        for path in [
+            "crates/read_aloud/src/player.rs",
+            "crates/read_aloud/src/segmenter.rs",
+            "crates/read_aloud/src/sink.rs",
+            "crates/read_aloud/src/provider.rs",
+        ] {
+            let label = read_tool_label(path, cx);
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            model.prompts().len(),
+            1,
+            "a re-issue waits for the first answer, or a burst spends the \
+             whole budget describing its first call"
+        );
+
+        model.release_all();
+        cx.run_until_parked();
+        assert_eq!(
+            model.prompts().len(),
+            MAX_STEP_LINE_ISSUES,
+            "and once it answers, the calls that joined meanwhile are worth \
+             one re-issue"
+        );
+        assert!(
+            model.prompts()[1].contains("provider.rs"),
+            "which covers the whole step, got {:?}",
+            model.prompts()[1]
+        );
+    }
+
+    /// The agent's own words have already been spoken by the time the fused
+    /// line arrives, so a line that only says them again is dropped — two
+    /// spoken sentences carrying the same information is the choppiness this
+    /// task is fixing, in its other form.
+    #[gpui::test]
+    async fn a_step_line_that_only_restates_the_prose_is_dropped(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        // Near-verbatim: the model has re-said what the listener just heard.
+        let model = FakeSummaryModel::new("It moved the poll loop onto a timer.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+        });
+        let_the_step_close(cx);
+        drain_narration(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "I moved the poll loop onto a timer.".to_string(),
+                "Reading player.".to_string(),
+            ],
+            "the restatement gives way to the tool call's template, which at \
+             least names what is actually happening"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_model_that_says_it_has_nothing_to_add_is_believed(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new(NOTHING_TO_ADD);
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+        });
+        let_the_step_close(cx);
+        drain_narration(&sink, cx);
+
+        assert!(
+            !provider
+                .spoken()
+                .iter()
+                .any(|line| line.contains(NOTHING_TO_ADD)),
+            "the sentinel is an instruction, not something to say, got {:?}",
+            provider.spoken()
+        );
+        assert!(
+            provider.spoken().contains(&"Reading player.".to_string()),
+            "and what it is doing is still named, got {:?}",
+            provider.spoken()
         );
     }
 
@@ -4549,10 +4906,10 @@ mod tests {
         });
         let_the_step_close(cx);
         assert_eq!(model.prompts().len(), 1, "the step asked");
-        assert!(
-            provider.spoken().is_empty(),
-            "and is waiting on the answer, got {:?}",
-            provider.spoken()
+        assert_eq!(
+            provider.spoken(),
+            vec!["I moved the poll loop onto a timer.".to_string()],
+            "the opening is out; only the fused line is waiting on the answer"
         );
 
         let_the_step_time_out(cx);
@@ -4562,6 +4919,14 @@ mod tests {
             after_fallback.contains(&"Reading player.".to_string()),
             "past the budget the template speaks, got {after_fallback:?}"
         );
+        assert_eq!(
+            after_fallback
+                .iter()
+                .filter(|line| line.contains("poll loop"))
+                .count(),
+            1,
+            "and the opening is not repeated by the fallback, got {after_fallback:?}"
+        );
 
         model.release_all();
         cx.run_until_parked();
@@ -4570,6 +4935,50 @@ mod tests {
             provider.spoken(),
             after_fallback,
             "and the late answer is dropped rather than spoken on top"
+        );
+    }
+
+    /// A step that closes while its line is still in flight waits for it
+    /// rather than falling straight to the template. The generation was
+    /// started early enough that it is usually about to answer, and the
+    /// answer is the whole point of a step.
+    #[gpui::test]
+    async fn a_step_that_closes_mid_generation_still_gets_its_line(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Checking the player to see how it is timed.");
+        model.hold();
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message], cx);
+            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+        });
+        // The quiet window closes the step while the answer is still coming.
+        let_the_step_close(cx);
+        read_aloud.read_with(cx, |read_aloud, _| {
+            assert!(
+                read_aloud.step.is_none() && read_aloud.closing_steps.len() == 1,
+                "the step has closed and is waiting on its line"
+            );
+        });
+
+        // Still inside the two-second budget.
+        model.release_all();
+        cx.run_until_parked();
+        drain_narration(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "I moved the poll loop onto a timer.".to_string(),
+                "Checking the player to see how it is timed.".to_string(),
+            ],
+            "the line it waited for is what gets said, not the template"
         );
     }
 
@@ -4865,6 +5274,7 @@ mod tests {
         });
         cx.run_until_parked();
 
+        let spoken_before_the_stop = provider.spoken();
         read_aloud.update(cx, |read_aloud, cx| read_aloud.stop(cx));
         read_aloud.read_with(cx, |read_aloud, _| {
             assert!(
@@ -4876,8 +5286,9 @@ mod tests {
         cx.run_until_parked();
         let_the_step_time_out(cx);
         drain_narration(&sink, cx);
-        assert!(
-            provider.spoken().is_empty(),
+        assert_eq!(
+            provider.spoken(),
+            spoken_before_the_stop,
             "nothing a stop cancelled may arrive afterwards, got {:?}",
             provider.spoken()
         );
@@ -5070,12 +5481,14 @@ mod tests {
         });
         cx.run_until_parked();
 
+        let spoken_before_the_switch = provider.spoken();
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.set_narration_detail(NarrationDetail::Actions, cx);
         });
         let_the_step_close(cx);
-        assert!(
-            provider.spoken().is_empty(),
+        assert_eq!(
+            provider.spoken(),
+            spoken_before_the_switch,
             "the half-accumulated step means nothing in the mode switched into, got {:?}",
             provider.spoken()
         );
@@ -5085,10 +5498,13 @@ mod tests {
             read_aloud.narrate_tool_call(&next, NarrationKind::Read, cx);
         });
         cx.run_until_parked();
-        assert_eq!(
-            provider.spoken(),
-            vec!["Reading segmenter.".to_string()],
-            "and the detail just switched into must not start out mute"
+        drain_narration(&sink, cx);
+        assert!(
+            provider
+                .spoken()
+                .contains(&"Reading segmenter.".to_string()),
+            "and the detail just switched into must not start out mute, got {:?}",
+            provider.spoken()
         );
     }
 }
