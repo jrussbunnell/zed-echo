@@ -35,7 +35,7 @@ use gpui::{
 use markdown::Markdown;
 use narration::NarrationQueue;
 use settings::{LanguageModelSelection, RegisterSetting, Settings};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -254,10 +254,18 @@ pub struct ReadAloud {
     narration_message_pending_parse: Option<Vec<Entity<Markdown>>>,
     narration_parse_observations: Vec<Subscription>,
     summary_model: Option<Rc<dyn SummaryModel>>,
-    /// The in-flight summary generation. Dropping it cancels the call, so a
-    /// stop, a mode switch, or a new turn can never be spoken over by a
-    /// summary of what the user already moved on from.
-    summary_task: Option<Task<()>>,
+    /// Summary generations in flight, keyed by the message each one is for.
+    /// Dropping a task cancels its call, so a stop, a mode switch, or a new
+    /// turn can never be spoken over by a summary of what the user already
+    /// moved on from.
+    ///
+    /// Keyed rather than a single slot because turns interleave: a message
+    /// completes, a tool call fires, and the next message completes well
+    /// inside the one-to-three seconds a model round trip takes. A shared
+    /// slot would let the second request cancel the first, and the first is
+    /// already marked summarized, so it could never be retried — a message
+    /// silently lost to nothing but timing.
+    summary_tasks: HashMap<EntityId, Task<()>>,
     /// Messages already summarized, keyed by their first block, so exactly
     /// one model call is ever spent per completed message.
     summarized_messages: HashSet<EntityId>,
@@ -315,7 +323,7 @@ impl ReadAloud {
             narration_message_pending_parse: None,
             narration_parse_observations: Vec::new(),
             summary_model: None,
-            summary_task: None,
+            summary_tasks: HashMap::new(),
             summarized_messages: HashSet::new(),
             logged_summary_fallback: false,
             poll_task: None,
@@ -568,7 +576,7 @@ impl ReadAloud {
         // the time they ask for sound again, and a summary still being
         // generated must never arrive after a stop.
         self.narration.clear();
-        self.summary_task = None;
+        self.summary_tasks.clear();
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
         self.clear_narration_wash(cx);
@@ -612,7 +620,7 @@ impl ReadAloud {
     fn halt(&mut self, cx: &mut Context<Self>) {
         self.pending.clear();
         self.narration.clear();
-        self.summary_task = None;
+        self.summary_tasks.clear();
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
         self.clear_highlight(cx);
@@ -632,6 +640,29 @@ impl ReadAloud {
     /// With `click_to_seek` off nothing is mirrored: a disabled action gets
     /// no affordance.
     fn push_speakable_ranges(&self, cx: &mut Context<Self>) {
+        if !self.narration_wash.is_empty() {
+            // While a summary speaks, the player's utterances are of text
+            // that exists nowhere on screen, so they map to nothing the user
+            // could click. The message being washed is what they *can* click
+            // — that is the whole drill-down — so it advertises its own
+            // sentences instead. Without this, narration mode offers no
+            // hover band and no pointer cursor, and the gesture is invisible
+            // to anyone who does not already know it is there.
+            for block in self.narration_wash.clone() {
+                let ranges: Vec<Range<usize>> = if self.click_to_seek {
+                    segment(block.read(cx).parsed_markdown(), true)
+                        .into_iter()
+                        .map(|utterance| utterance.source_range)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                block.update(cx, |markdown, cx| {
+                    markdown.set_speakable_ranges(ranges, cx);
+                });
+            }
+            return;
+        }
         let Some(markdown) = self.speaking.clone() else {
             return;
         };
@@ -741,7 +772,7 @@ impl ReadAloud {
             // themselves also keeps the word highlight, which a summary
             // cannot have.
             for block in blocks {
-                self.narration.push_inline(block);
+                self.narration.push_inline(block, cx);
             }
             self.start_next_narration_if_idle(cx);
             return;
@@ -752,7 +783,8 @@ impl ReadAloud {
         };
 
         let prompt = narration::summary_prompt(&source);
-        self.summary_task = Some(cx.spawn(async move |this, cx| {
+        let message = first_block.entity_id();
+        let task = cx.spawn(async move |this, cx| {
             let completion = cx.update(|cx| model.complete(prompt, cx));
             let timeout = cx.background_executor().timer(SUMMARY_TIMEOUT);
             let reply = futures::select_biased! {
@@ -762,7 +794,7 @@ impl ReadAloud {
                 )),
             };
             this.update(cx, |this, cx| {
-                this.summary_task = None;
+                this.summary_tasks.remove(&message);
                 // One call per message: a failure falls back rather than
                 // retrying, so a broken model costs one request per
                 // message and not a stream of them.
@@ -781,7 +813,8 @@ impl ReadAloud {
                 }
             })
             .log_err();
-        }));
+        });
+        self.summary_tasks.insert(message, task);
     }
 
     /// Drops everything narration has lined up but not yet said, and any
@@ -791,7 +824,7 @@ impl ReadAloud {
     /// finish its sentence.
     pub fn cancel_narration(&mut self, cx: &mut Context<Self>) {
         self.narration.clear();
-        self.summary_task = None;
+        self.summary_tasks.clear();
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
         cx.notify();
@@ -832,7 +865,7 @@ impl ReadAloud {
         cx: &mut Context<Self>,
     ) {
         let spoken = cx.new(|cx| Markdown::new(summary.into(), None, None, cx));
-        self.narration.push_summary(spoken, blocks);
+        self.narration.push_summary(spoken, blocks, cx);
         self.start_next_narration_if_idle(cx);
     }
 
@@ -906,6 +939,9 @@ impl ReadAloud {
         if self.speaking.is_some() && !self.player.read(cx).is_idle() {
             return;
         }
+        // Starting a narration also starts the poll loop, which is what
+        // eventually drains everything queued behind it.
+        self.start_polling(cx);
         // The full-prose FIFO owns the floor while it has anything in it —
         // a message the user explicitly asked for is not interrupted by
         // status.
@@ -915,11 +951,26 @@ impl ReadAloud {
         self.start_next_narration(cx);
     }
 
-    /// Pops one narration and speaks it. Returns whether anything started,
-    /// which is what keeps the poll loop alive across the gap.
+    /// Pops one narration and speaks it. Returns whether the poll loop
+    /// should keep running — either something started, or something is
+    /// queued behind a narration that has not found its voice yet.
     fn start_next_narration(&mut self, cx: &mut Context<Self>) -> bool {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return false;
+        }
+        if self.narration.is_empty() {
+            return false;
+        }
+        // A narration only just handed to the player looks idle: its entity
+        // is still being parsed, so there are no utterances yet to be busy
+        // with. Taking the floor here would drop it before it made a sound —
+        // the same truncation the cross-entity queue exists to prevent, and
+        // easy to hit because a summary and the tool call after it land
+        // within a tick of each other.
+        if let Some(speaking) = self.speaking.clone()
+            && !Self::parse_is_current(&speaking, cx)
+        {
+            return true;
         }
         let Some(next) = self.narration.pop() else {
             return false;
@@ -928,6 +979,10 @@ impl ReadAloud {
         // is only recorded once it has taken over.
         self.switch_to(next.spoken, true, cx);
         self.narration_wash = next.wash;
+        // `switch_to` already pushed ranges, but for the spoken entity —
+        // which, with a wash set, is not the thing on screen. Re-push now
+        // that the wash is known so the drill-down has its affordance.
+        self.push_speakable_ranges(cx);
         true
     }
 
@@ -936,6 +991,10 @@ impl ReadAloud {
             block.update(cx, |markdown, cx| {
                 markdown.set_speaking_highlight(None, cx);
                 markdown.set_speaking_word_highlight(None, cx);
+                // The drill-down affordance belongs to whatever narration is
+                // speaking about right now, exactly as it belongs to the
+                // speaking message in full mode.
+                markdown.set_speakable_ranges(Vec::new(), cx);
             });
         }
     }
@@ -3104,6 +3163,64 @@ mod tests {
         );
     }
 
+    /// Regression: `summary_task` used to be a single slot, so a second
+    /// message completing while the first was still being summarized
+    /// cancelled the first — and the first was already marked summarized, so
+    /// it could never be retried. A model round trip is one to three
+    /// seconds; an agent writing a paragraph and then firing a tool inside
+    /// that window is the ordinary case, not an edge one.
+    #[gpui::test]
+    async fn a_second_message_does_not_cancel_the_first_ones_summary(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::sequence(&[
+            "It put the poll loop on a timer.",
+            "It left the stop latch alone.",
+        ]);
+        model.hold();
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let first = markdown_entity(&long_message_source(), cx);
+        let second = markdown_entity(
+            &long_message_source().replace("poll loop", "sentence segmenter"),
+            cx,
+        );
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![first], cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![second], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "setup: both messages have a call in flight"
+        );
+
+        model.release_all();
+        cx.run_until_parked();
+        for _ in 0..5 {
+            sink.finish_one();
+            cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        let spoken = provider.spoken();
+        assert!(
+            spoken.contains(&"It put the poll loop on a timer.".to_string()),
+            "the first message's summary must not be lost to the second, got {spoken:?}"
+        );
+        assert!(
+            spoken.contains(&"It left the stop latch alone.".to_string()),
+            "and the second must arrive too, got {spoken:?}"
+        );
+    }
+
     #[gpui::test]
     async fn a_failing_summary_model_falls_back_to_the_messages_opening(cx: &mut TestAppContext) {
         let provider = FakeTts::new();
@@ -3320,6 +3437,48 @@ mod tests {
             read_aloud.read_with(cx, |read_aloud, _| read_aloud.mode()),
             ReadAloudMode::Narration,
             "a drill-down is not a mode change"
+        );
+    }
+
+    /// Regression: the drill-down is the loop this whole branch is built on,
+    /// and in narration mode nothing advertised it. Speakable ranges were
+    /// mirrored onto the spoken entity — a summary phrase that exists
+    /// nowhere on screen — so the message the user can actually click got no
+    /// hover band and no pointer cursor.
+    #[gpui::test]
+    async fn the_message_a_summary_is_about_advertises_its_sentences(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("It put the poll loop on a timer.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model)));
+        });
+
+        let message = markdown_entity(&long_message_source(), cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![message.clone()], cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !message.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
+            "the washed message must advertise where the drill-down can land"
+        );
+
+        // The affordance belongs to whatever narration is speaking about
+        // right now, exactly as it belongs to the speaking message in full
+        // mode.
+        let label = markdown_entity("Read player.rs", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+        });
+        sink.finish_one();
+        cx.executor().advance_clock(POSITION_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            message.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
+            "and gives it up when narration moves on"
         );
     }
 

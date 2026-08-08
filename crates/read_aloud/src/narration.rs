@@ -111,14 +111,22 @@ pub(crate) struct Narration {
     progress: Option<Progress>,
 }
 
-/// The narration backlog: FIFO, with two rules that keep spoken length from
-/// tracking written length. A tool call whose label repeats the previous
-/// one is dropped, and once the backlog outgrows
-/// [`MAX_PENDING_NARRATIONS`] its trailing run of tool calls — including
-/// any count it produced earlier — collapses into a single count. A burst
-/// of eight reads therefore comes out as "reading seven files" followed by
-/// the one the agent is on, instead of eight sentences the listener hears
-/// long after they stopped being true.
+/// The narration backlog: FIFO, with three rules that keep spoken length
+/// from tracking written length.
+///
+/// 1. A tool call whose label repeats the previous one is dropped.
+/// 2. Past [`MAX_PENDING_NARRATIONS`], the last run of tool calls —
+///    including any count an earlier collapse produced — becomes a single
+///    count. A burst of eight reads comes out as "reading seven files"
+///    followed by the one the agent is on, not eight sentences the listener
+///    hears long after they stopped being true.
+/// 3. Whatever survives that is hard-capped at
+///    [`MAX_PENDING_NARRATIONS`], discarding the oldest. Rule 2 needs a run
+///    to work on and an interleaved message/tool stream never has one, so
+///    without this the backlog grows without limit.
+///
+/// Together these are the staleness bound: the queue can never hold more
+/// than [`MAX_PENDING_NARRATIONS`] utterances, whatever the agent does.
 #[derive(Default)]
 pub(crate) struct NarrationQueue {
     pending: Vec<Narration>,
@@ -156,30 +164,43 @@ impl NarrationQueue {
         };
         self.pending.push(narration);
         self.collapse_backlog(cx);
+        self.enforce_cap();
         true
     }
 
     /// Queues text that is on screen and speaks for itself — a message
     /// short enough that summarizing it would cost more than saying it.
-    pub fn push_inline(&mut self, text: Entity<Markdown>) {
+    pub fn push_inline(&mut self, text: Entity<Markdown>, cx: &mut App) {
         self.last_tool_label = None;
         self.pending.push(Narration {
             spoken: text,
             wash: Vec::new(),
             progress: None,
         });
+        self.collapse_backlog(cx);
+        self.enforce_cap();
     }
 
     /// Queues text that exists nowhere on screen (a model summary, or a
     /// message's opening sentences), alongside the blocks to wash so the
     /// listener can find what it is about.
-    pub fn push_summary(&mut self, spoken: Entity<Markdown>, message: Vec<Entity<Markdown>>) {
+    pub fn push_summary(
+        &mut self,
+        spoken: Entity<Markdown>,
+        message: Vec<Entity<Markdown>>,
+        cx: &mut App,
+    ) {
         self.last_tool_label = None;
         self.pending.push(Narration {
             spoken,
             wash: message,
             progress: None,
         });
+        // A burst already queued in front of this collapses rather than
+        // being discarded by the cap: a count keeps the information, a
+        // discard loses it.
+        self.collapse_backlog(cx);
+        self.enforce_cap();
     }
 
     pub fn pop(&mut self) -> Option<Narration> {
@@ -187,6 +208,10 @@ impl NarrationQueue {
             return None;
         }
         Some(self.pending.remove(0))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 
     pub fn clear(&mut self) {
@@ -199,26 +224,35 @@ impl NarrationQueue {
         self.pending.len()
     }
 
-    /// Replaces the trailing run of tool-call narrations with a single
-    /// count once the backlog outgrows the cap. Only the trailing run is
-    /// touched, so a summary already queued keeps its place in the story.
+    /// Replaces the last run of tool-call narrations with a single count
+    /// once the backlog outgrows the cap. Only one run is touched, and
+    /// nothing is reordered, so a summary already queued keeps its place in
+    /// the story.
+    ///
+    /// The run does not have to be at the end: a summary landing behind a
+    /// burst should still let the burst collapse in front of it.
     fn collapse_backlog(&mut self, cx: &mut App) {
         if self.pending.len() <= MAX_PENDING_NARRATIONS {
             return;
         }
-        let collapsible_from = self
+        let Some(run_end) = self
             .pending
+            .iter()
+            .rposition(|narration| narration.progress.is_some())
+        else {
+            return;
+        };
+        let run_start = self.pending[..run_end]
             .iter()
             .rposition(|narration| narration.progress.is_none())
             .map_or(0, |index| index + 1);
-        let tail = self.pending.split_off(collapsible_from);
-        if tail.len() < 2 {
-            self.pending.extend(tail);
+        if run_end + 1 - run_start < 2 {
             return;
         }
+        let run: Vec<Narration> = self.pending.drain(run_start..=run_end).collect();
         let mut count = 0;
         let mut kind = None;
-        for narration in &tail {
+        for narration in &run {
             let Some(progress) = narration.progress else {
                 continue;
             };
@@ -232,11 +266,30 @@ impl NarrationQueue {
         let kind = kind.unwrap_or(NarrationKind::Other);
         let phrase = kind.collapsed_phrase(count);
         let text = cx.new(|cx| Markdown::new(phrase.into(), None, None, cx));
-        self.pending.push(Narration {
-            spoken: text,
-            wash: Vec::new(),
-            progress: Some(Progress { kind, count }),
-        });
+        self.pending.insert(
+            run_start,
+            Narration {
+                spoken: text,
+                wash: Vec::new(),
+                progress: Some(Progress { kind, count }),
+            },
+        );
+    }
+
+    /// The backlog's hard bound, whatever it is made of.
+    ///
+    /// Collapsing only merges a *run* of tool calls, so a turn that
+    /// alternates short messages and tool calls — an agent narrating itself
+    /// in prose between steps — has no run longer than one and would
+    /// otherwise grow without limit: twenty queued utterances is half a
+    /// minute of speech describing things that stopped being true long
+    /// before the listener hears them. The oldest go first, because they are
+    /// the stalest; ambient status is worth nothing if it is not current.
+    fn enforce_cap(&mut self) {
+        while self.pending.len() > MAX_PENDING_NARRATIONS {
+            self.pending.remove(0);
+            log::debug!("read_aloud: dropped the oldest narration to keep status current");
+        }
     }
 }
 
@@ -371,8 +424,9 @@ fn truncate_chars(text: &str, limit: usize) -> &str {
 #[derive(Default)]
 struct FakeSummaryModelState {
     prompts: Vec<String>,
-    /// The reply to give; `None` fails the call.
-    reply: Option<String>,
+    /// Replies handed out in call order, the last one repeating. Empty
+    /// fails every call.
+    replies: Vec<String>,
     hold: bool,
     held: Vec<futures::channel::oneshot::Sender<()>>,
 }
@@ -389,9 +443,16 @@ pub struct FakeSummaryModel {
 #[cfg(any(test, feature = "test-support"))]
 impl FakeSummaryModel {
     pub fn new(reply: &str) -> Self {
+        Self::sequence(&[reply])
+    }
+
+    /// Answers each call with the next reply, repeating the last once they
+    /// run out — so a test with two messages in flight can tell their
+    /// summaries apart.
+    pub fn sequence(replies: &[&str]) -> Self {
         let model = Self::default();
         if let Ok(mut state) = model.state.lock() {
-            state.reply = Some(reply.to_string());
+            state.replies = replies.iter().map(|reply| reply.to_string()).collect();
         }
         model
     }
@@ -432,16 +493,18 @@ impl FakeSummaryModel {
 #[cfg(any(test, feature = "test-support"))]
 impl SummaryModel for FakeSummaryModel {
     fn complete(&self, prompt: String, cx: &mut App) -> Task<anyhow::Result<String>> {
-        let gate = {
+        let (gate, call) = {
             let Ok(mut state) = self.state.lock() else {
                 return Task::ready(Err(anyhow::anyhow!("FakeSummaryModel state poisoned")));
             };
             state.prompts.push(prompt);
-            state.hold.then(|| {
+            let call = state.prompts.len() - 1;
+            let gate = state.hold.then(|| {
                 let (sender, receiver) = futures::channel::oneshot::channel();
                 state.held.push(sender);
                 receiver
-            })
+            });
+            (gate, call)
         };
         let state = self.state.clone();
         cx.background_spawn(async move {
@@ -452,8 +515,9 @@ impl SummaryModel for FakeSummaryModel {
                 anyhow::bail!("FakeSummaryModel state poisoned");
             };
             state
-                .reply
-                .clone()
+                .replies
+                .get(call.min(state.replies.len().saturating_sub(1)))
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("FakeSummaryModel was asked to fail"))
         })
     }
@@ -578,6 +642,86 @@ mod tests {
         );
     }
 
+    /// Regression: collapsing only ever merged a run of tool calls, and an
+    /// agent that narrates itself in short prose between steps produces
+    /// `[message, tool, message, tool, …]` — every run is length one, so
+    /// nothing ever collapsed and the backlog grew without limit. Twenty
+    /// queued utterances is half a minute of speech about things that
+    /// stopped being true long before the listener hears them.
+    #[gpui::test]
+    async fn an_interleaved_message_and_tool_stream_stays_bounded(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let mut entities = Vec::new();
+        for index in 0..10 {
+            entities.push((
+                markdown(&format!("Message {index}."), cx),
+                markdown(&format!("Read file_{index}.rs"), cx),
+            ));
+        }
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            for (message, label) in entities {
+                queue.push_inline(message, cx);
+                queue.push_tool_call(label, NarrationKind::Read, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        assert!(
+            queue.len() <= MAX_PENDING_NARRATIONS,
+            "the backlog must stay bounded whatever it is made of, got {}",
+            queue.len()
+        );
+        // What survives is the newest: the oldest status is the stalest.
+        let newest = queue.pop().expect("something is queued");
+        let spoken = newest
+            .spoken
+            .read_with(cx, |markdown, _| markdown.source().to_string());
+        assert!(
+            spoken.contains('9') || spoken.contains('8'),
+            "the survivors must be the most recent status, got {spoken:?}"
+        );
+    }
+
+    /// A burst that a summary lands behind must still collapse: the run to
+    /// merge is not always at the very end of the queue.
+    #[gpui::test]
+    async fn a_burst_collapses_even_once_a_summary_is_queued_behind_it(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let labels: Vec<_> = (0..3)
+            .map(|index| markdown(&format!("Read file_{index}.rs"), cx))
+            .collect();
+        let summary = markdown("It moved the poll loop onto a timer.", cx);
+        let message = markdown("Long message body.", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            for label in labels {
+                queue.push_tool_call(label, NarrationKind::Read, cx);
+            }
+        });
+        cx.update(|cx| queue.push_summary(summary, vec![message], cx));
+        cx.run_until_parked();
+
+        assert_eq!(queue.len(), 2);
+        let collapsed = queue.pop().expect("the burst is still first");
+        assert_eq!(
+            collapsed
+                .spoken
+                .read_with(cx, |markdown, _| markdown.source().to_string()),
+            "Reading three files.",
+            "the run collapses in place rather than being discarded by the cap"
+        );
+        let summary = queue.pop().expect("the summary follows it");
+        assert_eq!(
+            summary
+                .spoken
+                .read_with(cx, |markdown, _| markdown.source().to_string()),
+            "It moved the poll loop onto a timer."
+        );
+    }
+
     #[gpui::test]
     async fn a_queued_summary_keeps_its_place_when_a_burst_collapses(cx: &mut TestAppContext) {
         let mut queue = NarrationQueue::default();
@@ -588,7 +732,7 @@ mod tests {
             .collect();
         cx.run_until_parked();
 
-        queue.push_summary(summary, vec![message]);
+        cx.update(|cx| queue.push_summary(summary, vec![message], cx));
         cx.update(|cx| {
             for label in labels {
                 queue.push_tool_call(label, NarrationKind::Read, cx);
