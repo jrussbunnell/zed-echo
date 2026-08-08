@@ -442,9 +442,11 @@ fn generated_phrase(label: &str, kind: NarrationKind, continuing: bool) -> Optio
 /// placeholder that arrived before the tool's input finished streaming.
 fn label_path(label: &str) -> Option<String> {
     if let Some(span) = code_span(label) {
-        let span = span.trim();
+        // Unescaped like the bare-path branch: a backslash surviving into
+        // the code span would be spoken rather than ignored.
+        let span = unescape_markdown_punctuation(span.trim());
         if !span.is_empty() && !span.contains(char::is_whitespace) {
-            return Some(span.to_string());
+            return Some(span);
         }
     }
     // No code span: either the label *is* the path (an edit title), or an
@@ -457,7 +459,7 @@ fn label_path(label: &str) -> Option<String> {
         .find(|token| is_path_like(token))
         .map(|token| {
             token
-                .trim_matches(|c: char| c == '"' || c == '\'')
+                .trim_matches(|character: char| character == '"' || character == '\'')
                 .to_string()
         })
         .filter(|token| !token.is_empty() && !token.contains('`'))
@@ -474,7 +476,9 @@ fn is_path_like(token: &str) -> bool {
             !stem.is_empty()
                 && !extension.is_empty()
                 && extension.len() <= 5
-                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
         }
         None => false,
     }
@@ -560,8 +564,12 @@ fn strip_directory_change(command: &str) -> &str {
         else {
             return rest;
         };
-        let Some(separator) = after_cd.find("&&").or_else(|| after_cd.find(';')) else {
-            return rest;
+        // The *earliest* separator ends the `cd`, not whichever kind is
+        // searched for first: `cd /x; ls && grep` runs `ls`, not `grep`.
+        let separator = match (after_cd.find("&&"), after_cd.find(';')) {
+            (Some(and), Some(semicolon)) => and.min(semicolon),
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => return rest,
         };
         let skip = if after_cd[separator..].starts_with("&&") {
             2
@@ -641,7 +649,9 @@ fn spoken_command_token(token: &str) -> Option<String> {
             if !stem.is_empty()
                 && !extension.is_empty()
                 && extension.len() <= 4
-                && extension.chars().all(|c| c.is_ascii_alphanumeric()) =>
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()) =>
         {
             stem
         }
@@ -1337,6 +1347,34 @@ mod tests {
             "this exercises the wrap-up's own bound, not the one it inherits"
         );
         assert_eq!(clean_wrap_up(&speech), None);
+    }
+
+    #[test]
+    fn a_cd_prefix_stops_at_the_earliest_separator() {
+        // `cd /x; ls && grep …` runs `ls`; searching for `&&` first would
+        // strip straight through it and announce the wrong program.
+        assert_eq!(
+            generated_phrase("cd /x; ls -la && grep foo", NarrationKind::Execute, false).as_deref(),
+            Some("Running `ls`.")
+        );
+        assert_eq!(
+            generated_phrase("cd /x && cargo test", NarrationKind::Execute, false).as_deref(),
+            Some("Running `cargo test`.")
+        );
+    }
+
+    #[test]
+    fn a_code_span_label_is_unescaped_too() {
+        // A backslash surviving into the code span would be spoken.
+        assert_eq!(
+            generated_phrase(
+                "Read file `crates/read\\_aloud/src/player.rs`",
+                NarrationKind::Read,
+                false
+            )
+            .as_deref(),
+            Some("Reading `crates/read_aloud/src/player.rs`.")
+        );
     }
 
     #[test]
