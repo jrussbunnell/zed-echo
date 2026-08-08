@@ -217,6 +217,16 @@ pub struct ReadAloud {
     /// past the cursor `stop` parked at the old end, and the player starts
     /// speaking again without being asked.
     stopped_by_user: bool,
+    /// What `stopped_by_user` was when [`Self::deactivate`] parked this
+    /// reader, so returning restores the user's own intent instead of
+    /// inheriting the navigation's. `None` means this reader is not parked
+    /// for a navigation.
+    ///
+    /// Kept as a saved value rather than a second latch so every existing
+    /// check of `stopped_by_user` — the auto-play gates, the narration
+    /// gates, the mini player's stopped form — keeps working unchanged;
+    /// while away, a navigation stop should behave exactly like a user stop.
+    stopped_before_navigation: Option<bool>,
     /// Whether the tracked entity's message had finished streaming as of the
     /// last segmentation. While it has not, an idle player is a lull (speech
     /// outran the stream), not the end — the mini player stays visible
@@ -313,6 +323,7 @@ impl ReadAloud {
             speaking: None,
             pending: Vec::new(),
             stopped_by_user: false,
+            stopped_before_navigation: None,
             message_complete: false,
             pending_completion: false,
             speaking_parse_observation: None,
@@ -563,12 +574,19 @@ impl ReadAloud {
     /// until explicit intent (a toggle, a seek, or `play_from_top`). Same
     /// path `toggle` takes while speaking.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        // `stop` emits `Finished`, and this entity's own subscription to
-        // the player already clears the highlight in response — no need
-        // to do it again here.
+        self.park(cx);
+        self.stopped_by_user = true;
+    }
+
+    /// Parks playback and drops everything queued, without saying whose
+    /// decision it was — [`Self::stop`] and [`Self::deactivate`] each add
+    /// their own latch on top.
+    fn park(&mut self, cx: &mut Context<Self>) {
+        // `player.stop` emits `Finished`, and this entity's own
+        // subscription to the player already clears the highlight in
+        // response — no need to do it again here.
         self.player.update(cx, |player, cx| player.stop(cx));
         self.poll_task = None;
-        self.stopped_by_user = true;
         // A stop is explicit intent about the whole session, not just the
         // current message: nothing waiting its turn may start either.
         self.pending.clear();
@@ -582,6 +600,40 @@ impl ReadAloud {
         self.clear_narration_wash(cx);
         // `self.speaking` is deliberately retained so the stopped-form
         // controls have a message to preview and restart.
+    }
+
+    /// Silences this reader because the user is looking at something else —
+    /// another thread, or a hidden panel. Everything a stop does, but the
+    /// latch it leaves is undone by [`Self::reactivate`] rather than
+    /// needing explicit intent: asking someone to re-arm read aloud every
+    /// time they glance at another thread is not a decision they made.
+    ///
+    /// A user's own stop, if one was already in force, is remembered and
+    /// handed back on return — leaving is not consent to start talking
+    /// again.
+    pub fn deactivate(&mut self, cx: &mut Context<Self>) {
+        if self.stopped_before_navigation.is_none() {
+            self.stopped_before_navigation = Some(self.stopped_by_user);
+        }
+        self.park(cx);
+        self.stopped_by_user = true;
+        cx.notify();
+    }
+
+    /// Undoes [`Self::deactivate`] when the user comes back, restoring
+    /// whatever their own intent had been. Nothing resumes on its own; the
+    /// next turn is simply allowed to speak again.
+    pub fn reactivate(&mut self, cx: &mut Context<Self>) {
+        let Some(before_navigation) = self.stopped_before_navigation.take() else {
+            return;
+        };
+        // Anything that explicitly started speaking while this thread sat in
+        // the background has already lifted the latch, and knows better than
+        // the value the navigation parked.
+        if self.stopped_by_user {
+            self.stopped_by_user = before_navigation;
+            cx.notify();
+        }
     }
 
     /// A completeness signal that arrives outside the enqueue path: the turn

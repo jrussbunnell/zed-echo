@@ -287,8 +287,21 @@ impl NarrationQueue {
     /// the stalest; ambient status is worth nothing if it is not current.
     fn enforce_cap(&mut self) {
         while self.pending.len() > MAX_PENDING_NARRATIONS {
-            self.pending.remove(0);
-            log::debug!("read_aloud: dropped the oldest narration to keep status current");
+            let dropped = self.pending.remove(0);
+            if dropped.progress.is_some() {
+                log::debug!("read_aloud: dropped the oldest tool narration to keep status current");
+            } else {
+                // A message narration is a summary that was paid for, or a
+                // short message's own words, and it will not be retried: the
+                // message stays marked summarized, deliberately, because
+                // exactly one model call per message is the cost rule.
+                // Losing it silently is what makes that indistinguishable
+                // from a bug, so it is said out loud.
+                log::warn!(
+                    "read_aloud: narration fell far enough behind to drop a queued message \
+                     summary; it will not be retried"
+                );
+            }
         }
     }
 }
