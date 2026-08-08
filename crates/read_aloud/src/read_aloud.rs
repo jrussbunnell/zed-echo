@@ -2027,6 +2027,32 @@ mod tests {
         assert_eq!(settings.summary_model, None);
     }
 
+    /// The wire format documented in `default.json`. A typo in the serde
+    /// rename would leave the setting silently unreadable, and narration
+    /// would sit on its default with nothing to say why.
+    #[test]
+    fn narration_detail_reads_the_names_default_json_documents() {
+        for (written, expected) in [
+            ("\"steps\"", NarrationDetail::Steps),
+            ("\"actions\"", NarrationDetail::Actions),
+        ] {
+            let content: settings::SettingsContent = serde_json::from_str(&format!(
+                "{{ \"read_aloud\": {{ \"narration_detail\": {written} }} }}"
+            ))
+            .expect("the documented name deserializes");
+            assert_eq!(
+                ReadAloudSettings::from_settings(&content).narration_detail,
+                expected
+            );
+        }
+        assert_eq!(
+            ReadAloudSettings::from_settings(&settings::SettingsContent::default())
+                .narration_detail,
+            NarrationDetail::Steps,
+            "steps is the default, because saying why is what was asked for"
+        );
+    }
+
     #[test]
     fn pill_colors_parse_valid_hex_forms() {
         let solid = resolve_pill_colors(&["#A855F7".to_string()]).expect("one color is valid");
