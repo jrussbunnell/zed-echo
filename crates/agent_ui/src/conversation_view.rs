@@ -8212,6 +8212,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression (review C1): the edit family does not use a *fixed*
+    /// placeholder. `initial_title_from_partial_path` deserializes the
+    /// model's half-streamed input — `partial_json_fixer` closes the
+    /// truncated string, so it parses — and falls back to whatever prefix of
+    /// the path has arrived. Half of `crates/read_aloud/src/segmenter.rs`
+    /// arrives as the plausible-but-wrong title `crates/read_aloud/sr`.
+    ///
+    /// Narrating on "the label moved" spoke that as "Editing sr." and then
+    /// suppressed the real path forever. The status is no help either: the
+    /// edit tools stream their input, so `InProgress` is emitted on the
+    /// first partial delta.
+    #[gpui::test]
+    async fn test_read_aloud_narration_never_speaks_a_half_streamed_edit_path(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            // Delta 1: the input has not begun to parse.
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool1", "Edit file")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::Pending),
+            ),
+            // Delta 2: the tool streams, so it is already running, and the
+            // title is built from a truncated path.
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new()
+                    .title("crates/read_aloud/sr")
+                    .status(acp::ToolCallStatus::InProgress),
+            )),
+            // Delta 3: the path finishes arriving.
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new().title("crates/read_aloud/src/segmenter.rs"),
+            )),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        ]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert_eq!(
+            spoken,
+            vec!["Editing segmenter.".to_string()],
+            "exactly one utterance, naming the real file — never the truncated \
+             path the title passed through, got {spoken:?}"
+        );
+    }
+
     /// The other half of the same rule: a call that arrives complete and
     /// never refines its title must still be narrated. Waiting for an update
     /// that is not coming would be silence.

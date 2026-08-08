@@ -684,15 +684,24 @@ pub struct ThreadView {
     /// yet" from "already said" without re-narrating a call whose label is
     /// later refined again. Cleared at the start of every turn.
     read_aloud_tool_calls: HashMap<acp::ToolCallId, ToolCallNarration>,
+    /// Decides that tool labels have stopped changing. One timer for all of
+    /// them: a burst arrives together and settles together, and the step
+    /// they belong to batches them anyway.
+    read_aloud_label_settle: Option<Task<()>>,
 }
 
-/// One tool call's narration state. See
-/// [`ThreadView::note_read_aloud_tool_call`] for why both fields are needed.
+/// How long a tool call's label must hold still before narration believes
+/// it. A title is recomputed from the model's partial tool input on every
+/// delta, so one that is still arriving keeps changing; see
+/// [`ThreadView::note_read_aloud_tool_call`] for why no other signal works.
+const TOOL_LABEL_SETTLE: Duration = Duration::from_millis(350);
+
+/// One tool call's narration state.
 struct ToolCallNarration {
-    /// The label the entry carried when it first appeared, which for a
-    /// streaming tool call is a generic placeholder ("Read file",
-    /// "Terminal"). A label that differs from this one is the real thing.
-    first_label: SharedString,
+    /// The label as of the last time this call was looked at. A label equal
+    /// to it after [`TOOL_LABEL_SETTLE`] has passed is one that has stopped
+    /// arriving.
+    last_label: SharedString,
     narrated: bool,
 }
 
@@ -1186,6 +1195,7 @@ impl ThreadView {
             read_aloud_voices: None,
             read_aloud_voices_task: None,
             read_aloud_tool_calls: HashMap::default(),
+            read_aloud_label_settle: None,
         };
 
         this.init_read_aloud(cx);
@@ -1441,6 +1451,7 @@ impl ThreadView {
                             // A new turn: status the user has not heard yet
                             // is about the turn they just moved on from.
                             this.read_aloud_tool_calls.clear();
+                            this.read_aloud_label_settle = None;
                             if let Some(read_aloud) = this.read_aloud.clone() {
                                 read_aloud
                                     .update(cx, |read_aloud, cx| read_aloud.cancel_narration(cx));
@@ -1497,6 +1508,7 @@ impl ThreadView {
                     // never left pending, still happened: narrate it now
                     // rather than going silent waiting for an update that is
                     // no longer coming.
+                    this.read_aloud_label_settle = None;
                     this.flush_read_aloud_tool_calls(cx);
                     // The turn's last assistant message can no longer grow,
                     // so narration mode may now wrap the turn up. Earlier
@@ -1519,6 +1531,7 @@ impl ThreadView {
                     // the *removed* call was narrated would silence its
                     // replacement.
                     this.read_aloud_tool_calls.clear();
+                    this.read_aloud_label_settle = None;
                 }
                 _ => {}
             },
@@ -1607,33 +1620,40 @@ impl ThreadView {
         });
     }
 
-    /// Hands one tool call to narration, once, as soon as its label is worth
-    /// saying — and never before.
+    /// Hands one tool call to narration, once, as soon as its label has
+    /// stopped changing — and never before.
     ///
-    /// A tool call reaches the thread in two stages. It appears while the
-    /// model is still streaming the tool's input, so its title is whatever
-    /// the tool can say with nothing to go on ("Read file", "Terminal"), and
-    /// the real title — the path, the command — lands in a later update
-    /// once the input parses. Narrating on appearance therefore speaks the
-    /// placeholder forever, which is exactly the "read file. running
-    /// terminal." the listener heard.
+    /// A tool call's title is recomputed and re-sent on *every* delta of the
+    /// model's streamed tool input (`Thread::handle_tool_use_event`), from
+    /// whatever prefix of that input has arrived. What it says on the way is
+    /// not a placeholder that can be recognised:
     ///
-    /// A call is ready when either of two things is true:
+    /// * `read_file` and `terminal` produce a fixed generic string ("Read
+    ///   file", or the empty string) until the input parses, then the real
+    ///   title.
+    /// * The **edit family** produces a *plausible but wrong* title:
+    ///   `initial_title_from_partial_path` deserializes the partial input
+    ///   (`partial_json_fixer::fix_json` closes the truncated string, so it
+    ///   parses cleanly) and falls back to the raw prefix when it cannot be
+    ///   resolved against the project. Half of `crates/read_aloud/src/…`
+    ///   arrives as the title `crates/read_aloud/sr`, which reads aloud as
+    ///   "Editing sr."
     ///
-    /// * its label differs from the one it appeared with — the refinement
-    ///   has landed, and this is the update that carries it; or
-    /// * its status has left `Pending` — the tool has actually started, so
-    ///   its input parsed, so its label is already final. This covers the
-    ///   call that arrives complete in one piece and never updates its
-    ///   title at all.
+    /// Nor does the status help: `edit_file_tool` and `write_file_tool`
+    /// declare `supports_input_streaming`, so `run_tool` — and with it the
+    /// `InProgress` status — fires on the *first* partial delta, long before
+    /// the path is known.
     ///
-    /// `force` is the turn-end sweep: a call that never refined *and* never
-    /// left pending still happened, and silence about it is worse than a
-    /// generic line.
+    /// There is therefore no field in the protocol that distinguishes a
+    /// half-streamed title from a finished one. The only honest signal is
+    /// that a title which is still arriving keeps changing, and a finished
+    /// one does not: a call is narrated once its label has held still for
+    /// [`TOOL_LABEL_SETTLE`]. A terminal status short-circuits the wait — no
+    /// refinement can follow a call that has finished — and the turn-end
+    /// sweep is the backstop for anything still waiting.
     ///
-    /// Dedupe is per tool-call id, not per label, so a call refined a second
-    /// time (a streaming terminal retitling itself) never produces a second
-    /// utterance.
+    /// Dedupe is per tool-call id, not per label, so a call whose label moves
+    /// again later never produces a second utterance.
     fn note_read_aloud_tool_call(
         &mut self,
         entry_index: usize,
@@ -1666,19 +1686,36 @@ impl ThreadView {
         let label = tool_call.label.clone();
         let kind = narration_kind(&tool_call.kind);
         let source = label.read(cx).source().clone();
-        let pending = matches!(tool_call.status, ToolCallStatus::Pending);
+        // Nothing further can refine a call that has already finished.
+        let settled = matches!(
+            tool_call.status,
+            ToolCallStatus::Completed | ToolCallStatus::Failed
+        );
+        let call_id = tool_call.id.clone();
 
         let state = self
             .read_aloud_tool_calls
-            .entry(tool_call.id.clone())
+            .entry(call_id)
             .or_insert_with(|| ToolCallNarration {
-                first_label: source.clone(),
+                last_label: source.clone(),
                 narrated: false,
             });
         if state.narrated {
             return;
         }
-        if !force && pending && state.first_label == source {
+        let moved = state.last_label != source;
+        state.last_label = source.clone();
+        if !force && !settled {
+            // Still moving, or not yet still for long enough. Either way the
+            // step it belongs to must not close underneath it, so the reader
+            // is told the agent is mid-action.
+            self.hold_read_aloud_step(cx);
+            if moved || self.read_aloud_label_settle.is_none() {
+                self.arm_read_aloud_label_settle(cx);
+            }
+            return;
+        }
+        if source.trim().is_empty() {
             return;
         }
         state.narrated = true;
@@ -1686,6 +1723,57 @@ impl ThreadView {
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_tool_call(&label, kind, cx);
         });
+    }
+
+    /// (Re)starts the timer that decides a tool label has stopped changing.
+    /// Dropping the previous task cancels it, so every fresh label pushes the
+    /// decision out rather than stacking timers.
+    fn arm_read_aloud_label_settle(&mut self, cx: &mut Context<Self>) {
+        self.read_aloud_label_settle = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOOL_LABEL_SETTLE).await;
+            this.update(cx, |this, cx| {
+                this.read_aloud_label_settle = None;
+                this.narrate_settled_read_aloud_tool_calls(cx);
+            })
+            .log_err();
+        }));
+    }
+
+    /// Narrates every un-narrated call whose label held still while the
+    /// settle timer ran. A call whose label moved in that window has already
+    /// re-armed the timer and waits for the next one.
+    fn narrate_settled_read_aloud_tool_calls(&mut self, cx: &mut Context<Self>) {
+        let settled: Vec<usize> = {
+            let entries = self.thread.read(cx).entries();
+            entries
+                .iter()
+                .enumerate()
+                .skip(self.read_aloud_watermark)
+                .filter_map(|(entry_index, entry)| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => self
+                        .read_aloud_tool_calls
+                        .get(&tool_call.id)
+                        .filter(|state| {
+                            !state.narrated
+                                && state.last_label == *tool_call.label.read(cx).source()
+                        })
+                        .map(|_| entry_index),
+                    _ => None,
+                })
+                .collect()
+        };
+        for entry_index in settled {
+            self.note_read_aloud_tool_call(entry_index, true, cx);
+        }
+    }
+
+    /// Tells the reader that the agent is mid-action even though nothing is
+    /// sayable yet, so the open step does not close out from under a tool
+    /// call whose label is still arriving.
+    fn hold_read_aloud_step(&mut self, cx: &mut Context<Self>) {
+        if let Some(read_aloud) = self.read_aloud.clone() {
+            read_aloud.update(cx, |read_aloud, cx| read_aloud.note_tool_call_pending(cx));
+        }
     }
 
     /// Narrates every tool call of this turn that is still waiting for a

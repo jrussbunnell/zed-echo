@@ -629,8 +629,11 @@
     // sentence or two per finished message — leaving the full text on
     // screen. Clicking a sentence still reads that message in full.
     "mode": "full",
-    // Whether narration mode speaks each tool call ("Read player.rs").
-    // Ignored in full mode.
+    // Whether narration mode speaks each tool call ("Reading player").
+    // Ignored in full mode. With "narration_detail": "steps" this also
+    // turns off the turn wrap-up, because a turn narration never saw any
+    // work in has nothing to wrap up — each message is summarized on its
+    // own instead.
     "narrate_tool_calls": true,
     // How much narration mode condenses. "steps" groups the agent's prose
     // with the tool calls it then made and speaks one line saying what it
