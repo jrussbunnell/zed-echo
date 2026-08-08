@@ -622,7 +622,20 @@
     // Whether clicking a sentence seeks playback to it. When false,
     // sentence clicks and their hover affordance are disabled; the speaker
     // buttons, mini player, and auto-play are unaffected.
-    "click_to_seek": true
+    "click_to_seek": true,
+    // What to speak. "full" reads the response verbatim with word-level
+    // highlighting. "narration" instead speaks a running status of what the
+    // agent is doing and deciding — tool calls as they happen, and a
+    // sentence or two per finished message — leaving the full text on
+    // screen. Clicking a sentence still reads that message in full.
+    "mode": "full",
+    // Whether narration mode speaks each tool call ("Read player.rs").
+    // Ignored in full mode.
+    "narrate_tool_calls": true
+    // "summary_model": { "provider": "anthropic", "model": "claude-haiku-4-5" }
+    // The model that condenses a finished message for narration mode. Unset
+    // uses the inline assistant model, and with no model at all narration
+    // falls back to speaking each message's first sentences.
   },
   // Custom styling for the agent panel's content types: "assistant_prose",
   // "thinking", "tool_output" (tool cards, terminal output labels, diff

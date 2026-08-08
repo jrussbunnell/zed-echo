@@ -622,6 +622,46 @@ pub struct ReadAloudSettingsContent {
     ///
     /// Default: true
     pub click_to_seek: Option<bool>,
+    /// What to speak: the assistant's full prose, or a running narration of
+    /// what it is doing and deciding while the full text stays on screen.
+    ///
+    /// Default: full
+    pub mode: Option<ReadAloudMode>,
+    /// Whether narration mode speaks each tool call's label ("Read
+    /// player.rs"). Has no effect in full mode.
+    ///
+    /// Default: true
+    pub narrate_tool_calls: Option<bool>,
+    /// The language model that condenses a completed assistant message into
+    /// the sentence or two narration mode speaks. Unset falls back to the
+    /// inline assistant model, and then to speaking the message's first
+    /// sentences with no model call at all.
+    pub summary_model: Option<LanguageModelSelection>,
+}
+
+/// How much of an assistant response read-aloud speaks.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadAloudMode {
+    /// Speak the response verbatim, with word-level highlighting.
+    #[default]
+    Full,
+    /// Speak a running summary of what the agent is doing and deciding,
+    /// leaving the full text on screen to read later.
+    Narration,
 }
 
 /// Custom styling for the agent panel's content types. Every field is
