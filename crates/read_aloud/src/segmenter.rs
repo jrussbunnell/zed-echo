@@ -175,7 +175,13 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
         let token_start = token.as_ptr() as usize - text.as_ptr() as usize;
         let core = token.trim_start_matches(LEADING_EDGE);
         let core_start = token_start + (token.len() - core.len());
-        let core = core.trim_end_matches(TRAILING_EDGE);
+        // A bare arrow ends in `>`, which the trailing-edge trim would eat,
+        // leaving a hyphen with nothing to say.
+        let core = if core == "->" {
+            core
+        } else {
+            core.trim_end_matches(TRAILING_EDGE)
+        };
         if core.is_empty() {
             continue;
         }
@@ -184,7 +190,7 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
         } else if core.starts_with("http://") || core.starts_with("https://") {
             Some(spoken_url_host(core))
         } else {
-            None
+            spoken_code_separators(core).map(Some)
         };
         let Some(substitute) = replacement else {
             continue;
@@ -210,6 +216,71 @@ fn push_prose_runs(runs: &mut Vec<TextRun>, source_range: Range<usize>, text: &s
             text: text[emitted_until..].to_string(),
         });
     }
+}
+
+/// How a token of *plain prose* that carries code punctuation should sound.
+///
+/// Agents write `invite_token`, `Thread::run` and `foo -> bar` in ordinary
+/// sentences constantly, without backticks — so the inline-code rules never
+/// see them, and the voice pronounces the characters: "invite underscore
+/// token". The separators a person reads as a word break become one, and
+/// nothing else about the token changes.
+///
+/// Every replacement is the same byte length as what it replaces, which is
+/// what keeps the spoken→source origin map exact: the word highlight still
+/// lands on the original token, and `flush` collapses the runs of spaces a
+/// two-character separator leaves behind.
+///
+/// `None` when the token has nothing to fix, which leaves it in the
+/// surrounding prose run untouched.
+fn spoken_code_separators(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    let word_byte = |index: usize| -> bool {
+        bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    };
+    // A lone arrow between words is a relation a person reads as a word:
+    // "rename foo to bar". Two bytes in, two bytes out.
+    if token == "->" {
+        return Some("to".to_string());
+    }
+    let mut spoken = String::with_capacity(token.len());
+    let mut index = 0;
+    let mut substituted = false;
+    while index < bytes.len() {
+        // Only *between* word characters. A leading or trailing `_` is
+        // emphasis markdown left behind, or a deliberate name, and a lone
+        // `_` is neither — none of them are word breaks.
+        let separator = match bytes.get(index) {
+            Some(b'_') if word_byte(index.wrapping_sub(1)) && word_byte(index + 1) => 1,
+            Some(b':') if bytes.get(index + 1) == Some(&b':') => 2,
+            Some(b'-') if bytes.get(index + 1) == Some(&b'>') => 2,
+            _ => 0,
+        };
+        // `::` and `->` are word breaks wherever they appear inside a token
+        // (`Thread::run`, `foo->bar`), unlike `_`.
+        if separator > 1 && !(word_byte(index.wrapping_sub(1)) && word_byte(index + separator)) {
+            spoken.push_str(token.get(index..index + separator).unwrap_or_default());
+            index += separator;
+            continue;
+        }
+        if separator > 0 {
+            for _ in 0..separator {
+                spoken.push(' ');
+            }
+            index += separator;
+            substituted = true;
+            continue;
+        }
+        let rest = token.get(index..).unwrap_or_default();
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        spoken.push(character);
+        index += character.len_utf8();
+    }
+    substituted.then_some(spoken)
 }
 
 /// How an inline code span should sound. Word-like names are spoken with
@@ -701,6 +772,84 @@ mod tests {
         let utterance = &utterances[0];
         assert_eq!(utterance.source_range_for_spoken(2..2), None);
         assert_eq!(utterance.source_range_for_spoken(0..999), None);
+    }
+
+    /// Agents write identifiers in ordinary prose without backticks all the
+    /// time, and the voice pronounced the punctuation: "invite underscore
+    /// token". The inline-code rules never saw these, because they are not
+    /// code spans.
+    #[gpui::test]
+    fn code_punctuation_in_plain_prose_is_spoken_as_word_breaks(cx: &mut TestAppContext) {
+        assert_eq!(
+            spoken("The invite_token is stale.\n", cx),
+            vec!["The invite token is stale."]
+        );
+        assert_eq!(
+            spoken("Check snake_case_name first.\n", cx),
+            vec!["Check snake case name first."]
+        );
+        assert_eq!(
+            spoken("Thread::run calls send_or_update_tool_use.\n", cx),
+            vec!["Thread run calls send or update tool use."]
+        );
+        assert_eq!(
+            spoken("The map is foo->bar now.\n", cx),
+            vec!["The map is foo bar now."]
+        );
+        assert_eq!(
+            spoken("Rename thread_view -> conversation_view.\n", cx),
+            vec!["Rename thread view to conversation view."]
+        );
+    }
+
+    /// The other half of the rule: an underscore that is not a word break
+    /// stays exactly where it is. A leading one is a deliberate name (or
+    /// emphasis markdown the parser left behind), and a lone one is neither.
+    #[gpui::test]
+    fn underscores_that_are_not_word_breaks_are_left_alone(cx: &mut TestAppContext) {
+        // Emphasis never reaches the plain-text pass at all: the parser has
+        // already consumed the delimiters.
+        assert_eq!(
+            spoken("This is _really_ important.\n", cx),
+            vec!["This is really important."]
+        );
+        assert_eq!(
+            spoken("Use _ as a placeholder.\n", cx),
+            vec!["Use _ as a placeholder."]
+        );
+        assert_eq!(
+            spoken("The _private field stays.\n", cx),
+            vec!["The _private field stays."]
+        );
+    }
+
+    /// A substituted token must still highlight the token it came from. The
+    /// replacement is the same byte length as the original for exactly this
+    /// reason.
+    #[gpui::test]
+    fn a_word_break_substitution_still_maps_back_to_source(cx: &mut TestAppContext) {
+        let source = "The invite_token is stale.\n";
+        let utterances = utterances(source, false, cx);
+        let utterance = &utterances[0];
+        assert_eq!(utterance.spoken_text, "The invite token is stale.");
+
+        let spoken_start = utterance
+            .spoken_text
+            .find("token")
+            .expect("the second half of the name is spoken");
+        let source_range = utterance
+            .source_range_for_spoken(spoken_start..spoken_start + "token".len())
+            .expect("it maps back to the source");
+        assert_eq!(&source[source_range], "token");
+
+        let spoken_start = utterance
+            .spoken_text
+            .find("invite")
+            .expect("the first half is spoken");
+        let source_range = utterance
+            .source_range_for_spoken(spoken_start..spoken_start + "invite".len())
+            .expect("it maps back to the source");
+        assert_eq!(&source[source_range], "invite");
     }
 
     #[gpui::test]
