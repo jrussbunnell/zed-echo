@@ -8498,11 +8498,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// The kinds the first round of this fix missed. An agent whose search
-    /// tool names its subject under a key narration does not recognise
-    /// (`searchTerm`, not `pattern`) issues three calls all titled "Search";
-    /// falling through to the title made calls two and three compare equal
-    /// and go silent — the reported defect, one kind over.
+    /// An agent whose search tool names its subject under a key narration
+    /// does not recognise (`searchTerm`, not `pattern`) issues three calls
+    /// all titled "Search".
+    ///
+    /// What this pins is the *degradation path*: with nothing structured to
+    /// read, narration falls back to the agent's own title and says it once.
+    /// Red if duplicate suppression is removed (three repeats of an
+    /// identical line) and red if the title is ignored in favour of the
+    /// templated phrase ("Running a search."), which would throw away the
+    /// only real information available.
+    ///
+    /// It deliberately does **not** pin the missing-templated-phrase fix —
+    /// with a non-empty title, resolution returns the title before and after
+    /// that change. `test_read_aloud_narration_speaks_a_kind_with_no_title_at_all`
+    /// is the test for that.
+    ///
+    /// The residual is real and asserted here rather than hidden: three
+    /// *different* searches come out as one utterance, because nothing in the
+    /// protocol distinguishes them. Only teaching narration this agent's
+    /// schema, or the agent sending a useful title, can fix that.
     #[gpui::test]
     async fn test_read_aloud_narration_speaks_an_unrecognised_search_schema_once(
         cx: &mut TestAppContext,

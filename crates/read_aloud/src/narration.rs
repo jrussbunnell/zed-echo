@@ -36,11 +36,19 @@ pub const SPOKEN_WORDS_PER_SECOND: f32 = 2.5;
 /// of the listener's attention.
 pub const MAX_WRAP_UP_CHARS: usize = LARGE_TURN_WORDS * CHARS_PER_SPOKEN_WORD;
 
-/// Slack between the word ceiling the prompt asks for and the character
-/// bound a reply is rejected past. English averages about six characters a
-/// word with its space; this leaves roughly a third over, so the character
-/// bound is a backstop against an essay rather than a second word counter.
-const CHARS_PER_SPOKEN_WORD: usize = 8;
+/// What one English word costs in characters, its following space included.
+/// Used to turn a character bound back into the honest thing it bounds:
+/// seconds of speech.
+const CHARS_PER_REAL_WORD: f32 = 6.0;
+
+/// Slack between the word ceiling the prompt *asks* for and the character
+/// bound a reply is *rejected* past. Deliberately loose: rejecting a reply
+/// that hit its word target but used long words costs the listener the whole
+/// wrap-up and falls back to the message's own opening, which is worse than
+/// letting it run a few seconds over. Seven leaves about a sixth over the
+/// real average, so the bound is a backstop against an essay rather than a
+/// second word counter.
+const CHARS_PER_SPOKEN_WORD: usize = 7;
 
 /// How much of a wrap-up a turn has earned.
 ///
@@ -128,9 +136,21 @@ impl WrapUpBudget {
         self.max_words * CHARS_PER_SPOKEN_WORD
     }
 
-    /// How long this budget is to sit through.
-    pub fn spoken_seconds(&self) -> f32 {
+    /// How long a reply that hits the word ceiling takes to say. What the
+    /// prompt is aiming at.
+    pub fn asked_seconds(&self) -> f32 {
         self.max_words as f32 / SPOKEN_WORDS_PER_SECOND
+    }
+
+    /// How long the *longest reply this budget will actually accept* takes to
+    /// say — the character bound, not the word ceiling, because the character
+    /// bound is what is enforced.
+    ///
+    /// This is longer than [`Self::asked_seconds`] by the slack in
+    /// [`CHARS_PER_SPOKEN_WORD`], and it is the honest number: a listener
+    /// held for the worst case is held for this long, not for the ask.
+    pub fn max_spoken_seconds(&self) -> f32 {
+        self.max_chars() as f32 / CHARS_PER_REAL_WORD / SPOKEN_WORDS_PER_SECOND
     }
 }
 
@@ -487,14 +507,22 @@ pub(crate) struct Narration {
 #[derive(Default)]
 pub(crate) struct NarrationQueue {
     pending: Vec<Narration>,
-    /// What the last tool call accepted was *about*, whether it was queued
-    /// or spoken immediately, so back-to-back duplicates are suppressed
-    /// across the boundary between the queue and the player.
+    /// What the last tool call accepted was — its kind, and what it was
+    /// *about* — whether it was queued or spoken immediately, so back-to-back
+    /// duplicates are suppressed across the boundary between the queue and
+    /// the player.
     ///
     /// The resolved target, never the title: an external agent gives every
     /// terminal command the title "Terminal", and comparing titles turned a
     /// run of different commands into one utterance followed by silence.
-    last_tool_key: Option<String>,
+    ///
+    /// The kind is part of the comparison because doing two *different
+    /// things* to files that sound alike is two things to say. Reading
+    /// `crates/a/Cargo.toml` and then editing `crates/b/Cargo.toml` both
+    /// reduce to "Cargo", and comparing the target alone silently dropped
+    /// the edit — a real action going unspoken, which is the original
+    /// complaint in miniature.
+    last_tool_key: Option<(NarrationKind, String)>,
     /// The kind of the last tool call accepted, so a run of the same kind
     /// elides its verb ("Reading player. Then segmenter.") instead of
     /// chanting it. Cleared by anything that is not a tool call, because the
@@ -517,11 +545,16 @@ impl NarrationQueue {
         let label = facts.label.read(cx).source().trim().to_string();
         let kind = facts.kind;
         let key = facts.heard_key(cx);
-        if key.trim().is_empty() || self.last_tool_key.as_deref() == Some(key.as_str()) {
+        if key.trim().is_empty()
+            || self
+                .last_tool_key
+                .as_ref()
+                .is_some_and(|(last_kind, last_key)| *last_kind == kind && *last_key == key)
+        {
             return false;
         }
         let continuing = self.last_tool_kind == Some(kind);
-        self.last_tool_key = Some(key);
+        self.last_tool_key = Some((kind, key));
         self.last_tool_kind = Some(kind);
         let narration = match generated_phrase(kind, facts.structured_target(), &label, continuing)
         {
@@ -1968,6 +2001,41 @@ mod tests {
         });
     }
 
+    /// Reducing a path to what is heard must not collapse two *different
+    /// actions* on files that sound alike. `Cargo.toml` in two crates is the
+    /// ordinary case, and dropping the edit is a real action going unspoken
+    /// — the original complaint in miniature.
+    #[gpui::test]
+    async fn doing_two_different_things_to_similar_names_is_two_things_to_say(
+        cx: &mut TestAppContext,
+    ) {
+        let mut queue = NarrationQueue::default();
+        let read = markdown("Read file", cx);
+        let edit = markdown("Edit file", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(queue.push_tool_call(
+                ToolCallFacts {
+                    path: Some("crates/a/Cargo.toml".to_string()),
+                    ..ToolCallFacts::from_label("a", read, NarrationKind::Read)
+                },
+                cx
+            ));
+            assert!(
+                queue.push_tool_call(
+                    ToolCallFacts {
+                        path: Some("crates/b/Cargo.toml".to_string()),
+                        ..ToolCallFacts::from_label("b", edit, NarrationKind::Edit)
+                    },
+                    cx
+                ),
+                "editing is not reading, however alike the two files sound"
+            );
+        });
+        assert_eq!(queue.len(), 2);
+    }
+
     /// Structured input is agent-controlled and can be enormous — Claude
     /// Code's Bash tool routinely carries multi-line heredoc scripts. Two
     /// dozen of those would be tens of kilobytes of prompt on a path with a
@@ -2188,19 +2256,30 @@ mod tests {
     /// experiences: seconds of speech at the one moment they are waiting to
     /// act on the result.
     ///
-    /// These ceilings are an argument, not a measurement, so the test exists
-    /// to make raising one deliberate. Twenty-two seconds for the largest
-    /// turn is already a long time to stand still; it is the smallest number
-    /// that fits the "three or four sentences" a big turn was asked to get.
+    /// Both numbers are checked, because they are different promises. The
+    /// *ask* is what the prompt tells the model to write; the *ceiling* is
+    /// the longest reply the code will actually accept, which is longer by
+    /// the slack in the character bound. Asserting only the ask would let the
+    /// enforced ceiling drift while the test stayed green — the guarantee
+    /// would read tighter than the code makes.
+    ///
+    /// These are an argument, not a measurement, so the test exists to make
+    /// raising one deliberate.
     #[test]
     fn no_wrap_up_tier_is_a_monologue() {
-        for (tool_calls, most_seconds) in [(1, 10.0), (5, 16.0), (20, 22.0)] {
+        for (tool_calls, asked, ceiling) in [(1, 10.0, 12.0), (5, 16.0, 19.0), (20, 22.0, 26.0)] {
             let budget = WrapUpBudget::for_turn(tool_calls, None);
             assert!(
-                budget.spoken_seconds() <= most_seconds,
-                "a {tool_calls}-call turn's wrap-up may run {:.1}s, past the {most_seconds}s \
-                 argued for it — raise this only with a reason",
-                budget.spoken_seconds()
+                budget.asked_seconds() <= asked,
+                "a {tool_calls}-call turn's wrap-up asks for {:.1}s, past the {asked}s argued \
+                 for it — raise this only with a reason",
+                budget.asked_seconds()
+            );
+            assert!(
+                budget.max_spoken_seconds() <= ceiling,
+                "and will accept a reply running {:.1}s, past the {ceiling}s ceiling — the \
+                 enforced bound must not drift away from the ask",
+                budget.max_spoken_seconds()
             );
         }
     }

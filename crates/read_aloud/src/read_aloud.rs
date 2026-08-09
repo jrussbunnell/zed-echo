@@ -1167,28 +1167,43 @@ impl ReadAloud {
     /// Failures are never the thing dropped. "The tests failed" is what a
     /// supervising listener is there for, and a turn long enough to overflow
     /// this is exactly the turn where they were not watching.
+    /// [`MAX_TURN_ACTIVITY`] bounds the whole block, not just the part of it
+    /// that succeeded. Failures win the places, but they do not get an
+    /// unlimited number of them: a turn with a hundred and fifty failed calls
+    /// would otherwise put tens of kilobytes into a prompt that has seconds
+    /// to answer — reintroducing, by another route, exactly the flooding the
+    /// per-action truncation exists to prevent, on the turn where the wrap-up
+    /// matters most. Past the cap the most recent failures are the ones kept,
+    /// because the last thing that broke is what the listener has to act on.
     fn wrap_up_activity(&self) -> Vec<String> {
         let failures = self
             .turn_activity
             .iter()
             .filter(|action| action.facts.outcome == ToolCallOutcome::Failed)
             .count();
-        let others_kept = MAX_TURN_ACTIVITY.saturating_sub(failures);
-        let mut skippable = self.turn_activity.len() - failures;
-        self.turn_activity
+        let mut failures_kept = failures.min(MAX_TURN_ACTIVITY);
+        let mut others_kept = MAX_TURN_ACTIVITY.saturating_sub(failures_kept);
+        // Walk newest first so "keep the most recent" is a simple countdown,
+        // then put the survivors back in the order they happened.
+        let mut kept: Vec<String> = self
+            .turn_activity
             .iter()
-            .filter(|action| {
-                if action.facts.outcome == ToolCallOutcome::Failed {
-                    return true;
+            .rev()
+            .filter_map(|action| {
+                let budget = if action.facts.outcome == ToolCallOutcome::Failed {
+                    &mut failures_kept
+                } else {
+                    &mut others_kept
+                };
+                if *budget == 0 {
+                    return None;
                 }
-                // Keep the *last* `others_kept` of them: the oldest status is
-                // the least useful in a sign-off.
-                let keep = skippable <= others_kept;
-                skippable -= 1;
-                keep
+                *budget -= 1;
+                Some(action.description.clone())
             })
-            .map(|action| action.description.clone())
-            .collect()
+            .collect();
+        kept.reverse();
+        kept
     }
 
     /// Takes one finished assistant message. In `actions` detail it is
@@ -5554,6 +5569,70 @@ mod tests {
         );
     }
 
+    /// Failures win the places in the turn's account, but not an unlimited
+    /// number of them. A turn where everything failed would otherwise put
+    /// tens of kilobytes into a prompt that has seconds to answer — the same
+    /// flooding the per-action truncation prevents, by another route, on the
+    /// turn where the wrap-up matters most.
+    #[gpui::test]
+    async fn an_account_of_nothing_but_failures_is_still_bounded(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Everything failed.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let calls = MAX_TURN_ACTIVITY * 6;
+        for index in 0..calls {
+            let label = markdown_entity("Terminal", cx);
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_tool_call(
+                    ToolCallFacts {
+                        command: Some(format!("cargo build --bin tool_{index}")),
+                        ..ToolCallFacts::from_label(
+                            format!("call{index}"),
+                            label,
+                            NarrationKind::Execute,
+                        )
+                    },
+                    cx,
+                );
+                read_aloud.note_tool_call_outcome(
+                    &format!("call{index}"),
+                    ToolCallOutcome::Failed,
+                    cx,
+                );
+            });
+        }
+        cx.run_until_parked();
+
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+
+        let prompt = model
+            .prompts()
+            .first()
+            .cloned()
+            .expect("the wrap-up was generated");
+        let listed = prompt.matches("ran the command").count();
+        assert!(
+            listed <= MAX_TURN_ACTIVITY,
+            "the account stays bounded however much failed, got {listed} of {calls}"
+        );
+        // Bounded, but still the *useful* end of it: the last thing that
+        // broke is what the listener has to act on.
+        assert!(
+            prompt.contains(&format!("cargo build --bin tool_{}", calls - 1)),
+            "the most recent failure must survive the bound"
+        );
+    }
+
     /// The wrap-up's length is chosen from the size of the turn: a two-call
     /// turn deserves a sentence, a long one deserves a paragraph.
     #[gpui::test]
@@ -5596,6 +5675,70 @@ mod tests {
             model.prompts()[1].contains("under fifty-five words"),
             "a turn that touched ten things has more to sign off on, got {}",
             model.prompts()[1]
+        );
+    }
+
+    /// The tier ceiling, exercised through the whole reader rather than
+    /// against the budget struct.
+    ///
+    /// The duty-cycle assertion on the worked turn cannot pin this: its fake
+    /// answers with fixed literals, so its word count is structurally
+    /// independent of the budget and would not move if the tier were raised
+    /// to a hundred and fifty words. This does move — a reply just over the
+    /// largest tier's bound must be rejected, and the moment the tier grows
+    /// enough to accept it, this goes red.
+    #[gpui::test]
+    async fn a_wrap_up_past_the_largest_tier_is_still_rejected(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        // Over the largest tier's bound, but well under the general summary
+        // bound, so this isolates the tier and not the cleaner it inherits.
+        let overlong = format!(
+            "Overlong wrapup. {}",
+            "The segmenter is rewritten and every test passes. ".repeat(8)
+        );
+        let largest = narration::WrapUpBudget::for_turn(narration::LONG_TURN_TOOL_CALLS, None);
+        assert!(overlong.chars().count() > largest.max_chars());
+        assert!(overlong.chars().count() < MAX_SUMMARY_CHARS);
+        let model = FakeSummaryModel::new(&overlong);
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        for index in 0..narration::LONG_TURN_TOOL_CALLS {
+            let label = read_tool_label(&format!("crates/read_aloud/src/file_{index}.rs"), cx);
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_tool_call(titled_call(label, NarrationKind::Read), cx);
+            });
+        }
+        cx.run_until_parked();
+        drain_narration(&sink, cx);
+
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing.clone()], chars, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.finish_turn(vec![closing], cx);
+        });
+        cx.run_until_parked();
+        drain_narration(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert!(
+            !spoken.iter().any(|line| line.contains("Overlong wrapup")),
+            "a sign-off past the tier's bound is thrown away, not spoken at the \
+             one moment the listener is waiting, got {spoken:?}"
+        );
+        assert!(
+            spoken
+                .iter()
+                .any(|line| line.contains("I moved the poll loop onto a timer.")),
+            "and the message's own opening is spoken in its place rather than \
+             silence, got {spoken:?}"
         );
     }
 
