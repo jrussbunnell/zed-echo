@@ -688,6 +688,12 @@ pub struct ThreadView {
     /// them: a burst arrives together and settles together, and the step
     /// they belong to batches them anyway.
     read_aloud_label_settle: Option<Task<()>>,
+    /// Whether the "no summary model" toast has been shown. Once per view,
+    /// like the log line it replaces — a toast per message would be worse
+    /// than the silence it is fixing.
+    read_aloud_warned_no_summary_model: bool,
+    /// Whether the "the summary model is not answering" toast has been shown.
+    read_aloud_warned_model_failing: bool,
 }
 
 /// How long a tool call's label must hold still before narration believes
@@ -713,6 +719,10 @@ struct ToolCallNarration {
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
 /// another instead of stacking, even across thread views.
 struct ReadAloudDisabled;
+
+/// Identifies the "narration has no working summary model" toast, deduped the
+/// same way.
+struct ReadAloudNarrationDegraded;
 
 /// What a `NewEntry` event brought in, as far as narration cares.
 enum NewEntryKind {
@@ -793,6 +803,33 @@ fn read_aloud_tool_call_facts(tool_call: &acp_thread::ToolCall) -> read_aloud::T
         query: field(QUERY_KEYS),
         outcome: read_aloud_tool_call_outcome(&tool_call.status),
     }
+}
+
+/// The rungs [`ThreadView::read_aloud_summary_model`] walks, as a function of
+/// the registry alone so the order is directly testable. See that method for
+/// why this order.
+fn resolve_read_aloud_summary_model(
+    registry: &LanguageModelRegistry,
+    configured: Option<&settings::LanguageModelSelection>,
+    cx: &App,
+) -> Option<ConfiguredModel> {
+    let usable = |model: Option<ConfiguredModel>| -> Option<ConfiguredModel> {
+        model.filter(|model| model.provider.is_authenticated(cx))
+    };
+    usable(configured.and_then(|selection| {
+        let provider =
+            registry.provider(&LanguageModelProviderId::from(selection.provider.0.clone()))?;
+        let model_id = LanguageModelId::from(selection.model.clone());
+        let model = provider
+            .provided_models(cx)
+            .iter()
+            .find(|model| model.id() == model_id)?
+            .clone();
+        Some(ConfiguredModel { provider, model })
+    }))
+    .or_else(|| usable(registry.thread_summary_model(cx)))
+    .or_else(|| usable(registry.commit_message_model(cx)))
+    .or_else(|| usable(registry.inline_assistant_model()))
 }
 
 fn read_aloud_tool_call_outcome(status: &ToolCallStatus) -> read_aloud::ToolCallOutcome {
@@ -1268,6 +1305,8 @@ impl ThreadView {
             read_aloud_voices_task: None,
             read_aloud_tool_calls: HashMap::default(),
             read_aloud_label_settle: None,
+            read_aloud_warned_no_summary_model: false,
+            read_aloud_warned_model_failing: false,
         };
 
         this.init_read_aloud(cx);
@@ -1389,14 +1428,40 @@ impl ThreadView {
                 // The mini player renders off this entity's state; it already
                 // notifies on every playback transition, so observing it is
                 // what keeps the controls current without another timer.
-                this.read_aloud_subscriptions
-                    .push(cx.observe(&read_aloud, |_, _, cx| cx.notify()));
+                this.watch_read_aloud(&read_aloud, cx);
                 this.read_aloud_provider = Some(provider);
                 this.read_aloud = Some(read_aloud);
                 cx.notify();
             })
             .log_err();
         }));
+    }
+
+    /// Re-renders when the reader changes, and speaks up when it reports
+    /// that narration has stopped being the product it is supposed to be.
+    fn watch_read_aloud(
+        &mut self,
+        read_aloud: &Entity<read_aloud::ReadAloud>,
+        cx: &mut Context<Self>,
+    ) {
+        self.read_aloud_subscriptions
+            .push(cx.observe(read_aloud, |_, _, cx| cx.notify()));
+        self.read_aloud_subscriptions.push(cx.subscribe(
+            read_aloud,
+            |this, _, event, cx| match event {
+                read_aloud::ReadAloudEvent::SummaryModelFailing => {
+                    if this.read_aloud_warned_model_failing {
+                        return;
+                    }
+                    this.read_aloud_warned_model_failing = true;
+                    this.notify_read_aloud_degraded(
+                        "the summary model is not answering. Check \
+                         `read_aloud.summary_model` and its provider.",
+                        cx,
+                    );
+                }
+            },
+        ));
     }
 
     /// Applies `read_aloud.*` settings changes without a restart. Voice and
@@ -1911,7 +1976,7 @@ impl ThreadView {
         // Resolved per message rather than cached: models finish loading
         // after the panel opens, and an install that had none at startup
         // would otherwise be stuck on the fallback for the whole session.
-        let summary_model = self.read_aloud_summary_model(cx);
+        let summary_model = self.require_read_aloud_summary_model(cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.set_summary_model(summary_model);
             read_aloud.narrate_message(blocks, cx);
@@ -1937,7 +2002,7 @@ impl ThreadView {
         if blocks.is_empty() {
             return;
         }
-        let summary_model = self.read_aloud_summary_model(cx);
+        let summary_model = self.require_read_aloud_summary_model(cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.set_summary_model(summary_model);
             read_aloud.finish_turn(blocks, cx);
@@ -1979,34 +2044,90 @@ impl ThreadView {
         });
     }
 
-    /// Resolves the model narration condenses messages with:
-    /// `read_aloud.summary_model` when it names one that is actually
-    /// available, else the inline assistant's model — the panel's existing
-    /// "small, fast, already configured" choice. `None` leaves narration on
-    /// its no-model fallback.
+    /// [`Self::read_aloud_summary_model`], plus the once-per-view toast that
+    /// says narration is running degraded when nothing resolves.
+    ///
+    /// Only the paths that are about to *speak* use this. Wrap-up
+    /// speculation runs on every streamed chunk and asks the same question
+    /// long before anything is said, so toasting from there could fire while
+    /// providers are still authenticating.
+    fn require_read_aloud_summary_model(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Rc<dyn read_aloud::SummaryModel>> {
+        let model = self.read_aloud_summary_model(cx);
+        if model.is_none() && !self.read_aloud_warned_no_summary_model {
+            self.read_aloud_warned_no_summary_model = true;
+            self.notify_read_aloud_degraded(
+                "no language model is available to summarize with. Set \
+                 `read_aloud.summary_model`, or configure an agent model.",
+                cx,
+            );
+        }
+        model
+    }
+
+    /// Resolves the model narration condenses messages and steps with.
+    ///
+    /// The order prefers small and fast, because every one of these calls is
+    /// on the path between the agent doing something and the listener
+    /// hearing about it, and a step line that arrives after the step is over
+    /// is worse than the templated one that arrives now:
+    ///
+    /// 1. `read_aloud.summary_model` — named for this, so it always wins.
+    /// 2. `registry.thread_summary_model` — Zed's own "condense a thread into
+    ///    a line" model, the closest existing job to this one. It resolves
+    ///    `agent.thread_summary_model`, else the default provider's *fast*
+    ///    model, else the default model, so a normal Zed install lands on a
+    ///    Haiku-class model rather than whatever the panel is chatting with.
+    /// 3. `registry.commit_message_model` — the other small-task model people
+    ///    configure. This is the rung that catches somebody driving an
+    ///    external ACP agent, who has no Zed default model at all: rung 2
+    ///    resolves to nothing for them, and this is often the only model they
+    ///    have set.
+    /// 4. `registry.inline_assistant_model` — what this used to be, kept so
+    ///    an install configured only that way is not regressed.
+    ///
+    /// A provider that has not authenticated is skipped rather than
+    /// returned: an unauthenticated model is not a model, and pretending
+    /// otherwise is what made "no model" and "broken model" look the same.
+    /// `None` leaves narration on its templated fallback.
     fn read_aloud_summary_model(&self, cx: &App) -> Option<Rc<dyn read_aloud::SummaryModel>> {
         let registry = LanguageModelRegistry::try_read_global(cx)?;
-        let configured = read_aloud::ReadAloudSettings::get_global(cx)
-            .summary_model
-            .as_ref()
-            .and_then(|selection| {
-                let provider = registry
-                    .provider(&LanguageModelProviderId::from(selection.provider.0.clone()))?;
-                let model_id = LanguageModelId::from(selection.model.clone());
-                let model = provider
-                    .provided_models(cx)
-                    .iter()
-                    .find(|model| model.id() == model_id)?
-                    .clone();
-                Some(ConfiguredModel { provider, model })
-            })
-            .or_else(|| registry.inline_assistant_model())?;
+        let configured = resolve_read_aloud_summary_model(
+            registry,
+            read_aloud::ReadAloudSettings::get_global(cx)
+                .summary_model
+                .as_ref(),
+            cx,
+        )?;
         let temperature = AgentSettings::temperature_for_model(&configured.model, cx);
         Some(Rc::new(ReadAloudSummaryModel {
             model: configured.model,
             provider: configured.provider,
             temperature,
         }))
+    }
+
+    /// Says out loud, once per view, that narration is running on its
+    /// templated fallback rather than on real summaries.
+    ///
+    /// A log line is how this survived two days of use: the feature went on
+    /// working, just as a much worse product, and nothing on screen said so.
+    fn notify_read_aloud_degraded(&self, reason: &str, cx: &mut Context<Self>) {
+        log::warn!("read_aloud: narration is degraded: {reason}");
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::unique::<ReadAloudNarrationDegraded>(),
+                    format!("Read aloud is narrating without summaries: {reason}"),
+                ),
+                cx,
+            );
+        });
     }
 
     /// Starts, stops, or restarts reading aloud.
@@ -2118,6 +2239,11 @@ impl ThreadView {
     #[cfg(test)]
     pub(super) fn subscribe_read_aloud_for_test(&mut self, cx: &mut Context<Self>) {
         self.subscribe_read_aloud(cx);
+        // The same wiring activation installs, so what the reader reports
+        // reaches the UI in tests too.
+        if let Some(read_aloud) = self.read_aloud.clone() {
+            self.watch_read_aloud(&read_aloud, cx);
+        }
     }
 
     /// Floating playback controls for read aloud, docked just above the
@@ -14230,11 +14356,166 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use serde_json::json;
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    /// A provider that has models but no credentials — the case that made
+    /// "no model" and "a model that cannot be called" look the same.
+    struct UnauthenticatedProvider(language_model::fake_provider::FakeLanguageModelProvider);
+
+    impl language_model::LanguageModelProvider for UnauthenticatedProvider {
+        fn id(&self) -> LanguageModelProviderId {
+            self.0.id()
+        }
+
+        fn name(&self) -> language_model::LanguageModelProviderName {
+            self.0.name()
+        }
+
+        fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+            self.0.default_model(cx)
+        }
+
+        fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+            self.0.default_fast_model(cx)
+        }
+
+        fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
+            self.0.provided_models(cx)
+        }
+
+        fn is_authenticated(&self, _: &App) -> bool {
+            false
+        }
+
+        fn authenticate(&self, _: &mut App) -> Task<Result<(), language_model::AuthenticateError>> {
+            Task::ready(Err(language_model::AuthenticateError::CredentialsNotFound))
+        }
+
+        fn settings_view(&self, _: &mut App) -> Option<language_model::ProviderSettingsView> {
+            None
+        }
+    }
+
+    fn fake_model(name: &str, cx: &App) -> ConfiguredModel {
+        let provider = Arc::new(
+            language_model::fake_provider::FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from(name.to_string()),
+                language_model::LanguageModelProviderName::from(name.to_string()),
+            ),
+        );
+        let model = provider
+            .provided_models(cx)
+            .first()
+            .expect("the fake provider has a model")
+            .clone();
+        ConfiguredModel { provider, model }
+    }
+
+    /// The regression this whole rung ladder exists for: the user drives an
+    /// external ACP agent, so Zed has no default model and no inline
+    /// assistant model at all — but does have a small commit-message model
+    /// sitting right there. Narration resolved nothing for two days and
+    /// spoke templated lines the whole time.
+    #[gpui::test]
+    fn summary_model_resolution_prefers_small_configured_models(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let empty = cx.new(|_| LanguageModelRegistry::default());
+            assert!(
+                resolve_read_aloud_summary_model(&empty.read(cx), None, cx).is_none(),
+                "with nothing configured there is genuinely no model"
+            );
+
+            let commit_only = cx.new(|cx| {
+                let mut registry = LanguageModelRegistry::default();
+                let commit = fake_model("commit", cx);
+                registry.set_commit_message_model(Some(commit), cx);
+                registry
+            });
+            assert_eq!(
+                resolve_read_aloud_summary_model(&commit_only.read(cx), None, cx)
+                    .map(|model| model.provider.id().0.to_string()),
+                Some("commit".to_string()),
+                "an install with no default model must still find the small \
+                 model it does have"
+            );
+
+            let both = cx.new(|cx| {
+                let mut registry = LanguageModelRegistry::default();
+                let commit = fake_model("commit", cx);
+                registry.set_commit_message_model(Some(commit), cx);
+                let summary = fake_model("summary", cx);
+                registry.set_thread_summary_model(Some(summary), cx);
+                let inline = fake_model("inline", cx);
+                registry.set_inline_assistant_model(Some(inline), cx);
+                registry
+            });
+            assert_eq!(
+                resolve_read_aloud_summary_model(&both.read(cx), None, cx).map(|model| model
+                    .provider
+                    .id()
+                    .0
+                    .to_string()),
+                Some("summary".to_string()),
+                "the thread-summary model is the closest existing job to this one"
+            );
+
+            let inline_only = cx.new(|cx| {
+                let mut registry = LanguageModelRegistry::default();
+                let inline = fake_model("inline", cx);
+                registry.set_inline_assistant_model(Some(inline), cx);
+                registry
+            });
+            assert_eq!(
+                resolve_read_aloud_summary_model(&inline_only.read(cx), None, cx)
+                    .map(|model| model.provider.id().0.to_string()),
+                Some("inline".to_string()),
+                "the rung this used to be must not regress"
+            );
+        });
+    }
+
+    /// A provider without credentials is not a model. Falling through to the
+    /// next rung is what "no *authenticated* model" means.
+    #[gpui::test]
+    fn an_unauthenticated_provider_is_skipped(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let registry = cx.new(|cx| {
+                let mut registry = LanguageModelRegistry::default();
+                let unusable = fake_model("summary", cx);
+                registry.set_thread_summary_model(
+                    Some(ConfiguredModel {
+                        provider: Arc::new(UnauthenticatedProvider(
+                            language_model::fake_provider::FakeLanguageModelProvider::new(
+                                LanguageModelProviderId::from("summary".to_string()),
+                                language_model::LanguageModelProviderName::from(
+                                    "summary".to_string(),
+                                ),
+                            ),
+                        )),
+                        model: unusable.model,
+                    }),
+                    cx,
+                );
+                let commit = fake_model("commit", cx);
+                registry.set_commit_message_model(Some(commit), cx);
+                registry
+            });
+            assert_eq!(
+                resolve_read_aloud_summary_model(&registry.read(cx), None, cx).map(|model| model
+                    .provider
+                    .id()
+                    .0
+                    .to_string()),
+                Some("commit".to_string()),
+                "a provider with no credentials must not shadow one that works"
+            );
+        });
+    }
 
     fn native_command(name: &str) -> acp::AvailableCommand {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(

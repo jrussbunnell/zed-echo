@@ -13,6 +13,7 @@ pub use narration::{
     SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallOutcome, step_prompt,
     summary_prompt, wrap_up_prompt,
 };
+
 pub use player::{Player, PlayerEvent};
 pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
 pub use segmenter::{Utterance, segment};
@@ -32,7 +33,8 @@ pub use sink::FakeSink;
 
 use futures::FutureExt as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityId, Hsla, SharedString, Subscription, Task,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Hsla, SharedString,
+    Subscription, Task,
 };
 use markdown::Markdown;
 use narration::NarrationQueue;
@@ -242,6 +244,23 @@ const MAX_WRAP_UP_ISSUES: usize = 2;
 /// A turn that does more than this has a wrap-up shaped by its prose, not
 /// by an exhaustive list of every file it touched.
 const MAX_TURN_ACTIVITY: usize = 24;
+
+/// How many model calls must fail in a row, with nothing in between that
+/// worked, before narration says out loud that the model is not answering.
+///
+/// One failure is a blip: a slow but working model losing a step's
+/// two-second race counts as one, and toasting for that would be a lie.
+/// Three in a row is roughly a whole turn in which the listener heard
+/// nothing but templated lines and had no way to know why.
+const MODEL_FAILURES_BEFORE_REPORTING: usize = 3;
+
+/// Something the owning view has to act on rather than merely re-render.
+pub enum ReadAloudEvent {
+    /// Narration has asked the summary model for a line several times
+    /// running and got nothing usable back. Emitted once per reader, so the
+    /// view can say so once rather than per message.
+    SummaryModelFailing,
+}
 
 /// One tool call, as the step that contains it remembers it.
 struct StepToolCall {
@@ -483,9 +502,19 @@ pub struct ReadAloud {
     /// Whether the "no summary model, speaking the opening instead" warning
     /// has been logged. Logged once for this reader, not once per message.
     logged_summary_fallback: bool,
+    /// Model calls that have failed since the last one that worked. An
+    /// authenticated-but-erroring model is otherwise indistinguishable from
+    /// no model at all: narration goes on speaking templated lines and
+    /// nothing says why.
+    consecutive_model_failures: usize,
+    /// Whether this reader has already reported that the model is failing.
+    /// Once per reader, like the log line.
+    reported_model_failing: bool,
     poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<ReadAloudEvent> for ReadAloud {}
 
 impl ReadAloud {
     #[cfg(any(test, feature = "test-support"))]
@@ -549,6 +578,8 @@ impl ReadAloud {
             summary_tasks: HashMap::new(),
             summarized_messages: HashSet::new(),
             logged_summary_fallback: false,
+            consecutive_model_failures: 0,
+            reported_model_failing: false,
             poll_task: None,
             _subscriptions: vec![subscription, player_observation],
         }
@@ -980,6 +1011,32 @@ impl ReadAloud {
         cx.notify();
     }
 
+    /// Records whether one model call produced something narration could
+    /// use, and reports a run of failures once.
+    ///
+    /// "Nothing usable" deliberately covers a hard error, a timeout, and a
+    /// reply too long to be a status line: from the listener's seat they are
+    /// the same event — a templated line where a real one should have been.
+    fn note_model_result(&mut self, succeeded: bool, cx: &mut Context<Self>) {
+        if succeeded {
+            self.consecutive_model_failures = 0;
+            return;
+        }
+        self.consecutive_model_failures += 1;
+        if self.reported_model_failing
+            || self.consecutive_model_failures < MODEL_FAILURES_BEFORE_REPORTING
+        {
+            return;
+        }
+        self.reported_model_failing = true;
+        log::warn!(
+            "read_aloud: {} summary model calls in a row produced nothing usable; narration is \
+             running on its templated fallback",
+            self.consecutive_model_failures
+        );
+        cx.emit(ReadAloudEvent::SummaryModelFailing);
+    }
+
     /// Installs the model narration mode condenses finished messages with.
     /// `None` (no model configured, or none available) makes every message
     /// take the opening-sentences fallback instead.
@@ -1162,16 +1219,19 @@ impl ReadAloud {
                 // One call per message: a failure falls back rather than
                 // retrying, so a broken model costs one request per
                 // message and not a stream of them.
-                match reply {
-                    Ok(reply) => match narration::clean_summary(&reply) {
-                        Some(summary) => this.narrate_summary(summary, blocks, cx),
-                        None => this.narrate_opening_sentences(
-                            blocks,
-                            "the summary model returned nothing speakable",
-                            cx,
-                        ),
-                    },
-                    Err(error) => {
+                let summary = match &reply {
+                    Ok(reply) => narration::clean_summary(reply),
+                    Err(_) => None,
+                };
+                this.note_model_result(summary.is_some(), cx);
+                match (summary, reply) {
+                    (Some(summary), _) => this.narrate_summary(summary, blocks, cx),
+                    (None, Ok(_)) => this.narrate_opening_sentences(
+                        blocks,
+                        "the summary model returned nothing speakable",
+                        cx,
+                    ),
+                    (None, Err(error)) => {
                         this.narrate_opening_sentences(blocks, &format!("{error:#}"), cx);
                     }
                 }
@@ -1530,6 +1590,7 @@ impl ReadAloud {
                 let line = reply
                     .log_err()
                     .and_then(|reply| narration::clean_step_line(&reply));
+                this.note_model_result(line.is_some(), cx);
                 this.deliver_step_line(number, line, cx);
             })
             .log_err();
@@ -1732,15 +1793,16 @@ impl ReadAloud {
                 )),
             };
             this.update(cx, |this, cx| {
+                let line = reply
+                    .log_err()
+                    .and_then(|reply| narration::clean_wrap_up(&reply));
+                this.note_model_result(line.is_some(), cx);
                 let Some(wrap_up) = this.wrap_up.as_mut() else {
                     return;
                 };
                 wrap_up.task = None;
                 let awaiting_turn_end = wrap_up.awaiting_turn_end;
-                match reply
-                    .log_err()
-                    .and_then(|reply| narration::clean_wrap_up(&reply))
-                {
+                match line {
                     Some(line) => {
                         wrap_up.ready = Some(line);
                         if awaiting_turn_end {
@@ -4344,6 +4406,95 @@ mod tests {
             model.prompts().len(),
             1,
             "repeat completion signals must not repeat the cost"
+        );
+    }
+
+    /// An authenticated model that never answers is indistinguishable from
+    /// no model at all: narration goes on speaking templated lines, and
+    /// before this the only trace was a debug log. Said once, and only after
+    /// enough failures that a single slow answer cannot trigger it.
+    #[gpui::test]
+    async fn a_model_that_keeps_failing_is_reported_once(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = narration_reader(&provider, &sink, cx);
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(FakeSummaryModel::failing())));
+        });
+        let reports = Rc::new(std::cell::Cell::new(0usize));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&read_aloud, {
+                let reports = reports.clone();
+                move |_, _: &ReadAloudEvent, _| reports.set(reports.get() + 1)
+            })
+        });
+
+        let narrate = |index: usize, cx: &mut TestAppContext| {
+            let message = markdown_entity(
+                &long_message_source().replace("poll loop", &format!("part {index}")),
+                cx,
+            );
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_message(vec![message], cx);
+            });
+            cx.run_until_parked();
+        };
+
+        for index in 0..MODEL_FAILURES_BEFORE_REPORTING - 1 {
+            narrate(index, cx);
+            assert_eq!(
+                reports.get(),
+                0,
+                "one or two failures is a blip, not a broken model"
+            );
+        }
+        narrate(MODEL_FAILURES_BEFORE_REPORTING, cx);
+        assert_eq!(reports.get(), 1, "a run of failures is said out loud");
+        for index in 0..3 {
+            narrate(MODEL_FAILURES_BEFORE_REPORTING + 1 + index, cx);
+        }
+        assert_eq!(
+            reports.get(),
+            1,
+            "and said once: a report per message is worse than the silence \
+             it is fixing"
+        );
+    }
+
+    /// The counter is about a run, not a total: a model that works again has
+    /// stopped being broken.
+    #[gpui::test]
+    async fn a_working_answer_clears_the_failure_run(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = narration_reader(&provider, &sink, cx);
+        // Fails, fails, answers, fails, fails — never three in a row.
+        let model = FakeSummaryModel::sequence(&["", "", "It moved the poll loop.", "", ""]);
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model)));
+        });
+        let reports = Rc::new(std::cell::Cell::new(0usize));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&read_aloud, {
+                let reports = reports.clone();
+                move |_, _: &ReadAloudEvent, _| reports.set(reports.get() + 1)
+            })
+        });
+
+        for index in 0..5 {
+            let message = markdown_entity(
+                &long_message_source().replace("poll loop", &format!("part {index}")),
+                cx,
+            );
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_message(vec![message], cx);
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            reports.get(),
+            0,
+            "a model that answered in between is not a model that is failing"
         );
     }
 

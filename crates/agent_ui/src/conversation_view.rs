@@ -8560,6 +8560,128 @@ pub(crate) mod tests {
         );
     }
 
+    /// A log line nobody reads is how narration ran degraded for two days:
+    /// the feature kept working, just as a much worse product, and nothing on
+    /// screen said so. It must say so — once, not per message.
+    #[gpui::test]
+    async fn test_read_aloud_narration_says_out_loud_that_it_has_no_summary_model(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let message = read_aloud_long_message();
+        connection.set_next_prompt_updates(read_aloud_narration_updates(&message));
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let workspace = thread_view.read_with(cx, |view, _| {
+            view.workspace.upgrade().expect("the view has a workspace")
+        });
+        let (_provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        // No `LanguageModelRegistry` is installed, which is exactly the state
+        // the user's machine was in: nothing resolves.
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+            "nothing is wrong until narration actually needs a model"
+        );
+
+        async fn run_turn(
+            connection: &StubAgentConnection,
+            thread: &Entity<acp_thread::AcpThread>,
+            workspace: &Entity<Workspace>,
+            sink: &read_aloud::FakeSink,
+            message: &str,
+            cx: &mut VisualTestContext,
+        ) -> Vec<workspace::notifications::NotificationId> {
+            connection.set_next_prompt_updates(read_aloud_narration_updates(message));
+            thread
+                .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            drain_read_aloud(sink, cx);
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids())
+        }
+
+        let shown = run_turn(&connection, &thread, &workspace, &sink, &message, cx).await;
+        assert_eq!(
+            shown.len(),
+            1,
+            "narration speaking templated lines because it has no model must \
+             be said out loud, not only logged"
+        );
+
+        // Dismissing is the user saying they have read it. Re-showing the
+        // same toast id would replace rather than stack, so counting alone
+        // cannot tell "once" from "every message" — only dismissal can.
+        workspace.update(cx, |workspace, cx| {
+            for id in shown {
+                workspace.dismiss_notification(&id, cx);
+            }
+        });
+
+        assert!(
+            run_turn(&connection, &thread, &workspace, &sink, &message, cx)
+                .await
+                .is_empty(),
+            "and said once: a toast per message is worse than the silence it \
+             is fixing"
+        );
+    }
+
+    /// The other degraded case, which used to look exactly like the healthy
+    /// one: a model that is configured and authenticated but never answers.
+    #[gpui::test]
+    async fn test_read_aloud_narration_says_out_loud_that_the_model_is_failing(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let workspace = thread_view.read_with(cx, |view, _| {
+            view.workspace.upgrade().expect("the view has a workspace")
+        });
+        setup_read_aloud_narration(&thread_view, true, cx).await;
+        let reader = thread_view.read_with(cx, |view, _| {
+            view.read_aloud_for_test()
+                .expect("the reader is installed")
+                .clone()
+        });
+
+        reader.update(cx, |_, cx| {
+            cx.emit(read_aloud::ReadAloudEvent::SummaryModelFailing);
+        });
+        cx.run_until_parked();
+        let shown = workspace.read_with(cx, |workspace, _| workspace.notification_ids());
+        assert_eq!(
+            shown.len(),
+            1,
+            "a model that never answers must not be indistinguishable from a \
+             working one"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            for id in shown {
+                workspace.dismiss_notification(&id, cx);
+            }
+        });
+        reader.update(cx, |_, cx| {
+            cx.emit(read_aloud::ReadAloudEvent::SummaryModelFailing);
+        });
+        cx.run_until_parked();
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+            "and said once"
+        );
+    }
+
     /// Regression: a backgrounded thread view keeps its subscriptions, its
     /// tasks, and its share of the one audio player, so it went on narrating
     /// a conversation the user had left — and in narration mode a summary
