@@ -1076,13 +1076,11 @@ impl ReadAloud {
         self.turn_tool_calls += 1;
         self.turn_started_at
             .get_or_insert_with(|| cx.background_executor().now());
-        if self.turn_activity.len() < MAX_TURN_ACTIVITY {
-            self.turn_activity.push(TurnAction {
-                id: facts.id.clone(),
-                description: description.clone(),
-                facts: facts.clone(),
-            });
-        }
+        self.remember_turn_action(TurnAction {
+            id: facts.id.clone(),
+            description: description.clone(),
+            facts: facts.clone(),
+        });
         self.invalidate_speculated_wrap_up();
         match self.detail {
             NarrationDetail::Actions => {
@@ -1144,6 +1142,53 @@ impl ReadAloud {
         };
         action.facts.outcome = outcome;
         action.description = action.facts.description(cx);
+    }
+
+    /// Adds one action to the turn's account.
+    ///
+    /// The account itself is not capped — [`MAX_TURN_ACTIVITY`] bounds what
+    /// reaches the *prompt*, not what is remembered. Capping on the way in
+    /// meant that in a forty-call turn a `cargo test` that failed at call
+    /// thirty-one was never recorded, so its later `Failed` status had
+    /// nothing to attach to and the listener was told "that's done" about a
+    /// turn whose tests were red — precisely on the long turns where the
+    /// wrap-up is their only account of what happened.
+    ///
+    /// One small struct per tool call per turn, dropped with the turn, is
+    /// strictly less than the thread already retains for the same calls.
+    fn remember_turn_action(&mut self, action: TurnAction) {
+        self.turn_activity.push(action);
+    }
+
+    /// The turn's account as the wrap-up prompt should see it: every failure,
+    /// then as many of the most recent other calls as [`MAX_TURN_ACTIVITY`]
+    /// leaves room for, in the order they happened.
+    ///
+    /// Failures are never the thing dropped. "The tests failed" is what a
+    /// supervising listener is there for, and a turn long enough to overflow
+    /// this is exactly the turn where they were not watching.
+    fn wrap_up_activity(&self) -> Vec<String> {
+        let failures = self
+            .turn_activity
+            .iter()
+            .filter(|action| action.facts.outcome == ToolCallOutcome::Failed)
+            .count();
+        let others_kept = MAX_TURN_ACTIVITY.saturating_sub(failures);
+        let mut skippable = self.turn_activity.len() - failures;
+        self.turn_activity
+            .iter()
+            .filter(|action| {
+                if action.facts.outcome == ToolCallOutcome::Failed {
+                    return true;
+                }
+                // Keep the *last* `others_kept` of them: the oldest status is
+                // the least useful in a sign-off.
+                let keep = skippable <= others_kept;
+                skippable -= 1;
+                keep
+            })
+            .map(|action| action.description.clone())
+            .collect()
     }
 
     /// Takes one finished assistant message. In `actions` detail it is
@@ -1775,19 +1820,25 @@ impl ReadAloud {
     /// were first touched. A turn that edited the same file six times has
     /// changed one file, and saying so is the difference between a wrap-up
     /// that sounds like a person and one that sounds like a log.
+    /// Bounded like the activity list, and for the same reason: the turn's
+    /// account is remembered in full but only a prompt's worth of it is sent.
     fn files_changed_this_turn(&self, cx: &App) -> Vec<String> {
         let mut files: Vec<String> = Vec::new();
         for action in &self.turn_activity {
+            if files.len() >= MAX_TURN_ACTIVITY {
+                break;
+            }
             if !matches!(
                 action.facts.kind,
                 NarrationKind::Edit | NarrationKind::Delete | NarrationKind::Move
             ) {
                 continue;
             }
-            let file = match action.facts.path.as_deref().map(str::trim) {
+            let named = match action.facts.path.as_deref().map(str::trim) {
                 Some(path) if !path.is_empty() => path.to_string(),
                 _ => action.facts.label.read(cx).source().trim().to_string(),
             };
+            let file: String = named.chars().take(narration::MAX_ACTION_CHARS).collect();
             if !file.is_empty() && !files.contains(&file) {
                 files.push(file);
             }
@@ -1809,11 +1860,7 @@ impl ReadAloud {
         };
         let message = Self::message_source(&blocks, cx);
         let issued_chars = message.len();
-        let activity: Vec<String> = self
-            .turn_activity
-            .iter()
-            .map(|action| action.description.clone())
-            .collect();
+        let activity = self.wrap_up_activity();
         let files_changed = self.files_changed_this_turn(cx);
         let budget = self.wrap_up_budget(cx);
         let prompt = narration::wrap_up_prompt(narration::WrapUpMaterial {
@@ -5437,6 +5484,76 @@ mod tests {
         assert!(!prompt.contains("Terminal"), "got {prompt}");
     }
 
+    /// A long turn is exactly the turn the listener was not watching, so it
+    /// is the worst possible one to lose a failure from. The turn's account
+    /// is capped on the way *out* to the prompt, not on the way in, and
+    /// failures are never what the cap drops.
+    #[gpui::test]
+    async fn a_failure_late_in_a_long_turn_still_reaches_the_wrap_up(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Done.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        // Well past MAX_TURN_ACTIVITY, with the failure late enough that the
+        // old arrival-order cap had already stopped recording.
+        let failing_call = MAX_TURN_ACTIVITY + 7;
+        for index in 0..MAX_TURN_ACTIVITY * 2 {
+            let label = markdown_entity("Terminal", cx);
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_tool_call(
+                    ToolCallFacts {
+                        command: Some(format!("cargo build --bin tool_{index}")),
+                        ..ToolCallFacts::from_label(
+                            format!("call{index}"),
+                            label,
+                            NarrationKind::Execute,
+                        )
+                    },
+                    cx,
+                );
+            });
+        }
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.note_tool_call_outcome(
+                &format!("call{failing_call}"),
+                ToolCallOutcome::Failed,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+
+        let prompt = model
+            .prompts()
+            .first()
+            .cloned()
+            .expect("the wrap-up was generated");
+        assert!(
+            prompt.contains(&format!("cargo build --bin tool_{failing_call}")),
+            "the call that failed must be in the account however late it came"
+        );
+        assert!(
+            prompt.contains("it FAILED"),
+            "and it must be marked as the failure it was"
+        );
+        // Still bounded: the cap moved, it did not go away.
+        let listed = prompt.matches("ran the command").count();
+        assert!(
+            listed <= MAX_TURN_ACTIVITY,
+            "the account stays bounded, got {listed} actions"
+        );
+    }
+
     /// The wrap-up's length is chosen from the size of the turn: a two-call
     /// turn deserves a sentence, a long one deserves a paragraph.
     #[gpui::test]
@@ -5476,7 +5593,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(
-            model.prompts()[1].contains("under seventy words"),
+            model.prompts()[1].contains("under fifty-five words"),
             "a turn that touched ten things has more to sign off on, got {}",
             model.prompts()[1]
         );
@@ -5503,7 +5620,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(
-            model.prompts()[0].contains("under seventy words"),
+            model.prompts()[0].contains("under fifty-five words"),
             "the listener has been waiting a long time for this, got {}",
             model.prompts()[0]
         );
@@ -6393,6 +6510,20 @@ mod tests {
             !spoken.iter().any(|line| line.contains("provider")),
             "status still queued when the wrap-up landed is dropped rather \
              than drained as a list after it, got {spoken:?}"
+        );
+        // Duty cycle, the other half of "short". Measured on this fixture at
+        // thirty-seven words — about fifteen seconds at two and a half words
+        // a second, over a turn of roughly thirty-five. The bound is set one
+        // short utterance above that, so spoken volume cannot drift upwards
+        // unnoticed the way it did when the wrap-up budget grew.
+        let words: usize = spoken
+            .iter()
+            .map(|line| line.split_whitespace().count())
+            .sum();
+        assert!(
+            words <= 45,
+            "narration must not talk over the turn it is describing, got {words} \
+             words in {spoken:?}"
         );
     }
 

@@ -27,19 +27,27 @@ pub const MAX_SUMMARY_CHARS: usize = 600;
 /// templated form beats a paragraph that arrives late.
 pub const MAX_STEP_LINE_CHARS: usize = 220;
 
+/// Roughly how fast a wrap-up is spoken. Every duty-cycle number here is
+/// this rate applied to a word count.
+pub const SPOKEN_WORDS_PER_SECOND: f32 = 2.5;
+
 /// The most a turn wrap-up may ever be, whatever its budget. Past this the
 /// model has written an essay, and the message's own opening is a better use
 /// of the listener's attention.
-pub const MAX_WRAP_UP_CHARS: usize = 480;
+pub const MAX_WRAP_UP_CHARS: usize = LARGE_TURN_WORDS * CHARS_PER_SPOKEN_WORD;
+
+/// Slack between the word ceiling the prompt asks for and the character
+/// bound a reply is rejected past. English averages about six characters a
+/// word with its space; this leaves roughly a third over, so the character
+/// bound is a backstop against an essay rather than a second word counter.
+const CHARS_PER_SPOKEN_WORD: usize = 8;
 
 /// How much of a wrap-up a turn has earned.
 ///
 /// A wrap-up that is the same length whatever happened is wrong twice over:
 /// a sign-off after two tool calls is a monologue, and the same sign-off
 /// after twenty minutes and a dozen files leaves the listener with less than
-/// they were owed. Both were reported.
-///
-/// Sizes are in spoken seconds at roughly two and a half words a second.
+/// they were owed. Both were reported, in that order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrapUpBudget {
     /// How many sentences the prompt asks for, spelled the way it is said —
@@ -48,10 +56,10 @@ pub struct WrapUpBudget {
     sentences: &'static str,
     /// The word ceiling, spelled out for the same reason.
     words: &'static str,
-    /// What a reply is rejected past, with enough slack over the word
-    /// ceiling that a model one sentence over is trimmed by the listener's
-    /// patience rather than by this.
-    pub max_chars: usize,
+    /// The same ceiling as a number. This is the honest measure of how long
+    /// the listener is asked to stand still for, so it is what the
+    /// duty-cycle test ratchets on.
+    pub max_words: usize,
 }
 
 /// Below this many tool calls the turn did essentially one thing, the step
@@ -65,6 +73,28 @@ const BRIEF_TURN: Duration = Duration::from_secs(60);
 pub(crate) const LONG_TURN_TOOL_CALLS: usize = 10;
 pub(crate) const LONG_TURN: Duration = Duration::from_secs(5 * 60);
 
+/// The three ceilings, in words.
+///
+/// These are derived from what a *spoken* sentence in this register costs —
+/// twelve to fourteen words — not from a character budget:
+///
+/// * **Small**, twenty-five words (~10 s). One or two sentences. This is the
+///   fixed value the wrap-up had before it was tiered, so nothing that was
+///   already the right size got longer.
+/// * **Medium**, forty words (~16 s). Two or three sentences.
+/// * **Large**, fifty-five words (~22 s). The brief asks for "three or four"
+///   sentences for a turn that ran twenty minutes and touched a dozen files;
+///   four sentences at thirteen words is fifty-two. This is a *ceiling*, not
+///   a target — the prompt asks for three or four sentences, which normally
+///   lands well under it.
+///
+/// Twenty-two seconds is still a long time to stand still at the one moment
+/// the listener wants to act, so the large tier is deliberately the smallest
+/// number that fits the four sentences the brief asked for.
+const SMALL_TURN_WORDS: usize = 25;
+const MEDIUM_TURN_WORDS: usize = 40;
+const LARGE_TURN_WORDS: usize = 55;
+
 impl WrapUpBudget {
     /// What a turn of this size has earned. Either measure can promote a
     /// turn on its own: a turn is big because it did a lot of things, or
@@ -73,29 +103,41 @@ impl WrapUpBudget {
     pub fn for_turn(tool_calls: usize, elapsed: Option<Duration>) -> Self {
         let long = elapsed.unwrap_or_default();
         if tool_calls >= LONG_TURN_TOOL_CALLS || long >= LONG_TURN {
-            // ~28 seconds.
             Self {
                 sentences: "Three or four sentences",
-                words: "seventy",
-                max_chars: MAX_WRAP_UP_CHARS,
+                words: "fifty-five",
+                max_words: LARGE_TURN_WORDS,
             }
         } else if tool_calls >= BRIEF_TURN_TOOL_CALLS || long >= BRIEF_TURN {
-            // ~16 seconds.
             Self {
                 sentences: "Two or three sentences",
                 words: "forty",
-                max_chars: 300,
+                max_words: MEDIUM_TURN_WORDS,
             }
         } else {
-            // ~10 seconds.
             Self {
                 sentences: "One sentence, two at the most",
                 words: "twenty-five",
-                max_chars: 200,
+                max_words: SMALL_TURN_WORDS,
             }
         }
     }
+
+    /// What a reply is rejected past.
+    pub fn max_chars(&self) -> usize {
+        self.max_words * CHARS_PER_SPOKEN_WORD
+    }
+
+    /// How long this budget is to sit through.
+    pub fn spoken_seconds(&self) -> f32 {
+        self.max_words as f32 / SPOKEN_WORDS_PER_SECOND
+    }
 }
+
+/// The most of one tool call's command or path a prompt is given. Enough to
+/// recognise `cargo test -p read_aloud --lib` or a deep path; short enough
+/// that two dozen of them cannot crowd out the message they are context for.
+pub(crate) const MAX_ACTION_CHARS: usize = 200;
 
 /// The most of a message that is worth sending to the summary model. Longer
 /// messages are truncated rather than skipped: the opening carries the
@@ -281,25 +323,59 @@ impl ToolCallFacts {
     /// spoken: the model gets more out of the real path or the real command
     /// than out of the terse form the listener hears, and the prompts forbid
     /// it from reading either out.
+    ///
+    /// Bounded, because this is agent-controlled text now that structured
+    /// input is preferred over the title. A generic title was short by
+    /// definition; a `raw_input` command is whatever the agent felt like
+    /// running, and Claude Code's Bash tool routinely carries multi-line
+    /// heredoc scripts. Two dozen of those would be tens of kilobytes of
+    /// prompt on a path that has a two-second race to lose.
     pub(crate) fn description(&self, cx: &App) -> String {
         let label = self.label.read(cx).source().trim().to_string();
-        let described = match (self.kind, self.structured_target()) {
+        let target = self
+            .structured_target()
+            .map(|target| truncate_chars(target, MAX_ACTION_CHARS));
+        let described = match (self.kind, target) {
             (NarrationKind::Execute, Some(command)) => format!("ran the command `{command}`"),
             (NarrationKind::Search, Some(query)) => format!("searched for `{query}`"),
             (kind, Some(target)) => format!("{} {target}", kind.past_verb()),
             (NarrationKind::Execute, None) if !label.is_empty() => {
-                format!("ran the command `{label}`")
+                format!(
+                    "ran the command `{}`",
+                    truncate_chars(&label, MAX_ACTION_CHARS)
+                )
             }
-            (NarrationKind::Edit, None) if !label.is_empty() => {
-                format!("edited {}", unescape_markdown_punctuation(&label))
-            }
-            (_, None) if !label.is_empty() => label,
+            (NarrationKind::Edit, None) if !label.is_empty() => format!(
+                "edited {}",
+                truncate_chars(&unescape_markdown_punctuation(&label), MAX_ACTION_CHARS)
+            ),
+            (_, None) if !label.is_empty() => truncate_chars(&label, MAX_ACTION_CHARS).to_string(),
             (kind, None) => format!("{} something", kind.past_verb()),
         };
         match self.outcome {
             ToolCallOutcome::Failed => format!("{described} — it FAILED"),
             ToolCallOutcome::Pending | ToolCallOutcome::Succeeded => described,
         }
+    }
+
+    /// What duplicate suppression compares — which is what the listener will
+    /// actually *hear*, not what the line is derived from.
+    ///
+    /// For a file, that is the spoken form of the path: `a/foo.rs` and
+    /// `b/foo.rs` are different files but both come out as "Reading foo", and
+    /// hearing "Reading foo. Then foo." tells nobody anything. The owning
+    /// view deliberately keeps watching [`Self::spoken_key`] instead, because
+    /// quiescence has to notice a streaming path growing even while its final
+    /// component stands still.
+    pub(crate) fn heard_key(&self, cx: &App) -> String {
+        let key = self.spoken_key(cx);
+        if !matches!(
+            self.kind,
+            NarrationKind::Read | NarrationKind::Edit | NarrationKind::Delete | NarrationKind::Move
+        ) {
+            return key;
+        }
+        crate::segmenter::spoken_path_component(&key).unwrap_or(key)
     }
 
     /// The structured field this kind cares about, trimmed and non-empty.
@@ -320,7 +396,23 @@ impl ToolCallFacts {
 
 /// Resolution order, per kind: structured input first, the agent's own title
 /// second, the kind's templated phrase last.
+///
+/// **Every** kind ends at the templated phrase, never at nothing. A kind that
+/// falls through to a title it does not have is the reported bug all over
+/// again in a different costume: an agent whose search tool puts its subject
+/// under a key nothing here recognises (`{"searchTerm": …}`) issues three
+/// calls all titled "Search", and comparing those titles suppresses two of
+/// them. The templated phrase is a poor line, but it is a line, and it is the
+/// same one for every such call so the *first* is still spoken.
 fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) -> ToolCallTarget {
+    // A title only speaks for itself if there is one.
+    let titled = || {
+        if label.trim().is_empty() {
+            ToolCallTarget::Unnamed
+        } else {
+            ToolCallTarget::Label
+        }
+    };
     match kind {
         NarrationKind::Execute => structured
             .and_then(spoken_command)
@@ -334,14 +426,14 @@ fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) 
         // ("Rename thread view to conversation view") and read better than
         // anything narration would generate, so the title keeps precedence
         // over nothing — only structured input displaces it.
-        NarrationKind::Delete | NarrationKind::Move | NarrationKind::Search => structured
-            .map(str::to_string)
-            .map_or(ToolCallTarget::Label, ToolCallTarget::Named),
+        NarrationKind::Delete | NarrationKind::Move | NarrationKind::Search => {
+            structured.map_or_else(titled, |target| ToolCallTarget::Named(target.to_string()))
+        }
         NarrationKind::Fetch => structured
             .map(str::to_string)
             .or_else(|| label_url(label))
-            .map_or(ToolCallTarget::Label, ToolCallTarget::Named),
-        NarrationKind::Other => ToolCallTarget::Label,
+            .map_or_else(titled, ToolCallTarget::Named),
+        NarrationKind::Other => titled(),
     }
 }
 
@@ -424,7 +516,7 @@ impl NarrationQueue {
     pub fn push_tool_call(&mut self, facts: ToolCallFacts, cx: &mut App) -> bool {
         let label = facts.label.read(cx).source().trim().to_string();
         let kind = facts.kind;
-        let key = facts.spoken_key(cx);
+        let key = facts.heard_key(cx);
         if key.trim().is_empty() || self.last_tool_key.as_deref() == Some(key.as_str()) {
             return false;
         }
@@ -1196,12 +1288,12 @@ pub fn clean_summary(reply: &str) -> Option<String> {
 /// escape, arriving at the one moment they are actually waiting.
 pub fn clean_wrap_up(reply: &str, budget: WrapUpBudget) -> Option<String> {
     let cleaned = clean_summary(reply)?;
-    if cleaned.chars().count() > budget.max_chars {
+    if cleaned.chars().count() > budget.max_chars() {
         log::warn!(
             "read_aloud: the summary model answered the wrap-up with {} characters, past the {} \
              this turn's sign-off may be; speaking the message's opening instead",
             cleaned.chars().count(),
-            budget.max_chars
+            budget.max_chars()
         );
         return None;
     }
@@ -1636,8 +1728,8 @@ mod tests {
         let budget = brief_budget();
         let sign_off = "That is the bug. The fix is a flush on shutdown, and that is your call.";
         assert_eq!(clean_wrap_up(sign_off, budget).as_deref(), Some(sign_off));
-        let speech = "word ".repeat(budget.max_chars / 4);
-        assert!(speech.chars().count() > budget.max_chars);
+        let speech = "word ".repeat(budget.max_chars() / 4);
+        assert!(speech.chars().count() > budget.max_chars());
         assert!(speech.chars().count() < MAX_SUMMARY_CHARS);
         assert!(
             clean_summary(&speech).is_some(),
@@ -1654,9 +1746,9 @@ mod tests {
         let brief = WrapUpBudget::for_turn(2, Some(Duration::from_secs(20)));
         let standard = WrapUpBudget::for_turn(5, Some(Duration::from_secs(90)));
         let full = WrapUpBudget::for_turn(14, Some(Duration::from_secs(90)));
-        assert!(brief.max_chars < standard.max_chars);
-        assert!(standard.max_chars < full.max_chars);
-        assert_eq!(full.max_chars, MAX_WRAP_UP_CHARS);
+        assert!(brief.max_chars() < standard.max_chars());
+        assert!(standard.max_chars() < full.max_chars());
+        assert_eq!(full.max_chars(), MAX_WRAP_UP_CHARS);
 
         // Either measure promotes on its own: a turn can be big because it
         // did a lot, or because one thing in it took a long time.
@@ -1673,8 +1765,8 @@ mod tests {
 
         // A reply that fits a large turn is rejected for a small one.
         let paragraph = "word ".repeat(50);
-        assert!(paragraph.chars().count() > brief.max_chars);
-        assert!(paragraph.chars().count() < full.max_chars);
+        assert!(paragraph.chars().count() > brief.max_chars());
+        assert!(paragraph.chars().count() < full.max_chars());
         assert!(clean_wrap_up(&paragraph, full).is_some());
         assert_eq!(clean_wrap_up(&paragraph, brief), None);
     }
@@ -1731,6 +1823,60 @@ mod tests {
                 "{kind:?} with structured {structured:?} and title {label:?}"
             );
         }
+    }
+
+    /// The same defect one kind over. An agent whose search tool puts its
+    /// subject under a key nothing here recognises issues three calls all
+    /// titled "Search"; before, those fell through to the title, compared
+    /// equal, and two of the three went silent. Every kind now ends at a
+    /// templated phrase rather than at nothing, so the first is always said.
+    #[test]
+    fn every_kind_has_something_to_say_when_nothing_resolves() {
+        for kind in [
+            NarrationKind::Read,
+            NarrationKind::Edit,
+            NarrationKind::Delete,
+            NarrationKind::Move,
+            NarrationKind::Search,
+            NarrationKind::Execute,
+            NarrationKind::Fetch,
+            NarrationKind::Other,
+        ] {
+            // No structured input and no title at all: the shape an
+            // unrecognised tool schema plus a placeholder produces.
+            assert_eq!(
+                generated_phrase(kind, None, "", false).as_deref(),
+                Some(kind.unnamed_phrase()),
+                "{kind:?} must still have a line when nothing resolves"
+            );
+        }
+    }
+
+    /// And with a generic title present, the title is still what is spoken —
+    /// the templated phrase is the floor, not a replacement.
+    #[gpui::test]
+    async fn a_generic_title_is_spoken_once_and_then_suppressed(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let first = markdown("Search", cx);
+        let second = markdown("Search", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                queue.push_tool_call(
+                    ToolCallFacts::from_label("a", first, NarrationKind::Search),
+                    cx
+                ),
+                "the first call is always said, whatever its title"
+            );
+            assert!(
+                !queue.push_tool_call(
+                    ToolCallFacts::from_label("b", second, NarrationKind::Search),
+                    cx
+                ),
+                "and an indistinguishable second one adds nothing"
+            );
+        });
     }
 
     /// The bug the user hit: an external agent gives every shell command the
@@ -1792,6 +1938,65 @@ mod tests {
             );
         });
         assert_eq!(queue.len(), 1);
+    }
+
+    /// Two different files with the same name sound identical, so saying
+    /// both is saying the same thing twice.
+    #[gpui::test]
+    async fn two_files_that_sound_alike_are_only_said_once(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let first = markdown("Read file", cx);
+        let second = markdown("Read file", cx);
+        let third = markdown("Read file", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let facts = |id: &str, label, path: &str| ToolCallFacts {
+                path: Some(path.to_string()),
+                ..ToolCallFacts::from_label(id, label, NarrationKind::Read)
+            };
+            assert!(queue.push_tool_call(facts("a", first, "crates/a/foo.rs"), cx));
+            assert!(
+                !queue.push_tool_call(facts("b", second, "crates/b/foo.rs"), cx),
+                "\"Reading foo. Then foo.\" tells the listener nothing the \
+                 first line did not"
+            );
+            assert!(
+                queue.push_tool_call(facts("c", third, "crates/a/bar.rs"), cx),
+                "a genuinely different-sounding file is still said"
+            );
+        });
+    }
+
+    /// Structured input is agent-controlled and can be enormous — Claude
+    /// Code's Bash tool routinely carries multi-line heredoc scripts. Two
+    /// dozen of those would be tens of kilobytes of prompt on a path with a
+    /// two-second race to lose.
+    #[gpui::test]
+    async fn an_enormous_command_is_bounded_before_it_reaches_a_prompt(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            command: Some(format!(
+                "cat <<'EOF' > out.txt\n{}\nEOF",
+                "x".repeat(20_000)
+            )),
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            let description = facts.description(cx);
+            assert!(
+                description.chars().count() <= MAX_ACTION_CHARS + 40,
+                "one action must not crowd out the message it is context for, \
+                 got {} characters",
+                description.chars().count()
+            );
+            assert!(
+                description.contains("cat"),
+                "and the front of it, which is the part that identifies the \
+                 command, survives"
+            );
+        });
     }
 
     /// A prompt sees the real command and the real path — and, above all,
@@ -1979,6 +2184,27 @@ mod tests {
         assert!(prompt.contains("crates/read_aloud/src/segmenter.rs"));
     }
 
+    /// Duty cycle, as a ratchet. Expressed in the unit the listener actually
+    /// experiences: seconds of speech at the one moment they are waiting to
+    /// act on the result.
+    ///
+    /// These ceilings are an argument, not a measurement, so the test exists
+    /// to make raising one deliberate. Twenty-two seconds for the largest
+    /// turn is already a long time to stand still; it is the smallest number
+    /// that fits the "three or four sentences" a big turn was asked to get.
+    #[test]
+    fn no_wrap_up_tier_is_a_monologue() {
+        for (tool_calls, most_seconds) in [(1, 10.0), (5, 16.0), (20, 22.0)] {
+            let budget = WrapUpBudget::for_turn(tool_calls, None);
+            assert!(
+                budget.spoken_seconds() <= most_seconds,
+                "a {tool_calls}-call turn's wrap-up may run {:.1}s, past the {most_seconds}s \
+                 argued for it — raise this only with a reason",
+                budget.spoken_seconds()
+            );
+        }
+    }
+
     /// The prompt asks for the length this turn has earned, not a constant.
     #[test]
     fn the_wrap_up_prompt_asks_for_the_length_the_turn_earned() {
@@ -1994,7 +2220,7 @@ mod tests {
         };
         assert!(of(1).contains("under twenty-five words"));
         assert!(of(5).contains("under forty words"));
-        assert!(of(20).contains("under seventy words"));
+        assert!(of(20).contains("under fifty-five words"));
     }
 
     /// Prompts written for a fake model can afford to be vague. A small fast

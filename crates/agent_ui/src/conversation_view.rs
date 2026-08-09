@@ -8498,6 +8498,89 @@ pub(crate) mod tests {
         );
     }
 
+    /// The kinds the first round of this fix missed. An agent whose search
+    /// tool names its subject under a key narration does not recognise
+    /// (`searchTerm`, not `pattern`) issues three calls all titled "Search";
+    /// falling through to the title made calls two and three compare equal
+    /// and go silent — the reported defect, one kind over.
+    #[gpui::test]
+    async fn test_read_aloud_narration_speaks_an_unrecognised_search_schema_once(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(
+            (0..3)
+                .map(|index| {
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(format!("tool{index}"), "Search")
+                            .kind(acp::ToolKind::Search)
+                            .status(acp::ToolCallStatus::InProgress)
+                            .raw_input(json!({ "searchTerm": format!("thing{index}") })),
+                    )
+                })
+                .collect(),
+        );
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        // Three indistinguishable calls are genuinely one thing to say, but
+        // that one thing must be said.
+        assert_eq!(
+            provider.spoken(),
+            vec!["Search".to_string()],
+            "an unrecognised schema must degrade to the title, not to silence, \
+             got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// The floor under that: a kind with no structured input narration reads
+    /// *and* no title at all must still say something.
+    #[gpui::test]
+    async fn test_read_aloud_narration_speaks_a_kind_with_no_title_at_all(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool1", "")
+                .kind(acp::ToolKind::Fetch)
+                .status(acp::ToolCallStatus::InProgress),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec!["Fetching a page.".to_string()],
+            "silence is the one thing narration must never be, got {:?}",
+            provider.spoken()
+        );
+    }
+
     /// Structured input must not displace a Zed-native title that already
     /// reads well. Zed's own read tool titles itself `Read file \`path\`` and
     /// carries the same path in `raw_input`; both must land on one utterance

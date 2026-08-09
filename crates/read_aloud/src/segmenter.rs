@@ -398,7 +398,7 @@ fn split_camel_case(run: &str) -> Vec<&str> {
 /// A path speaks its final component's name — "player" for
 /// `crates/read_aloud/src/player.rs:250` — with the extension and any
 /// `:line` suffix dropped.
-fn spoken_path_component(path: &str) -> Option<String> {
+pub(crate) fn spoken_path_component(path: &str) -> Option<String> {
     let component = path
         .split(['/', '\\'])
         .map(str::trim)
@@ -1030,10 +1030,7 @@ mod tests {
         // filter must run on the whole token before the split, or the split
         // would turn it into short speakable-looking pieces.
         assert_eq!(
-            spoken(
-                "See `e5b3a1c94d2f70e6a8b1c2d3e4f5061728394a5b` too.\n",
-                cx
-            ),
+            spoken("See `e5b3a1c94d2f70e6a8b1c2d3e4f5061728394a5b` too.\n", cx),
             vec!["See too."]
         );
     }
