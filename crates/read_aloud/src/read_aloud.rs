@@ -10,8 +10,8 @@ pub use inworld::{
 };
 pub use narration::{
     MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, MAX_WRAP_UP_CHARS, NOTHING_TO_ADD, NarrationKind,
-    SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallOutcome, step_prompt,
-    summary_prompt, wrap_up_prompt,
+    SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallOutcome, WrapUpBudget,
+    WrapUpMaterial, step_prompt, summary_prompt, wrap_up_prompt,
 };
 
 pub use player::{Player, PlayerEvent};
@@ -1268,6 +1268,8 @@ impl ReadAloud {
             && self.step_idle_task.is_none()
             && self.step_tasks.is_empty()
             && self.turn_activity.is_empty()
+            && self.turn_tool_calls == 0
+            && self.turn_started_at.is_none()
             && self.wrap_up.is_none()
     }
 
@@ -1758,6 +1760,41 @@ impl ReadAloud {
         self.issue_wrap_up(blocks, true, cx);
     }
 
+    /// How much of a wrap-up this turn has earned, from how much it did and
+    /// how long the listener has been waiting.
+    fn wrap_up_budget(&self, cx: &App) -> WrapUpBudget {
+        let elapsed = self.turn_started_at.map(|started| {
+            cx.background_executor()
+                .now()
+                .saturating_duration_since(started)
+        });
+        WrapUpBudget::for_turn(self.turn_tool_calls, elapsed)
+    }
+
+    /// The files this turn changed, named once each and in the order they
+    /// were first touched. A turn that edited the same file six times has
+    /// changed one file, and saying so is the difference between a wrap-up
+    /// that sounds like a person and one that sounds like a log.
+    fn files_changed_this_turn(&self, cx: &App) -> Vec<String> {
+        let mut files: Vec<String> = Vec::new();
+        for action in &self.turn_activity {
+            if !matches!(
+                action.facts.kind,
+                NarrationKind::Edit | NarrationKind::Delete | NarrationKind::Move
+            ) {
+                continue;
+            }
+            let file = match action.facts.path.as_deref().map(str::trim) {
+                Some(path) if !path.is_empty() => path.to_string(),
+                _ => action.facts.label.read(cx).source().trim().to_string(),
+            };
+            if !file.is_empty() && !files.contains(&file) {
+                files.push(file);
+            }
+        }
+        files
+    }
+
     fn issue_wrap_up(
         &mut self,
         blocks: Vec<Entity<Markdown>>,
@@ -1777,12 +1814,16 @@ impl ReadAloud {
             .iter()
             .map(|action| action.description.clone())
             .collect();
-        let prompt = narration::wrap_up_prompt(
-            &message,
-            &activity,
-            &self.narration.recent_lines(),
+        let files_changed = self.files_changed_this_turn(cx);
+        let budget = self.wrap_up_budget(cx);
+        let prompt = narration::wrap_up_prompt(narration::WrapUpMaterial {
+            message: &message,
             still_streaming,
-        );
+            activity: &activity,
+            files_changed: &files_changed,
+            recent: &self.narration.recent_lines(),
+            budget,
+        });
         let task = cx.spawn(async move |this, cx| {
             let completion = cx.update(|cx| model.complete(prompt, cx));
             let timeout = cx.background_executor().timer(WRAP_UP_TIMEOUT);
@@ -1795,7 +1836,7 @@ impl ReadAloud {
             this.update(cx, |this, cx| {
                 let line = reply
                     .log_err()
-                    .and_then(|reply| narration::clean_wrap_up(&reply));
+                    .and_then(|reply| narration::clean_wrap_up(&reply, budget));
                 this.note_model_result(line.is_some(), cx);
                 let Some(wrap_up) = this.wrap_up.as_mut() else {
                     return;
@@ -5328,6 +5369,144 @@ mod tests {
         });
         cx.run_until_parked();
         markdown_entity(&long_message_source(), cx)
+    }
+
+    /// The user's actual complaint about wrap-ups: "better metadata …
+    /// onto what we're receiving back". The wrap-up saw the closing
+    /// paragraph and a list of tool labels, and nothing guaranteed that a
+    /// failed command was mentioned at all.
+    #[gpui::test]
+    async fn the_wrap_up_sees_the_commands_the_files_and_the_failure(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("The tests fail on the segmenter.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        // An external agent's shape throughout: generic titles, structured
+        // input.
+        let edit = markdown_entity("Edit file", cx);
+        let terminal = markdown_entity("Terminal", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_tool_call(
+                ToolCallFacts {
+                    path: Some("crates/read_aloud/src/segmenter.rs".to_string()),
+                    ..ToolCallFacts::from_label("edit1", edit, NarrationKind::Edit)
+                },
+                cx,
+            );
+            read_aloud.narrate_tool_call(
+                ToolCallFacts {
+                    command: Some("cargo test -p read_aloud".to_string()),
+                    ..ToolCallFacts::from_label("run1", terminal, NarrationKind::Execute)
+                },
+                cx,
+            );
+            // The command's result lands after it was narrated, which is the
+            // ordinary case.
+            read_aloud.note_tool_call_outcome("run1", ToolCallOutcome::Failed, cx);
+        });
+        cx.run_until_parked();
+
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+
+        let prompt = model
+            .prompts()
+            .first()
+            .cloned()
+            .expect("the wrap-up was generated");
+        assert!(
+            prompt.contains("cargo test -p read_aloud"),
+            "the real command, not the generic title the agent sent"
+        );
+        assert!(
+            prompt.contains("FAILED"),
+            "a failed command is the single most important thing to carry through"
+        );
+        assert!(
+            prompt.contains("Files it changed"),
+            "and what the turn actually touched"
+        );
+        assert!(!prompt.contains("Terminal"), "got {prompt}");
+    }
+
+    /// The wrap-up's length is chosen from the size of the turn: a two-call
+    /// turn deserves a sentence, a long one deserves a paragraph.
+    #[gpui::test]
+    async fn a_bigger_turn_earns_a_longer_wrap_up(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Done.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let closing = turn_in_progress(&read_aloud, cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing.clone()], chars, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            model.prompts()[0].contains("under twenty-five words"),
+            "one tool call is a sentence's worth of turn"
+        );
+
+        // A new turn, with a great deal more in it.
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.cancel_narration(cx));
+        for index in 0..narration::LONG_TURN_TOOL_CALLS {
+            let label = read_tool_label(&format!("crates/read_aloud/src/file_{index}.rs"), cx);
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.narrate_tool_call(titled_call(label, NarrationKind::Read), cx);
+            });
+        }
+        cx.run_until_parked();
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            model.prompts()[1].contains("under seventy words"),
+            "a turn that touched ten things has more to sign off on, got {}",
+            model.prompts()[1]
+        );
+    }
+
+    /// The other half of the budget: a turn can be long because one thing in
+    /// it took a long time, not because it did many things.
+    #[gpui::test]
+    async fn a_long_slow_turn_earns_a_longer_wrap_up(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Done.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let closing = turn_in_progress(&read_aloud, cx);
+        cx.executor()
+            .advance_clock(narration::LONG_TURN + Duration::from_secs(1));
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            model.prompts()[0].contains("under seventy words"),
+            "the listener has been waiting a long time for this, got {}",
+            model.prompts()[0]
+        );
     }
 
     /// The addendum's core requirement: the wrap-up starts generating before

@@ -1,5 +1,6 @@
 use gpui::{App, AppContext as _, Entity, Task};
 use markdown::Markdown;
+use std::time::Duration;
 
 /// How many narrations may wait their turn before a burst is collapsed into
 /// a count. This cap is also the staleness bound: nothing can be more than
@@ -26,11 +27,75 @@ pub const MAX_SUMMARY_CHARS: usize = 600;
 /// templated form beats a paragraph that arrives late.
 pub const MAX_STEP_LINE_CHARS: usize = 220;
 
-/// The most a turn wrap-up may be. A wrap-up is a sign-off, not a speech:
-/// at spoken pace this is about ten seconds, and the prompt asks for half
-/// that. Past it the model has written an essay, and the message's own
-/// opening is a better use of the listener's attention.
-pub const MAX_WRAP_UP_CHARS: usize = 300;
+/// The most a turn wrap-up may ever be, whatever its budget. Past this the
+/// model has written an essay, and the message's own opening is a better use
+/// of the listener's attention.
+pub const MAX_WRAP_UP_CHARS: usize = 480;
+
+/// How much of a wrap-up a turn has earned.
+///
+/// A wrap-up that is the same length whatever happened is wrong twice over:
+/// a sign-off after two tool calls is a monologue, and the same sign-off
+/// after twenty minutes and a dozen files leaves the listener with less than
+/// they were owed. Both were reported.
+///
+/// Sizes are in spoken seconds at roughly two and a half words a second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrapUpBudget {
+    /// How many sentences the prompt asks for, spelled the way it is said —
+    /// a small model follows "two or three sentences" more reliably than a
+    /// digit.
+    sentences: &'static str,
+    /// The word ceiling, spelled out for the same reason.
+    words: &'static str,
+    /// What a reply is rejected past, with enough slack over the word
+    /// ceiling that a model one sentence over is trimmed by the listener's
+    /// patience rather than by this.
+    pub max_chars: usize,
+}
+
+/// Below this many tool calls the turn did essentially one thing, the step
+/// lines already covered it, and the sign-off only has to close it.
+const BRIEF_TURN_TOOL_CALLS: usize = 3;
+/// …and a turn this short is still in the listener's short-term memory.
+const BRIEF_TURN: Duration = Duration::from_secs(60);
+/// At this many tool calls, or this long, the listener has heard scattered
+/// status over minutes and lost the thread. The wrap-up is the only thing
+/// that reassembles it, and there is genuinely more to reassemble.
+pub(crate) const LONG_TURN_TOOL_CALLS: usize = 10;
+pub(crate) const LONG_TURN: Duration = Duration::from_secs(5 * 60);
+
+impl WrapUpBudget {
+    /// What a turn of this size has earned. Either measure can promote a
+    /// turn on its own: a turn is big because it did a lot of things, or
+    /// because one of them took ten minutes, and a listener who has been
+    /// waiting either way wants more than "that's done".
+    pub fn for_turn(tool_calls: usize, elapsed: Option<Duration>) -> Self {
+        let long = elapsed.unwrap_or_default();
+        if tool_calls >= LONG_TURN_TOOL_CALLS || long >= LONG_TURN {
+            // ~28 seconds.
+            Self {
+                sentences: "Three or four sentences",
+                words: "seventy",
+                max_chars: MAX_WRAP_UP_CHARS,
+            }
+        } else if tool_calls >= BRIEF_TURN_TOOL_CALLS || long >= BRIEF_TURN {
+            // ~16 seconds.
+            Self {
+                sentences: "Two or three sentences",
+                words: "forty",
+                max_chars: 300,
+            }
+        } else {
+            // ~10 seconds.
+            Self {
+                sentences: "One sentence, two at the most",
+                words: "twenty-five",
+                max_chars: 200,
+            }
+        }
+    }
+}
 
 /// The most of a message that is worth sending to the summary model. Longer
 /// messages are truncated rather than skipped: the opening carries the
@@ -865,14 +930,24 @@ pub fn summary_prompt(message: &str) -> String {
     let message = truncate_chars(message, MAX_SUMMARY_INPUT_CHARS);
     format!(
         "You are narrating a coding agent's progress out loud to someone who is not \
-         looking at the screen.\n\n\
+         looking at the screen. Your reply is spoken by a text-to-speech voice, so it \
+         must read as something a person would say.\n\n\
          Summarize what the agent did and what it decided in the message below.\n\n\
          Rules:\n\
-         - At most two sentences. Use one if one will do.\n\
-         - Plain spoken English, present tense, no preamble and no sign-off.\n\
-         - No markdown, no code, no command lines, no lists.\n\
-         - Name a file only when the file is the point.\n\
-         - Say what changed and what was chosen, not how it was written.\n\n\
+         - At most two sentences and thirty-five words. Use one sentence if one will do.\n\
+         - Say what changed and what was chosen, not how it was written.\n\
+         - If anything failed or is still broken, say that first.\n\
+         - Spoken English. No markdown, no backticks, no code, no command lines, no \
+         lists, no headings.\n\
+         - Name a file the way you would say it aloud (\"the segmenter\", not \
+         \"crates/read_aloud/src/segmenter.rs\"), and only when the file is the point.\n\
+         - Start with the substance. Never open with \"Here's\", \"This message\", \
+         \"The agent\", \"In summary\", or a restatement of the question.\n\
+         - Reply with the summary alone: no preamble, no sign-off, no quotation marks \
+         around it.\n\n\
+         Good reply: \"It moved the poll loop onto a timer and left the stop latch \
+         alone.\"\n\
+         Bad reply: \"Here's a summary: the agent has updated `player.rs`...\"\n\n\
          Message:\n\
          ---\n\
          {message}\n\
@@ -965,71 +1040,114 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
     };
     format!(
         "You are narrating a coding agent's work out loud, the way a colleague sitting \
-         next to someone would talk them through what they are doing.\n\n\
+         next to someone would talk them through what they are doing. Your reply is \
+         spoken by a text-to-speech voice.\n\n\
          The agent's own words have usually just been read out already. Say what it is \
          actually *doing* now — the files, the commands — and why, without saying those \
          words again.\n\n\
          Rules:\n\
-         - One sentence, under fifteen words, present tense.\n\
-         - Start with the action, then the reason: \"Checking the sync design spec to see \
-         how the pipeline stages line up.\"\n\
+         - One sentence, under fifteen words, present tense, ending in a full stop.\n\
+         - Start with the action, then the reason.\n\
          - Spoken English only. No markdown, no code, no backticks, no command lines, no \
          file paths — name a file the way you would say it aloud (\"the sync design spec\", \
          not \"docs/sync_design.md\").\n\
+         - Never open with \"The agent\", \"It is\", \"Currently\", or \"Here\".\n\
          - If everything worth saying is already in what you have said out loud, reply \
          with exactly: {NOTHING_TO_ADD}\n\
          - No preamble, no sign-off, no quotes around the reply.\n\n\
+         Good reply: \"Checking the sync design spec to see how the pipeline stages line \
+         up.\"\n\
+         Good reply: \"Running the read-aloud tests to see what the change broke.\"\n\
+         Bad reply: \"The agent is currently reading `docs/sync_design.md`.\"\n\n\
          {already}{wrote}{did}\
          Reply with the one sentence and nothing else.",
         already = already_said(recent),
     )
 }
 
+/// Everything the turn's wrap-up is written from.
+///
+/// Deliberately more than the closing prose: what a supervising listener
+/// needs is what actually *happened* — which commands ran, which files
+/// changed, and above all whether anything failed. A wrap-up written from
+/// the closing paragraph alone repeats a paragraph they are about to be able
+/// to read, and an agent's closing paragraph is not reliably the place a
+/// failure gets mentioned.
+pub struct WrapUpMaterial<'a> {
+    /// The closing message *so far*. The wrap-up is issued speculatively,
+    /// before the turn-end event, so the audio is ready the instant the turn
+    /// ends rather than a round trip after it.
+    pub message: &'a str,
+    /// Whether that message may still grow. The prompt says so, because a
+    /// model told it is seeing a partial message writes a wrap-up that still
+    /// stands up when the last sentence never arrives.
+    pub still_streaming: bool,
+    /// Every tool call of the turn, with its real command or path and
+    /// whether it failed.
+    pub activity: &'a [String],
+    /// The files the turn changed, named once each.
+    pub files_changed: &'a [String],
+    /// What narration has already said out loud, so the wrap-up builds on it
+    /// instead of reciting the turn again.
+    pub recent: &'a [String],
+    /// How much of a wrap-up this turn has earned.
+    pub budget: WrapUpBudget,
+}
+
 /// The prompt for the turn wrap-up: what was done, what was found, and what
 /// the listener has to act on.
-///
-/// `message` is the closing message *so far* — this is issued speculatively,
-/// before the turn-end event, so that the audio is ready the instant the turn
-/// ends rather than a round trip after it. The prompt says so, because a
-/// model told it is seeing a partial message writes a wrap-up that still
-/// stands up when the last sentence never arrives.
-pub fn wrap_up_prompt(
-    message: &str,
-    activity: &[String],
-    recent: &[String],
-    still_streaming: bool,
-) -> String {
-    let message = truncate_chars(message.trim(), MAX_SUMMARY_INPUT_CHARS);
+pub fn wrap_up_prompt(material: WrapUpMaterial<'_>) -> String {
+    let message = truncate_chars(material.message.trim(), MAX_SUMMARY_INPUT_CHARS);
     let closing = if message.is_empty() {
         String::new()
     } else {
-        let caveat = if still_streaming {
+        let caveat = if material.still_streaming {
             " (it may still be being written; work with what is here)"
         } else {
             ""
         };
         format!("Its closing message{caveat}:\n---\n{message}\n---\n\n")
     };
-    let did = if activity.is_empty() {
+    let did = if material.activity.is_empty() {
         String::new()
     } else {
-        format!("What it did this turn:\n{}\n\n", bulleted(activity))
+        format!(
+            "What it did this turn, in order:\n{}\n\n",
+            bulleted(material.activity)
+        )
+    };
+    let changed = if material.files_changed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Files it changed:\n{}\n\n",
+            bulleted(material.files_changed)
+        )
     };
     format!(
         "You are narrating a coding agent's work out loud to someone who is not looking at \
-         the screen. The turn is finishing, so give them the wrap-up.\n\n\
+         the screen. The turn is finishing, so give them the wrap-up. Your reply is spoken \
+         by a text-to-speech voice.\n\n\
          Say what was done, what was found or decided, and anything they have to act on.\n\n\
          Rules:\n\
-         - Two sentences at most, and under twenty-five words in total. This is a \
-         sign-off, not a recap.\n\
+         - {sentences}, and under {words} words in total.\n\
+         - If anything failed — a command, a test, a build — say that first and say what \
+         failed. It is the most important thing they need to hear.\n\
+         - Otherwise lead with the outcome, then what it took.\n\
          - Spoken English only. No markdown, no code, no backticks, no command lines, no \
-         lists, no file paths spelled out.\n\
+         lists, no file paths spelled out — name a file the way you would say it aloud.\n\
          - Build on what you have already said rather than repeating it — \"that's done, \
          and the tests pass\", not the whole story again.\n\
+         - Never open with \"Here's\", \"In summary\", \"The agent\", or \"To wrap up\".\n\
          - No preamble, no sign-off, no quotes around the reply.\n\n\
-         {already}{did}{closing}\
+         Good reply: \"The read-aloud tests fail — two of them, on the segmenter. \
+         Everything else is wired up and building.\"\n\
+         Bad reply: \"To wrap up, the agent has made changes to several files.\"\n\n\
+         {already}{did}{changed}{closing}\
          Reply with the wrap-up and nothing else.",
-        already = already_said(recent),
+        sentences = material.budget.sentences,
+        words = material.budget.words,
+        already = already_said(material.recent),
     )
 }
 
@@ -1073,16 +1191,17 @@ pub fn clean_summary(reply: &str) -> Option<String> {
 }
 
 /// Makes a turn wrap-up speakable, or rejects it. Same cleaning as
-/// [`clean_summary`] against a tighter bound: a wrap-up the listener has to
-/// sit through is the verbosity this mode exists to escape, arriving at the
-/// one moment they are actually waiting.
-pub fn clean_wrap_up(reply: &str) -> Option<String> {
+/// [`clean_summary`] against the bound this turn's budget allows: a wrap-up
+/// the listener has to sit through is the verbosity this mode exists to
+/// escape, arriving at the one moment they are actually waiting.
+pub fn clean_wrap_up(reply: &str, budget: WrapUpBudget) -> Option<String> {
     let cleaned = clean_summary(reply)?;
-    if cleaned.chars().count() > MAX_WRAP_UP_CHARS {
+    if cleaned.chars().count() > budget.max_chars {
         log::warn!(
-            "read_aloud: the summary model answered the wrap-up with {} characters, past the \
-             {MAX_WRAP_UP_CHARS} a sign-off may be; speaking the message's opening instead",
-            cleaned.chars().count()
+            "read_aloud: the summary model answered the wrap-up with {} characters, past the {} \
+             this turn's sign-off may be; speaking the message's opening instead",
+            cleaned.chars().count(),
+            budget.max_chars
         );
         return None;
     }
@@ -1506,18 +1625,58 @@ mod tests {
         assert_eq!(clean_step_line(&paragraph), None);
     }
 
+    /// The budget a small turn gets, so the shortest bound is the one under
+    /// test.
+    fn brief_budget() -> WrapUpBudget {
+        WrapUpBudget::for_turn(1, None)
+    }
+
     #[test]
     fn a_wrap_up_that_is_really_a_speech_is_rejected() {
+        let budget = brief_budget();
         let sign_off = "That is the bug. The fix is a flush on shutdown, and that is your call.";
-        assert_eq!(clean_wrap_up(sign_off).as_deref(), Some(sign_off));
-        let speech = "word ".repeat(MAX_WRAP_UP_CHARS / 4);
-        assert!(speech.chars().count() > MAX_WRAP_UP_CHARS);
+        assert_eq!(clean_wrap_up(sign_off, budget).as_deref(), Some(sign_off));
+        let speech = "word ".repeat(budget.max_chars / 4);
+        assert!(speech.chars().count() > budget.max_chars);
         assert!(speech.chars().count() < MAX_SUMMARY_CHARS);
         assert!(
             clean_summary(&speech).is_some(),
             "this exercises the wrap-up's own bound, not the one it inherits"
         );
-        assert_eq!(clean_wrap_up(&speech), None);
+        assert_eq!(clean_wrap_up(&speech, budget), None);
+    }
+
+    /// The user reported both failures in turn: a fifteen-second monologue
+    /// after a small turn, and then a sign-off that was "not sufficient"
+    /// after a large one. A single fixed length cannot be right for both.
+    #[test]
+    fn the_wrap_up_budget_scales_with_the_turn() {
+        let brief = WrapUpBudget::for_turn(2, Some(Duration::from_secs(20)));
+        let standard = WrapUpBudget::for_turn(5, Some(Duration::from_secs(90)));
+        let full = WrapUpBudget::for_turn(14, Some(Duration::from_secs(90)));
+        assert!(brief.max_chars < standard.max_chars);
+        assert!(standard.max_chars < full.max_chars);
+        assert_eq!(full.max_chars, MAX_WRAP_UP_CHARS);
+
+        // Either measure promotes on its own: a turn can be big because it
+        // did a lot, or because one thing in it took a long time.
+        assert_eq!(
+            WrapUpBudget::for_turn(2, Some(Duration::from_secs(20 * 60))),
+            full,
+            "a twenty-minute turn earns a full wrap-up however few calls it made"
+        );
+        assert_eq!(
+            WrapUpBudget::for_turn(20, None),
+            full,
+            "and so does a turn that touched twenty things in a minute"
+        );
+
+        // A reply that fits a large turn is rejected for a small one.
+        let paragraph = "word ".repeat(50);
+        assert!(paragraph.chars().count() > brief.max_chars);
+        assert!(paragraph.chars().count() < full.max_chars);
+        assert!(clean_wrap_up(&paragraph, full).is_some());
+        assert_eq!(clean_wrap_up(&paragraph, brief), None);
     }
 
     /// Structured input beats the title for every kind that has one, and the
@@ -1742,30 +1901,125 @@ mod tests {
         );
     }
 
+    fn wrap_up_material<'a>(
+        message: &'a str,
+        activity: &'a [String],
+        files_changed: &'a [String],
+        recent: &'a [String],
+        still_streaming: bool,
+    ) -> WrapUpMaterial<'a> {
+        WrapUpMaterial {
+            message,
+            still_streaming,
+            activity,
+            files_changed,
+            recent,
+            budget: brief_budget(),
+        }
+    }
+
     #[test]
     fn the_wrap_up_prompt_says_when_the_message_is_unfinished() {
-        let streaming = wrap_up_prompt("The tests all pass now", &[], &[], true);
+        let streaming = wrap_up_prompt(wrap_up_material(
+            "The tests all pass now",
+            &[],
+            &[],
+            &[],
+            true,
+        ));
         assert!(streaming.contains("still be being written"));
-        let finished = wrap_up_prompt("The tests all pass now.", &[], &[], false);
+        let finished = wrap_up_prompt(wrap_up_material(
+            "The tests all pass now.",
+            &[],
+            &[],
+            &[],
+            false,
+        ));
         assert!(!finished.contains("still be being written"));
     }
 
     #[test]
     fn the_wrap_up_prompt_carries_the_turn_and_forbids_repeating_it() {
-        let prompt = wrap_up_prompt(
+        let prompt = wrap_up_prompt(wrap_up_material(
             "Everything is wired up.",
             &["ran the command `cargo test -p read_aloud`".to_string()],
+            &[],
             &["Running cargo test.".to_string()],
             false,
-        );
+        ));
         assert!(prompt.contains("cargo test -p read_aloud"));
         assert!(prompt.contains("Running cargo test."));
         assert!(prompt.contains("must not repeat"));
         assert!(prompt.contains("Build on what you have already said"));
         assert!(
             prompt.contains("under twenty-five words"),
-            "a wrap-up is a sign-off, not a speech"
+            "a two-call turn has earned a sentence, not a speech"
         );
+    }
+
+    /// "The tests failed" is the single most important thing a supervising
+    /// listener needs, and the closing paragraph is not reliably where an
+    /// agent mentions it. The prompt has to see the failure itself, and be
+    /// told to lead with it.
+    #[test]
+    fn the_wrap_up_prompt_leads_on_a_failure_and_names_the_files() {
+        let prompt = wrap_up_prompt(wrap_up_material(
+            "That should do it.",
+            &[
+                "edited crates/read_aloud/src/segmenter.rs".to_string(),
+                "ran the command `cargo test -p read_aloud` — it FAILED".to_string(),
+            ],
+            &["crates/read_aloud/src/segmenter.rs".to_string()],
+            &[],
+            false,
+        ));
+        assert!(prompt.contains("it FAILED"));
+        assert!(prompt.contains("say that first"));
+        assert!(prompt.contains("Files it changed"));
+        assert!(prompt.contains("crates/read_aloud/src/segmenter.rs"));
+    }
+
+    /// The prompt asks for the length this turn has earned, not a constant.
+    #[test]
+    fn the_wrap_up_prompt_asks_for_the_length_the_turn_earned() {
+        let of = |tool_calls| {
+            wrap_up_prompt(WrapUpMaterial {
+                message: "Done.",
+                still_streaming: false,
+                activity: &[],
+                files_changed: &[],
+                recent: &[],
+                budget: WrapUpBudget::for_turn(tool_calls, None),
+            })
+        };
+        assert!(of(1).contains("under twenty-five words"));
+        assert!(of(5).contains("under forty words"));
+        assert!(of(20).contains("under seventy words"));
+    }
+
+    /// Prompts written for a fake model can afford to be vague. A small fast
+    /// model needs to be told what *not* to do, and shown the shape.
+    #[test]
+    fn every_prompt_forbids_preamble_and_shows_the_shape() {
+        for prompt in [
+            summary_prompt("I moved the poll loop onto a timer."),
+            step_prompt("Some prose.", &["read the segmenter".to_string()], &[]),
+            wrap_up_prompt(wrap_up_material("Done.", &[], &[], &[], false)),
+        ] {
+            assert!(
+                prompt.contains("Good reply:"),
+                "a small model follows an example better than a description"
+            );
+            assert!(prompt.contains("No preamble") || prompt.contains("no preamble"));
+            assert!(
+                prompt.contains("Never open with"),
+                "\"The agent is currently...\" is what these models do unprompted"
+            );
+            assert!(
+                prompt.contains("backticks"),
+                "spoken aloud, a backtick is a noise"
+            );
+        }
     }
 
     #[test]
