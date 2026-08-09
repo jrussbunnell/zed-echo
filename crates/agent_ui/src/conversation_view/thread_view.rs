@@ -698,10 +698,15 @@ const TOOL_LABEL_SETTLE: Duration = Duration::from_millis(350);
 
 /// One tool call's narration state.
 struct ToolCallNarration {
-    /// The label as of the last time this call was looked at. A label equal
-    /// to it after [`TOOL_LABEL_SETTLE`] has passed is one that has stopped
-    /// arriving.
-    last_label: SharedString,
+    /// What narration would say this call is about, as of the last time it
+    /// was looked at. A key equal to it after [`TOOL_LABEL_SETTLE`] has
+    /// passed is one that has stopped arriving.
+    ///
+    /// The resolved key rather than the raw title, because the title is not
+    /// what gets spoken: an edit's title and its `raw_input` path stream
+    /// together, and watching the thing narration actually reads is what
+    /// makes quiescence mean "the line is final".
+    last_key: String,
     narrated: bool,
 }
 
@@ -728,6 +733,73 @@ fn narration_kind(kind: &acp::ToolKind) -> read_aloud::NarrationKind {
         acp::ToolKind::Execute => read_aloud::NarrationKind::Execute,
         acp::ToolKind::Fetch => read_aloud::NarrationKind::Fetch,
         _ => read_aloud::NarrationKind::Other,
+    }
+}
+
+/// What narration is told about one tool call.
+///
+/// The title is the *last* thing consulted. Zed's own tools put the command
+/// or the path straight into it, but an external ACP agent writes its own
+/// titles and Claude Code's are generic — "Terminal", "Read file" — with the
+/// command and the path only in `raw_input` and `locations`. Narration built
+/// on titles said "running terminal" once and then went silent for the rest
+/// of the turn, because every following call had the same title.
+///
+/// `raw_input` is the agent's own tool schema, so the key it uses is a
+/// convention rather than a contract; the common spellings are probed and
+/// anything unrecognised degrades to the title.
+fn read_aloud_tool_call_facts(tool_call: &acp_thread::ToolCall) -> read_aloud::ToolCallFacts {
+    /// The keys an agent might put a shell command under.
+    const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "shell_command"];
+    /// …a file path under. `path` is Zed's own edit and read tools;
+    /// `file_path` is Claude Code's.
+    const PATH_KEYS: &[&str] = &["file_path", "path", "abs_path", "absolute_path", "filename"];
+    const URL_KEYS: &[&str] = &["url", "uri"];
+    /// …a search's subject under. `regex` is Zed's grep tool; `pattern` is
+    /// Claude Code's Grep and Glob.
+    const QUERY_KEYS: &[&str] = &["pattern", "regex", "query", "glob"];
+
+    let raw_input = tool_call
+        .raw_input
+        .as_ref()
+        .and_then(|input| input.as_object());
+    let field = |keys: &[&str]| -> Option<String> {
+        let object = raw_input?;
+        keys.iter().find_map(|key| {
+            object
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    };
+    // ACP populates `locations` independently of the title, so a call whose
+    // input schema is unrecognised can still name its file.
+    let path = field(PATH_KEYS).or_else(|| {
+        tool_call
+            .locations
+            .first()
+            .map(|location| location.path.to_string_lossy().into_owned())
+            .filter(|path| !path.trim().is_empty())
+    });
+    read_aloud::ToolCallFacts {
+        id: tool_call.id.0.to_string(),
+        kind: narration_kind(&tool_call.kind),
+        label: tool_call.label.clone(),
+        command: field(COMMAND_KEYS),
+        path,
+        url: field(URL_KEYS),
+        query: field(QUERY_KEYS),
+        outcome: read_aloud_tool_call_outcome(&tool_call.status),
+    }
+}
+
+fn read_aloud_tool_call_outcome(status: &ToolCallStatus) -> read_aloud::ToolCallOutcome {
+    match status {
+        ToolCallStatus::Completed => read_aloud::ToolCallOutcome::Succeeded,
+        ToolCallStatus::Failed => read_aloud::ToolCallOutcome::Failed,
+        _ => read_aloud::ToolCallOutcome::Pending,
     }
 }
 
@@ -1683,28 +1755,34 @@ impl ThreadView {
         ) {
             return;
         }
-        let label = tool_call.label.clone();
-        let kind = narration_kind(&tool_call.kind);
-        let source = label.read(cx).source().clone();
+        let facts = read_aloud_tool_call_facts(tool_call);
+        let outcome = facts.outcome;
         // Nothing further can refine a call that has already finished.
         let settled = matches!(
             tool_call.status,
             ToolCallStatus::Completed | ToolCallStatus::Failed
         );
         let call_id = tool_call.id.clone();
+        let key = facts.spoken_key(cx);
+
+        // Whether the call has been narrated or not, how it ended is what the
+        // turn's wrap-up most needs to know.
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.note_tool_call_outcome(&facts.id, outcome, cx);
+        });
 
         let state = self
             .read_aloud_tool_calls
             .entry(call_id)
             .or_insert_with(|| ToolCallNarration {
-                last_label: source.clone(),
+                last_key: key.clone(),
                 narrated: false,
             });
         if state.narrated {
             return;
         }
-        let moved = state.last_label != source;
-        state.last_label = source.clone();
+        let moved = state.last_key != key;
+        state.last_key = key.clone();
         if !force && !settled {
             // Still moving, or not yet still for long enough. Either way the
             // step it belongs to must not close underneath it, so the reader
@@ -1715,13 +1793,13 @@ impl ThreadView {
             }
             return;
         }
-        if source.trim().is_empty() {
+        if key.trim().is_empty() {
             return;
         }
         state.narrated = true;
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, kind, cx);
+            read_aloud.narrate_tool_call(facts, cx);
         });
     }
 
@@ -1755,7 +1833,8 @@ impl ThreadView {
                         .get(&tool_call.id)
                         .filter(|state| {
                             !state.narrated
-                                && state.last_label == *tool_call.label.read(cx).source()
+                                && state.last_key
+                                    == read_aloud_tool_call_facts(tool_call).spoken_key(cx)
                         })
                         .map(|_| entry_index),
                     _ => None,

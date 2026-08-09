@@ -8390,6 +8390,176 @@ pub(crate) mod tests {
         );
     }
 
+    /// The shape every earlier tool-call test missed, and the one the user
+    /// actually runs: an **external ACP agent**, which titles its own tool
+    /// calls. Claude Code's titles are generic and constant — every shell
+    /// command is "Terminal" — with the real command only in `raw_input`.
+    ///
+    /// Narrating from the title said "running terminal" once and then went
+    /// silent for the rest of the turn, because duplicate suppression
+    /// compared titles and every following title was identical. Every test
+    /// in this file passed the whole time, because every test used Zed's own
+    /// tool shapes, whose titles carry the command.
+    #[gpui::test]
+    async fn test_read_aloud_narration_names_an_external_agents_commands(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(
+            ["git status", "cargo test", "npm run build"]
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(format!("tool{index}"), "Terminal")
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::InProgress)
+                            .raw_input(json!({ "command": command, "description": "…" })),
+                    )
+                })
+                .collect(),
+        );
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "Running git status.".to_string(),
+                "Then cargo test.".to_string(),
+                "Then npm run build.".to_string(),
+            ],
+            "three different commands sharing one generic title are three \
+             different things to say, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// The same defect for files. Claude Code's Read and Edit calls are
+    /// titled "Read file" and "Edit file" with the path in `raw_input`; ACP
+    /// also populates `locations` independently of the title, so a call whose
+    /// input schema is unrecognised can still name its file.
+    #[gpui::test]
+    async fn test_read_aloud_narration_names_an_external_agents_files(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool1", "Read file")
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(json!({ "file_path": "/repo/crates/read_aloud/src/segmenter.rs" })),
+            ),
+            // No `raw_input` at all: `locations` is the only structured
+            // source, and it is enough.
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool2", "Edit file")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .locations(vec![acp::ToolCallLocation::new(PathBuf::from(
+                        "/repo/crates/read_aloud/src/player.rs",
+                    ))]),
+            ),
+        ]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "Reading segmenter.".to_string(),
+                "Editing player.".to_string()
+            ],
+            "a generic title must not stop narration naming the file, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// Structured input must not displace a Zed-native title that already
+    /// reads well. Zed's own read tool titles itself `Read file \`path\`` and
+    /// carries the same path in `raw_input`; both must land on one utterance
+    /// naming the file, and the settle gate must still hold until the
+    /// streamed path is complete.
+    #[gpui::test]
+    async fn test_read_aloud_narration_still_waits_out_a_streaming_native_path(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool1", "Edit file")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::Pending),
+            ),
+            // Zed's edit tool re-derives both the title and `raw_input` from
+            // the model's half-streamed input, so the structured field is
+            // truncated exactly like the title is.
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new()
+                    .title("crates/read_aloud/sr")
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(json!({ "path": "crates/read_aloud/sr" })),
+            )),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new()
+                    .title("crates/read_aloud/src/segmenter.rs")
+                    .raw_input(json!({ "path": "crates/read_aloud/src/segmenter.rs" })),
+            )),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool1"),
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        ]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert_eq!(
+            provider.spoken(),
+            vec!["Editing segmenter.".to_string()],
+            "preferring structured input must not reintroduce the truncated \
+             path, got {:?}",
+            provider.spoken()
+        );
+    }
+
     /// Regression: a backgrounded thread view keeps its subscriptions, its
     /// tasks, and its share of the one audio player, so it went on narrating
     /// a conversation the user had left — and in narration mode a summary

@@ -1,4 +1,4 @@
-use gpui::{App, AppContext as _, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, Entity, Task};
 use markdown::Markdown;
 
 /// How many narrations may wait their turn before a burst is collapsed into
@@ -58,17 +58,48 @@ pub enum NarrationKind {
 }
 
 impl NarrationKind {
-    /// The verb narration puts in front of a label that has none of its own.
+    /// The verb narration puts in front of a target that has none of its own.
     fn verb(self) -> &'static str {
         match self {
             NarrationKind::Read => "Reading",
             NarrationKind::Edit => "Editing",
             NarrationKind::Delete => "Deleting",
             NarrationKind::Move => "Moving",
-            NarrationKind::Search => "Searching",
+            NarrationKind::Search => "Searching for",
             NarrationKind::Execute => "Running",
             NarrationKind::Fetch => "Fetching",
             NarrationKind::Other => "Running",
+        }
+    }
+
+    /// What narration says when it knows the kind of thing the agent is
+    /// doing but nothing about what it is doing it to. Never silence: a
+    /// tool call the listener is not told about is the failure mode this
+    /// whole path exists to avoid.
+    fn unnamed_phrase(self) -> &'static str {
+        match self {
+            NarrationKind::Read => "Reading a file.",
+            NarrationKind::Edit => "Editing a file.",
+            NarrationKind::Delete => "Deleting a file.",
+            NarrationKind::Move => "Moving a file.",
+            NarrationKind::Search => "Running a search.",
+            NarrationKind::Execute => "Running a command.",
+            NarrationKind::Fetch => "Fetching a page.",
+            NarrationKind::Other => "Taking a step.",
+        }
+    }
+
+    /// The past-tense verb a prompt's account of the turn uses.
+    fn past_verb(self) -> &'static str {
+        match self {
+            NarrationKind::Read => "read",
+            NarrationKind::Edit => "edited",
+            NarrationKind::Delete => "deleted",
+            NarrationKind::Move => "moved",
+            NarrationKind::Search => "searched for",
+            NarrationKind::Execute => "ran",
+            NarrationKind::Fetch => "fetched",
+            NarrationKind::Other => "did",
         }
     }
 
@@ -108,6 +139,159 @@ fn spoken_count(count: usize) -> String {
     word.to_string()
 }
 
+/// How a tool call ended, as far as a listener is concerned. A failure is
+/// the single most important thing a supervising listener needs to hear, so
+/// it is carried all the way into the turn's wrap-up prompt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolCallOutcome {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+/// What narration knows about one tool call.
+///
+/// The title is deliberately the *last* source consulted. Zed's own tools
+/// put the command or the path straight into the title, but an external ACP
+/// agent titles its own calls and those titles are generic — Claude Code
+/// sends "Terminal" and "Read file" and carries the real content only in
+/// `raw_input` and `locations`. Narration built on titles therefore said
+/// "running terminal" once and then went silent, because every subsequent
+/// call had the same title. Structured fields are protocol data and mean the
+/// same thing whoever sent them; a title is a display string.
+#[derive(Clone)]
+pub struct ToolCallFacts {
+    /// The agent's own id for the call, so a later status update can find
+    /// the account of it this produced.
+    pub id: String,
+    pub kind: NarrationKind,
+    /// The agent's own title. Still what is spoken for the kinds whose
+    /// titles read as prose, and the fallback for every kind.
+    pub label: Entity<Markdown>,
+    /// The command an Execute call runs.
+    pub command: Option<String>,
+    /// The file a Read, Edit, Delete or Move call is about.
+    pub path: Option<String>,
+    /// The page a Fetch call retrieves.
+    pub url: Option<String>,
+    /// What a Search call is looking for.
+    pub query: Option<String>,
+    pub outcome: ToolCallOutcome,
+}
+
+impl ToolCallFacts {
+    /// A call with nothing structured behind it: what a caller that only has
+    /// a title can supply.
+    pub fn from_label(id: impl Into<String>, label: Entity<Markdown>, kind: NarrationKind) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            label,
+            command: None,
+            path: None,
+            url: None,
+            query: None,
+            outcome: ToolCallOutcome::default(),
+        }
+    }
+
+    /// What narration's line for this call is *about* — the command, the
+    /// path, the URL, the pattern, or (when nothing structured exists) the
+    /// title itself.
+    ///
+    /// This is what duplicate suppression compares, and what the owning view
+    /// watches for quiescence. Comparing titles is what made several distinct
+    /// commands sharing one generic title collapse into a single utterance.
+    pub fn spoken_key(&self, cx: &App) -> String {
+        let label = self.label.read(cx).source().trim().to_string();
+        match tool_call_target(self.kind, self.structured_target(), &label) {
+            ToolCallTarget::Named(target) => target,
+            ToolCallTarget::Unnamed => self.kind.unnamed_phrase().to_string(),
+            ToolCallTarget::Label => label,
+        }
+    }
+
+    /// This call as a *prompt* should see it, which is not how it should be
+    /// spoken: the model gets more out of the real path or the real command
+    /// than out of the terse form the listener hears, and the prompts forbid
+    /// it from reading either out.
+    pub(crate) fn description(&self, cx: &App) -> String {
+        let label = self.label.read(cx).source().trim().to_string();
+        let described = match (self.kind, self.structured_target()) {
+            (NarrationKind::Execute, Some(command)) => format!("ran the command `{command}`"),
+            (NarrationKind::Search, Some(query)) => format!("searched for `{query}`"),
+            (kind, Some(target)) => format!("{} {target}", kind.past_verb()),
+            (NarrationKind::Execute, None) if !label.is_empty() => {
+                format!("ran the command `{label}`")
+            }
+            (NarrationKind::Edit, None) if !label.is_empty() => {
+                format!("edited {}", unescape_markdown_punctuation(&label))
+            }
+            (_, None) if !label.is_empty() => label,
+            (kind, None) => format!("{} something", kind.past_verb()),
+        };
+        match self.outcome {
+            ToolCallOutcome::Failed => format!("{described} — it FAILED"),
+            ToolCallOutcome::Pending | ToolCallOutcome::Succeeded => described,
+        }
+    }
+
+    /// The structured field this kind cares about, trimmed and non-empty.
+    fn structured_target(&self) -> Option<&str> {
+        let field = match self.kind {
+            NarrationKind::Execute => &self.command,
+            NarrationKind::Read
+            | NarrationKind::Edit
+            | NarrationKind::Delete
+            | NarrationKind::Move => &self.path,
+            NarrationKind::Fetch => &self.url,
+            NarrationKind::Search => &self.query,
+            NarrationKind::Other => &None,
+        };
+        field.as_deref().map(str::trim).filter(|it| !it.is_empty())
+    }
+}
+
+/// Resolution order, per kind: structured input first, the agent's own title
+/// second, the kind's templated phrase last.
+fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) -> ToolCallTarget {
+    match kind {
+        NarrationKind::Execute => structured
+            .and_then(spoken_command)
+            .or_else(|| spoken_command(label))
+            .map_or(ToolCallTarget::Unnamed, ToolCallTarget::Named),
+        NarrationKind::Read | NarrationKind::Edit => structured
+            .map(str::to_string)
+            .or_else(|| label_path(label))
+            .map_or(ToolCallTarget::Unnamed, ToolCallTarget::Named),
+        // Zed's own delete and move titles are already verb-led prose
+        // ("Rename thread view to conversation view") and read better than
+        // anything narration would generate, so the title keeps precedence
+        // over nothing — only structured input displaces it.
+        NarrationKind::Delete | NarrationKind::Move | NarrationKind::Search => structured
+            .map(str::to_string)
+            .map_or(ToolCallTarget::Label, ToolCallTarget::Named),
+        NarrationKind::Fetch => structured
+            .map(str::to_string)
+            .or_else(|| label_url(label))
+            .map_or(ToolCallTarget::Label, ToolCallTarget::Named),
+        NarrationKind::Other => ToolCallTarget::Label,
+    }
+}
+
+/// What narration's line for a call is about, before a verb goes in front.
+enum ToolCallTarget {
+    /// A concrete thing: the command, the path, the URL, the pattern.
+    Named(String),
+    /// Nothing concrete could be resolved, and the title does not read as
+    /// prose either, so the kind's templated phrase is all there is.
+    Unnamed,
+    /// The agent's own title reads well enough to be spoken — and
+    /// highlighted — in place.
+    Label,
+}
+
 /// Tool-call progress, the only narration a burst may collapse. `count` is
 /// 1 for a single call and grows as a collapsed burst absorbs more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +314,7 @@ pub(crate) struct Narration {
 /// The narration backlog: FIFO, with three rules that keep spoken length
 /// from tracking written length.
 ///
-/// 1. A tool call whose label repeats the previous one is dropped.
+/// 1. A tool call about the same thing as the previous one is dropped.
 /// 2. Past [`MAX_PENDING_NARRATIONS`], the last run of tool calls —
 ///    including any count an earlier collapse produced — becomes a single
 ///    count. A burst of eight reads comes out as "reading seven files"
@@ -146,10 +330,14 @@ pub(crate) struct Narration {
 #[derive(Default)]
 pub(crate) struct NarrationQueue {
     pending: Vec<Narration>,
-    /// The last tool label accepted, whether it was queued or spoken
-    /// immediately, so back-to-back duplicates are suppressed across the
-    /// boundary between the queue and the player.
-    last_tool_label: Option<SharedString>,
+    /// What the last tool call accepted was *about*, whether it was queued
+    /// or spoken immediately, so back-to-back duplicates are suppressed
+    /// across the boundary between the queue and the player.
+    ///
+    /// The resolved target, never the title: an external agent gives every
+    /// terminal command the title "Terminal", and comparing titles turned a
+    /// run of different commands into one utterance followed by silence.
+    last_tool_key: Option<String>,
     /// The kind of the last tool call accepted, so a run of the same kind
     /// elides its verb ("Reading player. Then segmenter.") instead of
     /// chanting it. Cleared by anything that is not a tool call, because the
@@ -166,34 +354,32 @@ pub(crate) struct NarrationQueue {
 }
 
 impl NarrationQueue {
-    /// Queues a tool call's own label. Returns whether anything was queued:
-    /// a label identical to the previous one adds nothing to a listener.
-    pub fn push_tool_call(
-        &mut self,
-        label: Entity<Markdown>,
-        kind: NarrationKind,
-        cx: &mut App,
-    ) -> bool {
-        let source = label.read(cx).source().clone();
-        if source.trim().is_empty() || self.last_tool_label.as_ref() == Some(&source) {
+    /// Queues one tool call. Returns whether anything was queued: a call
+    /// about the same thing as the one before it adds nothing to a listener.
+    pub fn push_tool_call(&mut self, facts: ToolCallFacts, cx: &mut App) -> bool {
+        let label = facts.label.read(cx).source().trim().to_string();
+        let kind = facts.kind;
+        let key = facts.spoken_key(cx);
+        if key.trim().is_empty() || self.last_tool_key.as_deref() == Some(key.as_str()) {
             return false;
         }
         let continuing = self.last_tool_kind == Some(kind);
-        self.last_tool_label = Some(source.clone());
+        self.last_tool_key = Some(key);
         self.last_tool_kind = Some(kind);
-        let narration = match generated_phrase(&source, kind, continuing) {
+        let narration = match generated_phrase(kind, facts.structured_target(), &label, continuing)
+        {
             Some(phrase) => {
                 self.remember(&phrase);
                 Narration {
                     spoken: cx.new(|cx| Markdown::new(phrase.into(), None, None, cx)),
-                    wash: vec![label],
+                    wash: vec![facts.label],
                     progress: Some(Progress { kind, count: 1 }),
                 }
             }
             None => {
-                self.remember(&source);
+                self.remember(&label);
                 Narration {
-                    spoken: label,
+                    spoken: facts.label,
                     wash: Vec::new(),
                     progress: Some(Progress { kind, count: 1 }),
                 }
@@ -208,7 +394,7 @@ impl NarrationQueue {
     /// Queues text that is on screen and speaks for itself — a message
     /// short enough that summarizing it would cost more than saying it.
     pub fn push_inline(&mut self, text: Entity<Markdown>, cx: &mut App) {
-        self.last_tool_label = None;
+        self.last_tool_key = None;
         self.last_tool_kind = None;
         self.remember(&text.read(cx).source().clone());
         self.pending.push(Narration {
@@ -229,7 +415,7 @@ impl NarrationQueue {
         message: Vec<Entity<Markdown>>,
         cx: &mut App,
     ) {
-        self.last_tool_label = None;
+        self.last_tool_key = None;
         self.last_tool_kind = None;
         self.remember(&spoken.read(cx).source().clone());
         self.pending.push(Narration {
@@ -257,7 +443,7 @@ impl NarrationQueue {
 
     pub fn clear(&mut self) {
         self.pending.clear();
-        self.last_tool_label = None;
+        self.last_tool_key = None;
         self.last_tool_kind = None;
     }
 
@@ -375,28 +561,29 @@ impl NarrationQueue {
     }
 }
 
-/// The phrase to speak in place of a label that does not read aloud well on
-/// its own. `None` means the label speaks for itself and is spoken, and
-/// highlighted, in place.
+/// The phrase to speak for one tool call. `None` means the agent's own title
+/// speaks for itself and is spoken, and highlighted, in place.
 ///
-/// Four kinds need a phrase of their own:
+/// What is spoken comes from [`ToolCallFacts::target`], which prefers the
+/// call's structured input over its title. The title is only consulted for
+/// the kinds whose titles Zed's own tools fill in usefully:
 ///
-/// * **Read** — the label is `Read file \`path\` (lines 3-9)`. Read out it
+/// * **Read** — the title is `Read file \`path\` (lines 3-9)`. Read out it
 ///   is "read file player (lines 3-9)": the verb is past tense, the line
 ///   range is noise, and after a burst it chants.
-/// * **Edit** — the label is nothing but a markdown-escaped file path, with
+/// * **Edit** — the title is nothing but a markdown-escaped file path, with
 ///   no verb at all, and reads out one path component at a time.
-/// * **Execute** — the label is the raw command, and `acp_thread` hands it
+/// * **Execute** — the title is the raw command, and `acp_thread` hands it
 ///   over as plain text (links only), which the segmenter produces *no*
 ///   utterances from. Reciting a whole command line reads badly besides
 ///   ("cd slash users slash…"), so only the program and its most meaningful
 ///   argument are spoken.
-/// * **Fetch** — the label is `Fetch <url>` with the URL markdown-escaped,
+/// * **Fetch** — the title is `Fetch <url>` with the URL markdown-escaped,
 ///   and the escapes defeat the URL substitute ("Fetch example_b").
 ///
-/// Search, Move, Delete and the rest already read as verb-led prose
-/// ("Rename thread view to conversation view") and are left in place, where
-/// they keep their sentence and word highlighting.
+/// Move and Delete already read as verb-led prose ("Rename thread view to
+/// conversation view") and are left in place unless structured input names
+/// the file, where they keep their sentence and word highlighting.
 ///
 /// Everything a phrase names goes in as a code span, so the substitute rules
 /// that already turn `player.rs` into "player" and a URL into its host do
@@ -405,11 +592,12 @@ impl NarrationQueue {
 /// `continuing` means the previous narration was a tool call of this same
 /// kind. The verb is elided then ("Reading player. Then segmenter."), which
 /// is what keeps a run of reads from chanting.
-fn generated_phrase(label: &str, kind: NarrationKind, continuing: bool) -> Option<String> {
-    let label = label.trim();
-    if label.is_empty() {
-        return None;
-    }
+fn generated_phrase(
+    kind: NarrationKind,
+    structured: Option<&str>,
+    label: &str,
+    continuing: bool,
+) -> Option<String> {
     let lead = |target: &str| {
         if continuing {
             format!("Then `{target}`.")
@@ -417,22 +605,12 @@ fn generated_phrase(label: &str, kind: NarrationKind, continuing: bool) -> Optio
             format!("{} `{target}`.", kind.verb())
         }
     };
-    match kind {
-        NarrationKind::Execute => Some(match spoken_command(label) {
-            Some(command) => lead(&command),
-            // Silence is the one thing this must never be: an Execute label
-            // reaches the segmenter as plain text and says nothing at all.
-            None => "Running a command.".to_string(),
-        }),
-        NarrationKind::Read | NarrationKind::Edit => Some(match label_path(label) {
-            Some(path) => lead(&path),
-            // Only reachable from a placeholder label ("Read file"), which
-            // reads as the bare past-tense fragment the listener complained
-            // about. Saying less is better than saying that.
-            None => format!("{} a file.", kind.verb()),
-        }),
-        NarrationKind::Fetch => label_url(label).map(|url| lead(&url)),
-        _ => None,
+    match tool_call_target(kind, structured, label) {
+        ToolCallTarget::Named(target) => Some(lead(&target)),
+        // Silence is the one thing this must never be: a listener told
+        // nothing cannot tell a quiet agent from a broken feature.
+        ToolCallTarget::Unnamed => Some(kind.unnamed_phrase().to_string()),
+        ToolCallTarget::Label => None,
     }
 }
 
@@ -492,20 +670,6 @@ fn label_url(label: &str) -> Option<String> {
         .split_whitespace()
         .find(|token| token.contains("://"))?;
     (!url.contains('`')).then(|| url.to_string())
-}
-
-/// One tool call as a *prompt* should see it, which is not how it should be
-/// spoken: the model gets more out of the real path or the real command than
-/// out of the terse form the listener hears, and the prompts forbid it from
-/// reading either out. Only the kinds whose label does not name its own
-/// action get a verb added.
-pub(crate) fn tool_call_description(label: &str, kind: NarrationKind) -> String {
-    let label = label.trim();
-    match kind {
-        NarrationKind::Execute => format!("ran the command `{label}`"),
-        NarrationKind::Edit => format!("edited {}", unescape_markdown_punctuation(label)),
-        _ => label.to_string(),
-    }
 }
 
 /// The content of a label's first inline code span.
@@ -1064,6 +1228,13 @@ mod tests {
         cx.new(|cx| Markdown::new(text.to_string().into(), None, None, cx))
     }
 
+    /// A call with nothing but a title behind it — the Zed-native shape, and
+    /// the shape every one of these queue tests exercised before external
+    /// agents were taken into account.
+    fn titled(label: Entity<Markdown>, kind: NarrationKind) -> ToolCallFacts {
+        ToolCallFacts::from_label("call", label, kind)
+    }
+
     #[gpui::test]
     async fn a_repeated_tool_label_is_not_said_twice(cx: &mut TestAppContext) {
         let mut queue = NarrationQueue::default();
@@ -1073,12 +1244,12 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|cx| {
-            assert!(queue.push_tool_call(first, NarrationKind::Read, cx));
+            assert!(queue.push_tool_call(titled(first, NarrationKind::Read), cx));
             assert!(
-                !queue.push_tool_call(same, NarrationKind::Read, cx),
+                !queue.push_tool_call(titled(same, NarrationKind::Read), cx),
                 "an identical label back to back tells the listener nothing new"
             );
-            assert!(queue.push_tool_call(other, NarrationKind::Read, cx));
+            assert!(queue.push_tool_call(titled(other, NarrationKind::Read), cx));
         });
         assert_eq!(queue.len(), 2);
     }
@@ -1093,7 +1264,7 @@ mod tests {
 
         cx.update(|cx| {
             for label in labels {
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         cx.run_until_parked();
@@ -1131,7 +1302,7 @@ mod tests {
 
         cx.update(|cx| {
             for label in labels {
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         cx.run_until_parked();
@@ -1161,7 +1332,7 @@ mod tests {
                 } else {
                     NarrationKind::Execute
                 };
-                queue.push_tool_call(label, kind, cx);
+                queue.push_tool_call(titled(label, kind), cx);
             }
         });
         cx.run_until_parked();
@@ -1196,7 +1367,7 @@ mod tests {
         cx.update(|cx| {
             for (message, label) in entities {
                 queue.push_inline(message, cx);
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         cx.run_until_parked();
@@ -1231,7 +1402,7 @@ mod tests {
 
         cx.update(|cx| {
             for label in labels {
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         cx.update(|cx| queue.push_summary(summary, vec![message], cx));
@@ -1268,7 +1439,7 @@ mod tests {
         cx.update(|cx| queue.push_summary(summary, vec![message], cx));
         cx.update(|cx| {
             for label in labels {
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         cx.run_until_parked();
@@ -1349,16 +1520,164 @@ mod tests {
         assert_eq!(clean_wrap_up(&speech), None);
     }
 
+    /// Structured input beats the title for every kind that has one, and the
+    /// title is still there when it does not.
+    #[test]
+    fn structured_input_names_what_a_generic_title_cannot() {
+        for (kind, structured, label, expected) in [
+            (
+                NarrationKind::Execute,
+                Some("cd /repo && cargo test -p read_aloud"),
+                "Terminal",
+                Some("Running `cargo test`."),
+            ),
+            (
+                NarrationKind::Read,
+                Some("/repo/crates/read_aloud/src/player.rs"),
+                "Read file",
+                Some("Reading `/repo/crates/read_aloud/src/player.rs`."),
+            ),
+            (
+                NarrationKind::Edit,
+                Some("/repo/crates/read_aloud/src/sink.rs"),
+                "Update",
+                Some("Editing `/repo/crates/read_aloud/src/sink.rs`."),
+            ),
+            (
+                NarrationKind::Search,
+                Some("TODO"),
+                "Grep",
+                Some("Searching for `TODO`."),
+            ),
+            (
+                NarrationKind::Fetch,
+                Some("https://docs.inworld.ai/tts"),
+                "Fetch",
+                Some("Fetching `https://docs.inworld.ai/tts`."),
+            ),
+            // Nothing structured, and a title with nothing in it either: the
+            // kind's templated phrase, never silence.
+            (NarrationKind::Execute, None, "", Some("Running a command.")),
+            // Zed's own move title reads as prose and keeps precedence.
+            (
+                NarrationKind::Move,
+                None,
+                "Rename thread view to conversation view",
+                None,
+            ),
+        ] {
+            assert_eq!(
+                generated_phrase(kind, structured, label, false).as_deref(),
+                expected,
+                "{kind:?} with structured {structured:?} and title {label:?}"
+            );
+        }
+    }
+
+    /// The bug the user hit: an external agent gives every shell command the
+    /// same generic title, so suppressing on the title turned a run of
+    /// different commands into one utterance followed by silence.
+    #[gpui::test]
+    async fn distinct_commands_sharing_one_title_are_all_spoken(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let labels: Vec<_> = (0..3).map(|_| markdown("Terminal", cx)).collect();
+        cx.run_until_parked();
+
+        let mut spoken = Vec::new();
+        for (label, command) in labels.into_iter().zip(["git status", "cargo test", "ls"]) {
+            let facts = ToolCallFacts {
+                command: Some(command.to_string()),
+                ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+            };
+            cx.update(|cx| {
+                assert!(
+                    queue.push_tool_call(facts, cx),
+                    "{command} is a different thing to say than the one before it"
+                );
+            });
+            let narration = queue.pop().expect("the call was queued");
+            spoken.push(
+                narration
+                    .spoken
+                    .read_with(cx, |markdown, _| markdown.source().to_string()),
+            );
+        }
+        assert_eq!(
+            spoken,
+            vec![
+                "Running `git status`.".to_string(),
+                "Then `cargo test`.".to_string(),
+                "Then `ls`.".to_string(),
+            ]
+        );
+    }
+
+    /// The other half: the same command twice running is still one thing to
+    /// say, even though the resolved text is now what is compared.
+    #[gpui::test]
+    async fn the_same_command_twice_is_not_said_twice(cx: &mut TestAppContext) {
+        let mut queue = NarrationQueue::default();
+        let first = markdown("Terminal", cx);
+        let second = markdown("Terminal", cx);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let facts = |label| ToolCallFacts {
+                command: Some("cargo test -p read_aloud".to_string()),
+                ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+            };
+            assert!(queue.push_tool_call(facts(first), cx));
+            assert!(
+                !queue.push_tool_call(facts(second), cx),
+                "the same command back to back tells the listener nothing new"
+            );
+        });
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// A prompt sees the real command and the real path — and, above all,
+    /// that something failed.
+    #[gpui::test]
+    async fn a_prompt_sees_the_real_command_and_whether_it_failed(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            command: Some("cargo test -p read_aloud".to_string()),
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert_eq!(
+                facts.description(cx),
+                "ran the command `cargo test -p read_aloud`",
+                "never the generic title, which tells a model nothing"
+            );
+            let failed = ToolCallFacts {
+                outcome: ToolCallOutcome::Failed,
+                ..facts.clone()
+            };
+            assert!(
+                failed.description(cx).contains("FAILED"),
+                "a failure is the one thing a supervising listener must hear"
+            );
+        });
+    }
+
     #[test]
     fn a_cd_prefix_stops_at_the_earliest_separator() {
         // `cd /x; ls && grep …` runs `ls`; searching for `&&` first would
         // strip straight through it and announce the wrong program.
         assert_eq!(
-            generated_phrase("cd /x; ls -la && grep foo", NarrationKind::Execute, false).as_deref(),
+            generated_phrase(
+                NarrationKind::Execute,
+                None,
+                "cd /x; ls -la && grep foo",
+                false
+            )
+            .as_deref(),
             Some("Running `ls`.")
         );
         assert_eq!(
-            generated_phrase("cd /x && cargo test", NarrationKind::Execute, false).as_deref(),
+            generated_phrase(NarrationKind::Execute, None, "cd /x && cargo test", false).as_deref(),
             Some("Running `cargo test`.")
         );
     }
@@ -1368,8 +1687,9 @@ mod tests {
         // A backslash surviving into the code span would be spoken.
         assert_eq!(
             generated_phrase(
-                "Read file `crates/read\\_aloud/src/player.rs`",
                 NarrationKind::Read,
+                None,
+                "Read file `crates/read\\_aloud/src/player.rs`",
                 false
             )
             .as_deref(),
@@ -1476,7 +1796,7 @@ mod tests {
             (command, NarrationKind::Execute),
             (third, NarrationKind::Read),
         ] {
-            cx.update(|cx| queue.push_tool_call(label, kind, cx));
+            cx.update(|cx| queue.push_tool_call(titled(label, kind), cx));
             let narration = queue.pop().expect("the call was queued");
             spoken.push(
                 narration
@@ -1505,7 +1825,7 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|cx| {
-            queue.push_tool_call(label, NarrationKind::Read, cx);
+            queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             queue.push_summary(summary, vec![message], cx);
         });
         assert_eq!(
@@ -1533,7 +1853,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             for label in labels {
-                queue.push_tool_call(label, NarrationKind::Read, cx);
+                queue.push_tool_call(titled(label, NarrationKind::Read), cx);
             }
         });
         assert_eq!(queue.recent_lines().len(), RECENT_LINES);

@@ -10,7 +10,8 @@ pub use inworld::{
 };
 pub use narration::{
     MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, MAX_WRAP_UP_CHARS, NOTHING_TO_ADD, NarrationKind,
-    SummaryModel, TRIVIAL_MESSAGE_CHARS, step_prompt, summary_prompt, wrap_up_prompt,
+    SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallOutcome, step_prompt,
+    summary_prompt, wrap_up_prompt,
 };
 pub use player::{Player, PlayerEvent};
 pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
@@ -244,11 +245,22 @@ const MAX_TURN_ACTIVITY: usize = 24;
 
 /// One tool call, as the step that contains it remembers it.
 struct StepToolCall {
-    label: Entity<Markdown>,
-    kind: NarrationKind,
-    /// The label as the prompt should see it, captured when the call joined
+    facts: ToolCallFacts,
+    /// The call as the prompt should see it, captured when the call joined
     /// the step so the prompt never has to read an entity.
     description: String,
+}
+
+/// One thing the agent did this turn, as raw material for the wrap-up.
+struct TurnAction {
+    /// The agent's own id for the call, so a later status update finds the
+    /// action it is about.
+    id: String,
+    /// The call as the prompt should see it, refreshed when the outcome
+    /// changes: a failure is the single most important thing to carry
+    /// through to the wrap-up.
+    description: String,
+    facts: ToolCallFacts,
 }
 
 /// The prose the agent wrote plus the tool calls it then made: one thing it
@@ -422,9 +434,18 @@ pub struct ReadAloud {
     step_tasks: HashMap<usize, Task<()>>,
     next_step_number: usize,
     /// Every tool call this turn has made, as raw material for the wrap-up.
-    /// Raw labels rather than their spoken forms: the model gets more out of
-    /// the real path or command than out of "reading player".
-    turn_activity: Vec<String>,
+    /// The real paths and commands rather than their spoken forms: the model
+    /// gets more out of those than out of "reading player".
+    turn_activity: Vec<TurnAction>,
+    /// How many tool calls this turn has made, uncapped — the wrap-up's
+    /// length budget is chosen from the size of the turn, and
+    /// [`MAX_TURN_ACTIVITY`] would flatten every large turn into the same
+    /// number.
+    turn_tool_calls: usize,
+    /// When this turn's first tool call arrived, on the executor's clock so
+    /// tests can move it. The other half of the wrap-up's length budget: a
+    /// long turn earns a longer sign-off even if it made few calls.
+    turn_started_at: Option<std::time::Instant>,
     wrap_up: Option<WrapUp>,
     /// How many wrap-up generations this *turn* has spent. Kept out of
     /// [`WrapUp`] because a wrap-up is discarded whenever the agent turns out
@@ -517,6 +538,8 @@ impl ReadAloud {
             step_tasks: HashMap::new(),
             next_step_number: 0,
             turn_activity: Vec::new(),
+            turn_tool_calls: 0,
+            turn_started_at: None,
             wrap_up: None,
             wrap_up_issues: 0,
             narration_wash: Vec::new(),
@@ -983,29 +1006,30 @@ impl ReadAloud {
     /// what the agent is doing and why.
     ///
     /// The owning view decides *when* a call is worth taking: a tool call's
-    /// real label arrives after the entry does, so this is called with the
-    /// refined label, never the placeholder.
-    pub fn narrate_tool_call(
-        &mut self,
-        label: &Entity<Markdown>,
-        kind: NarrationKind,
-        cx: &mut Context<Self>,
-    ) {
+    /// structured input and its title both arrive after the entry does, so
+    /// this is called once they have stopped changing.
+    pub fn narrate_tool_call(&mut self, facts: ToolCallFacts, cx: &mut Context<Self>) {
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }
-        let source = label.read(cx).source().trim().to_string();
-        if source.is_empty() {
+        if facts.spoken_key(cx).trim().is_empty() {
             return;
         }
-        let description = narration::tool_call_description(&source, kind);
+        let description = facts.description(cx);
+        self.turn_tool_calls += 1;
+        self.turn_started_at
+            .get_or_insert_with(|| cx.background_executor().now());
         if self.turn_activity.len() < MAX_TURN_ACTIVITY {
-            self.turn_activity.push(description.clone());
+            self.turn_activity.push(TurnAction {
+                id: facts.id.clone(),
+                description: description.clone(),
+                facts: facts.clone(),
+            });
         }
         self.invalidate_speculated_wrap_up();
         match self.detail {
             NarrationDetail::Actions => {
-                if !self.narration.push_tool_call(label.clone(), kind, cx) {
+                if !self.narration.push_tool_call(facts, cx) {
                     return;
                 }
                 self.start_next_narration_if_idle(cx);
@@ -1018,7 +1042,7 @@ impl ReadAloud {
                 // free line `actions` gives, and the same one the queue's
                 // collapse rules fold into a count when a burst arrives.
                 if self.step.as_ref().is_none_or(|step| step.prose.is_empty()) {
-                    if self.narration.push_tool_call(label.clone(), kind, cx) {
+                    if self.narration.push_tool_call(facts, cx) {
                         self.start_next_narration_if_idle(cx);
                     }
                     return;
@@ -1034,11 +1058,7 @@ impl ReadAloud {
                     .as_ref()
                     .is_some_and(|step| step.tool_calls.is_empty());
                 if let Some(step) = self.step.as_mut() {
-                    step.tool_calls.push(StepToolCall {
-                        label: label.clone(),
-                        kind,
-                        description,
-                    });
+                    step.tool_calls.push(StepToolCall { facts, description });
                 }
                 if first_call {
                     self.speak_step_opening(cx);
@@ -1047,6 +1067,26 @@ impl ReadAloud {
                 self.arm_step_idle_timer(cx);
             }
         }
+    }
+
+    /// Records how a tool call this turn ended.
+    ///
+    /// Kept apart from [`Self::narrate_tool_call`] because the two happen at
+    /// different times: a call is narrated as soon as what it is doing can
+    /// be named, and whether it worked is only known later. "The tests
+    /// failed" is the single most important thing a supervising listener
+    /// needs, and nothing else in the turn's material carries it.
+    pub fn note_tool_call_outcome(&mut self, id: &str, outcome: ToolCallOutcome, cx: &App) {
+        let Some(action) = self
+            .turn_activity
+            .iter_mut()
+            .find(|action| action.id == id)
+            .filter(|action| action.facts.outcome != outcome)
+        else {
+            return;
+        };
+        action.facts.outcome = outcome;
+        action.description = action.facts.description(cx);
     }
 
     /// Takes one finished assistant message. In `actions` detail it is
@@ -1182,6 +1222,8 @@ impl ReadAloud {
         self.step_idle_task = None;
         self.step_tasks.clear();
         self.turn_activity.clear();
+        self.turn_tool_calls = 0;
+        self.turn_started_at = None;
         self.wrap_up = None;
         self.wrap_up_issues = 0;
     }
@@ -1566,7 +1608,7 @@ impl ReadAloud {
             self.narrate_message_plainly(step.prose, narration::OPENING_SENTENCES, cx);
         }
         for call in step.tool_calls {
-            self.narration.push_tool_call(call.label, call.kind, cx);
+            self.narration.push_tool_call(call.facts, cx);
         }
         self.start_next_narration_if_idle(cx);
     }
@@ -1669,9 +1711,14 @@ impl ReadAloud {
         };
         let message = Self::message_source(&blocks, cx);
         let issued_chars = message.len();
+        let activity: Vec<String> = self
+            .turn_activity
+            .iter()
+            .map(|action| action.description.clone())
+            .collect();
         let prompt = narration::wrap_up_prompt(
             &message,
-            &self.turn_activity,
+            &activity,
             &self.narration.recent_lines(),
             still_streaming,
         );
@@ -3814,6 +3861,15 @@ mod tests {
     /// below that hands over a tool call or a message and expects to hear
     /// about it immediately is pinning *that* contract, which is what
     /// `actions` now names.
+    /// A tool call with nothing but a title behind it — the Zed-native
+    /// shape, where the title carries the command or the path. External ACP
+    /// agents send generic titles and put the content in structured fields;
+    /// those are exercised by the tests that build [`ToolCallFacts`]
+    /// directly.
+    fn titled_call(label: Entity<Markdown>, kind: NarrationKind) -> ToolCallFacts {
+        ToolCallFacts::from_label("call", label, kind)
+    }
+
     fn narration_reader(
         provider: &FakeTts,
         sink: &FakeSink,
@@ -4004,7 +4060,7 @@ mod tests {
                 markdown_entity(label, cx)
             };
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&markdown, kind, cx);
+                read_aloud.narrate_tool_call(titled_call(markdown.clone(), kind), cx);
             });
             cx.run_until_parked();
             assert_eq!(
@@ -4025,7 +4081,7 @@ mod tests {
         let label = markdown_entity("crates/read_aloud/src/player.rs", cx);
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Edit, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Edit), cx);
         });
         cx.run_until_parked();
         let source_length = label.read_with(cx, |markdown, _| markdown.source().len());
@@ -4053,7 +4109,7 @@ mod tests {
         let label = markdown_entity("Read player.rs", cx);
         let message = markdown_entity(&format!("{} sentence.\n", "A long ".repeat(60)), cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             read_aloud.narrate_message(vec![message], cx);
         });
         cx.run_until_parked();
@@ -4072,7 +4128,7 @@ mod tests {
         let label = markdown_entity("Read player.rs", cx);
 
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4093,7 +4149,7 @@ mod tests {
 
         for label in &labels {
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -4124,7 +4180,7 @@ mod tests {
         let read_aloud = narration_reader(&provider, &sink, cx);
         let first = markdown_entity("Read player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&first, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(first.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -4134,7 +4190,7 @@ mod tests {
 
         let second = markdown_entity("Edit segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&second, NarrationKind::Edit, cx);
+            read_aloud.narrate_tool_call(titled_call(second.clone(), NarrationKind::Edit), cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4182,7 +4238,7 @@ mod tests {
         // have latched anything the way a user stop does.
         let label = markdown_entity("Read player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         assert!(
@@ -4605,7 +4661,7 @@ mod tests {
         // mode.
         let label = markdown_entity("Read player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         sink.finish_one();
         cx.executor().advance_clock(POSITION_POLL_INTERVAL);
@@ -4635,7 +4691,7 @@ mod tests {
 
         let label = markdown_entity("Read player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         assert!(
@@ -4679,7 +4735,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4731,7 +4787,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![first], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -4762,7 +4818,7 @@ mod tests {
 
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message.clone()], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -4806,7 +4862,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -4852,7 +4908,7 @@ mod tests {
         ] {
             let label = read_tool_label(path, cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -4897,7 +4953,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         drain_narration(&sink, cx);
@@ -4927,7 +4983,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         drain_narration(&sink, cx);
@@ -4959,7 +5015,7 @@ mod tests {
 
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -4991,7 +5047,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         assert_eq!(model.prompts().len(), 1, "the step asked");
@@ -5046,7 +5102,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         // The quiet window closes the step while the answer is still coming.
         let_the_step_close(cx);
@@ -5084,7 +5140,7 @@ mod tests {
         // A bare tool call speaks straight away, so it is on the record.
         let first = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&first, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(first.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -5092,7 +5148,7 @@ mod tests {
         let second = read_tool_label("crates/read_aloud/src/segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&second, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(second.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
 
@@ -5117,7 +5173,7 @@ mod tests {
     ) -> Entity<Markdown> {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         markdown_entity(&long_message_source(), cx)
@@ -5255,7 +5311,7 @@ mod tests {
         ] {
             let label = read_tool_label(path, cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -5312,7 +5368,7 @@ mod tests {
         ] {
             let label = read_tool_label(path, cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -5351,7 +5407,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message.clone()], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         read_aloud.update(cx, |read_aloud, cx| {
@@ -5479,7 +5535,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message.clone()], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -5544,7 +5600,7 @@ mod tests {
         // The label settles and the call finally joins the step it belongs to.
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         drain_narration(&sink, cx);
@@ -5618,7 +5674,7 @@ mod tests {
         // ...but the agent had not finished: it does more work.
         let next = read_tool_label("crates/read_aloud/src/segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&next, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(next.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -5668,7 +5724,7 @@ mod tests {
             cx.run_until_parked();
             let label = read_tool_label(&format!("crates/read_aloud/src/file_{index}.rs"), cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -5700,7 +5756,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message.clone()], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
         // Let the opening finish so the fused line takes the floor — but not
@@ -5751,7 +5807,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message.clone()], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         let_the_step_close(cx);
 
@@ -5779,7 +5835,7 @@ mod tests {
         // Narration resumes with the next thing the agent does.
         let next = read_tool_label("crates/read_aloud/src/segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&next, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(next.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         drain_narration(&sink, cx);
@@ -5836,7 +5892,7 @@ mod tests {
         let spoken_after_the_switch = provider.spoken();
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         drain_narration(&sink, cx);
@@ -5930,7 +5986,7 @@ mod tests {
         for index in 0..5 {
             let label = read_tool_label(&format!("crates/read_aloud/src/file_{index}.rs"), cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -5949,7 +6005,7 @@ mod tests {
         let edit = markdown_entity("crates/read\\_aloud/src/segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&edit, NarrationKind::Edit, cx);
+            read_aloud.narrate_tool_call(titled_call(edit.clone(), NarrationKind::Edit), cx);
         });
         let_the_step_close(cx);
         assert!(
@@ -5969,7 +6025,7 @@ mod tests {
         ] {
             let label = read_tool_label(path, cx);
             read_aloud.update(cx, |read_aloud, cx| {
-                read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+                read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
             });
             cx.run_until_parked();
         }
@@ -6021,7 +6077,7 @@ mod tests {
         let label = read_tool_label("crates/read_aloud/src/player.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.narrate_message(vec![message], cx);
-            read_aloud.narrate_tool_call(&label, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(label.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
 
@@ -6039,7 +6095,7 @@ mod tests {
 
         let next = read_tool_label("crates/read_aloud/src/segmenter.rs", cx);
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.narrate_tool_call(&next, NarrationKind::Read, cx);
+            read_aloud.narrate_tool_call(titled_call(next.clone(), NarrationKind::Read), cx);
         });
         cx.run_until_parked();
         drain_narration(&sink, cx);
