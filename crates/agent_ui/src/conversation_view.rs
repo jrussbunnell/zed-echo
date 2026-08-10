@@ -13040,4 +13040,318 @@ pub(crate) mod tests {
             self
         }
     }
+
+    /// The other half of what the user heard, and the half the existing
+    /// contentless-call test could not catch: the payload is *not* empty, the
+    /// command is there, and it shortens to a shell keyword because the
+    /// description has not arrived yet.
+    ///
+    /// The timing is the whole test. In the capture, `{command}` and
+    /// `{command, description}` arrive in consecutive protocol messages, so a
+    /// test that delivers them back to back is green over broken code. The
+    /// clock is advanced past the settle timer in between, which is the
+    /// moment narration used to say "Running for p in".
+    #[gpui::test]
+    async fn test_read_aloud_narration_never_speaks_a_shell_keyword(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let update = |update: acp::SessionUpdate, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| connection.send_update(session_id, update, cx));
+            cx.run_until_parked();
+        };
+
+        // Verbatim from the capture: rawInput arrives empty, then the command
+        // alone, then the command with its description.
+        let command = "for h in \"x-hostname-override: www.bartrhomes.com\" \
+                       \"Host: www.localhost:3033\"; do echo \"=== $h ===\"; \
+                       curl -s -o /tmp/rr.out http://localhost:3033/robots.txt; done";
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("toolu_01LdeLBUQxPp2ir5aY8qkpwD", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(json!({})),
+            ),
+            cx,
+        );
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("toolu_01LdeLBUQxPp2ir5aY8qkpwD"),
+                acp::ToolCallUpdateFields::new()
+                    .title(command)
+                    .raw_input(json!({ "command": command })),
+            )),
+            cx,
+        );
+        // The gap the description lands in. Everything the listener heard was
+        // said here.
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            Vec::<String>::new(),
+            "silence beats \"Running for p in\", got {:?}",
+            provider.spoken()
+        );
+
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("toolu_01LdeLBUQxPp2ir5aY8qkpwD"),
+                acp::ToolCallUpdateFields::new().title(command).raw_input(json!({
+                    "command": command,
+                    "description": "Test robots.txt with hostname override and Host header",
+                })),
+            )),
+            cx,
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec!["Testing robots.txt with hostname override and Host header.".to_string()],
+            "and the description that follows is what is actually said, got {:?}",
+            provider.spoken()
+        );
+
+        // A call that never gets a description is dropped rather than
+        // resurrected by the turn-end sweep.
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("toolu_never_described", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(json!({ "command": "echo \"=== app dirs ===\" && ls -1 app/" })),
+            ),
+            cx,
+        );
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec!["Testing robots.txt with hostname override and Host header.".to_string()],
+            "the sweep speaks what is worth speaking and nothing else, got {:?}",
+            provider.spoken()
+        );
+    }
+
+    /// The feature the user actually asked for, driven the way they will:
+    /// nothing narrating, one press, hear what happened.
+    #[gpui::test]
+    async fn test_read_aloud_catch_up_speaks_the_span_since_the_last_press(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        // The on-demand arrangement: read aloud is on, and it is not to start
+        // talking on its own.
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().auto_play = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        // Nothing has happened, and pressing says exactly that.
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec![thread_view::NOTHING_NEW_SINCE_LAST_CATCH_UP.to_string()]
+        );
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let update = |update: acp::SessionUpdate, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| connection.send_update(session_id, update, cx));
+            cx.run_until_parked();
+        };
+        update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                "Checking the marketing routes now. The sitemap is the one I am unsure \
+                 about, so I will fetch it first and then run the tests."
+                    .into(),
+            )),
+            cx,
+        );
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-1", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Completed)
+                    .raw_input(json!({
+                        "command": "curl -s http://localhost:3033/sitemap.xml",
+                        "description": "Fetch the sitemap",
+                    }))
+                    .raw_output(json!("<urlset>13 urls</urlset>")),
+            ),
+            cx,
+        );
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-2", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Failed)
+                    .raw_input(json!({
+                        "command": "pnpm test",
+                        "description": "Run the marketing tests",
+                    }))
+                    .raw_output(json!("Exit code 1\n2 failing")),
+            ),
+            cx,
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        let heard_unasked = provider.spoken();
+
+        // The span holds both calls, what they printed, and the failure.
+        let span = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("two calls have happened since the last press");
+        assert_eq!(span.tool_calls, 2);
+        assert!(
+            span.activity.iter().any(|line| line.contains("13 urls")),
+            "what the command printed is the point: {:?}",
+            span.activity
+        );
+        assert!(
+            span.activity
+                .iter()
+                .any(|line| line.contains("it FAILED") && line.contains("Exit code 1")),
+            "and a failure is never the thing dropped: {:?}",
+            span.activity
+        );
+
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        let after_first_press = provider.spoken();
+        assert!(
+            after_first_press.len() > heard_unasked.len(),
+            "pressing the button says something, got {after_first_press:?}"
+        );
+
+        // The watermark has moved: the same span is not replayed.
+        assert!(
+            thread_view
+                .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+                .is_none(),
+            "nothing is left over from the span just spoken"
+        );
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken().last().map(String::as_str),
+            Some(thread_view::NOTHING_NEW_SINCE_LAST_CATCH_UP),
+            "a second press with nothing new says so rather than repeating \
+             itself, got {:?}",
+            provider.spoken()
+        );
+
+        // …and a new call reopens the span.
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-3", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Completed)
+                    .raw_input(json!({
+                        "command": "pnpm build",
+                        "description": "Rebuild the marketing site",
+                    }))
+                    .raw_output(json!("built in 4s")),
+            ),
+            cx,
+        );
+        let span = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("a new call is new activity");
+        assert_eq!(span.tool_calls, 1, "and only the new call is in it");
+        assert!(
+            span.activity.iter().any(|line| line.contains("built in 4s")),
+            "{:?}",
+            span.activity
+        );
+
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+    }
+
+    /// `auto_play: false` is what makes the button the whole experience. It
+    /// governed full mode's prose and left narration talking, which meant
+    /// there was no way to have read aloud available without having it
+    /// running.
+    #[gpui::test]
+    async fn test_read_aloud_auto_play_off_silences_narration_but_not_the_button(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.read_aloud.get_or_insert_default().auto_play = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        connection.set_next_prompt_updates(read_aloud_narration_updates(
+            &read_aloud_long_message(),
+        ));
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            Vec::<String>::new(),
+            "a whole turn narrated at somebody who asked for quiet, got {:?}",
+            provider.spoken()
+        );
+
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            !provider.spoken().is_empty(),
+            "but the button they pressed still speaks"
+        );
+    }
 }

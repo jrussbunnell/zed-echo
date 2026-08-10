@@ -694,6 +694,22 @@ pub struct ThreadView {
     read_aloud_warned_no_summary_model: bool,
     /// Whether the "the summary model is not answering" toast has been shown.
     read_aloud_warned_model_failing: bool,
+    /// Where the last catch-up left off: the entry count at the moment it was
+    /// asked for. Everything at or after it is what the listener has not been
+    /// told about.
+    ///
+    /// An entry index rather than an accumulated log, because the thread
+    /// already remembers every tool call of the session with its input, its
+    /// output and its status, and a second copy could only drift from it. It
+    /// starts at zero rather than at the view's own watermark: the first
+    /// press is meant to cover the session, including the part of it that was
+    /// restored from history.
+    read_aloud_catch_up_watermark: usize,
+    /// When that watermark was set, so the catch-up's length can be sized by
+    /// how long the listener has been away as well as by how much happened.
+    /// `None` before the first press — the span is then the session, whose
+    /// start this view did not see.
+    read_aloud_catch_up_since: Option<Instant>,
 }
 
 /// How long a tool call's label must hold still before narration believes
@@ -715,6 +731,13 @@ struct ToolCallNarration {
     last_key: String,
     narrated: bool,
 }
+
+/// What a catch-up says when nothing has happened since the last press.
+///
+/// Short on purpose, and not the previous summary again: pressing a button and
+/// hearing the same paragraph twice leaves no way to tell "nothing happened"
+/// from "the button did nothing".
+pub(crate) const NOTHING_NEW_SINCE_LAST_CATCH_UP: &str = "Nothing new since the last catch-up.";
 
 /// Identifies the "read aloud is disabled" toast so repeat showings replace one
 /// another instead of stacking, even across thread views.
@@ -778,6 +801,11 @@ fn read_aloud_tool_call_facts(tool_call: &acp_thread::ToolCall) -> read_aloud::T
         path,
         url: raw.url,
         query: raw.query,
+        // What the call found. `raw_output` is where a finished call's own
+        // output lands — for Claude Code, the command's combined output, and
+        // for a failure the exit code in front of it — so a summary can say
+        // what came back instead of only what was attempted.
+        output: read_aloud::tool_output(tool_call.raw_output.as_ref()),
         input: raw.input,
         outcome: read_aloud_tool_call_outcome(&tool_call.status),
     }
@@ -810,17 +838,27 @@ enum NarrationTrigger {
 /// the timer speaks the placeholder — "running terminal". An empty payload
 /// means *not ready yet*, and the wait continues until content arrives or a
 /// backstop fires.
+///
+/// A command that shortens to a shell keyword waits for the same reason and
+/// on the same terms. Claude Code fills `command` in one update and
+/// `description` in the next, so the settle timer can expire on a call whose
+/// only sayable form is "for p in" while the sentence that would have named
+/// it is one message away. Waiting costs the call one more update; not
+/// waiting is what the listener reported hearing. If the description never
+/// comes, the queue declines to speak the keyword at all — see
+/// [`read_aloud::ToolCallFacts::is_shell_noise`].
 fn read_aloud_tool_call_is_ready(
     facts: &read_aloud::ToolCallFacts,
     status: &ToolCallStatus,
     trigger: NarrationTrigger,
+    cx: &App,
 ) -> bool {
     if trigger == NarrationTrigger::TurnEnded
         || matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
     {
         return true;
     }
-    trigger == NarrationTrigger::Settled && !facts.awaiting_input()
+    trigger == NarrationTrigger::Settled && !facts.awaiting_input() && !facts.is_shell_noise(cx)
 }
 
 /// The rungs [`ThreadView::read_aloud_summary_model`] walks, as a function of
@@ -848,6 +886,21 @@ fn resolve_read_aloud_summary_model(
     .or_else(|| usable(registry.thread_summary_model(cx)))
     .or_else(|| usable(registry.commit_message_model(cx)))
     .or_else(|| usable(registry.inline_assistant_model()))
+}
+
+/// Whether narration may speak *without being asked*.
+///
+/// `auto_play` is the setting that already means "do not start talking on your
+/// own", and until now it only governed full mode's prose — narration went on
+/// narrating with it off, so there was no way to have read aloud available
+/// without having it running. That is precisely the arrangement the catch-up
+/// button is for: `auto_play: false` plus a button is the on-demand mode, and
+/// it needs no setting of its own. Everything explicit — the toggle, the
+/// per-message speakers, a sentence click, [`read_aloud::SummarizeSession`] —
+/// deliberately does not consult this.
+fn read_aloud_narrates_unasked(cx: &App) -> bool {
+    let settings = read_aloud::ReadAloudSettings::get_global(cx);
+    settings.auto_play && settings.mode == read_aloud::ReadAloudMode::Narration
 }
 
 fn read_aloud_tool_call_outcome(status: &ToolCallStatus) -> read_aloud::ToolCallOutcome {
@@ -1325,6 +1378,8 @@ impl ThreadView {
             read_aloud_label_settle: None,
             read_aloud_warned_no_summary_model: false,
             read_aloud_warned_model_failing: false,
+            read_aloud_catch_up_watermark: 0,
+            read_aloud_catch_up_since: None,
         };
 
         this.init_read_aloud(cx);
@@ -1685,6 +1740,11 @@ impl ThreadView {
                     // turn's indices would silently disable auto-play for
                     // every turn until the count grew past it again.
                     this.read_aloud_watermark = this.read_aloud_watermark.min(range.start);
+                    // Same hazard for the catch-up span: a watermark above
+                    // the regenerated turn's indices would report "nothing
+                    // new" about work that had just been redone.
+                    this.read_aloud_catch_up_watermark =
+                        this.read_aloud_catch_up_watermark.min(range.start);
                     // Tool-call ids are scoped to the message they belong to,
                     // so a regenerated turn can reuse one. Remembering that
                     // the *removed* call was narrated would silence its
@@ -1827,8 +1887,9 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        let settings = read_aloud::ReadAloudSettings::get_global(cx);
-        if settings.mode != read_aloud::ReadAloudMode::Narration || !settings.narrate_tool_calls {
+        if !read_aloud_narrates_unasked(cx)
+            || !read_aloud::ReadAloudSettings::get_global(cx).narrate_tool_calls
+        {
             return;
         }
         if entry_index < self.read_aloud_watermark {
@@ -1849,8 +1910,10 @@ impl ThreadView {
         }
         let facts = read_aloud_tool_call_facts(tool_call);
         let outcome = facts.outcome;
-        let ready = read_aloud_tool_call_is_ready(&facts, &tool_call.status, trigger);
-        let awaiting_input = facts.awaiting_input();
+        let ready = read_aloud_tool_call_is_ready(&facts, &tool_call.status, trigger, cx);
+        // The two waits have the same shape: the line cannot improve until
+        // the agent sends more, so nothing is gained by timing it again.
+        let awaiting_refinement = facts.awaiting_input() || facts.is_shell_noise(cx);
         let call_id = tool_call.id.clone();
         let key = facts.spoken_key(cx);
 
@@ -1877,11 +1940,12 @@ impl ThreadView {
             // Either way the step it belongs to must not close underneath it,
             // so the reader is told the agent is mid-action.
             self.hold_read_aloud_step(cx);
-            // An empty payload has nothing to time: its line cannot move
-            // until content arrives, and the update that brings the content
-            // re-enters here and arms the timer then. Re-arming on every
-            // expiry instead would spin a timer for the life of the call.
-            if moved || (self.read_aloud_label_settle.is_none() && !awaiting_input) {
+            // An empty payload — or a command that is still only a shell
+            // keyword — has nothing to time: its line cannot move until more
+            // arrives, and the update that brings it re-enters here and arms
+            // the timer then. Re-arming on every expiry instead would spin a
+            // timer for the life of the call.
+            if moved || (self.read_aloud_label_settle.is_none() && !awaiting_refinement) {
                 self.arm_read_aloud_label_settle(cx);
             }
             return;
@@ -1986,9 +2050,7 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        if read_aloud::ReadAloudSettings::get_global(cx).mode
-            != read_aloud::ReadAloudMode::Narration
-        {
+        if !read_aloud_narrates_unasked(cx) {
             return;
         }
         if entry_index < self.read_aloud_watermark {
@@ -2017,9 +2079,7 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        if read_aloud::ReadAloudSettings::get_global(cx).mode
-            != read_aloud::ReadAloudMode::Narration
-        {
+        if !read_aloud_narrates_unasked(cx) {
             return;
         }
         if entry_index < self.read_aloud_watermark {
@@ -2037,6 +2097,121 @@ impl ThreadView {
         });
     }
 
+    /// Speaks a summary of everything the agent has done since this was last
+    /// asked for — the whole session, the first time.
+    ///
+    /// The point of the feature is *not* having to listen: with several
+    /// sessions running, or during a long turn nobody wants narrated at them,
+    /// one press is worth twenty minutes of ambient status. So this ignores
+    /// the things that decide whether narration speaks *unasked* — the mode,
+    /// the stop latch, `auto_play` — and only needs read aloud to be on at
+    /// all.
+    ///
+    /// The span is assembled from the thread's own entries rather than from
+    /// anything narration accumulated: the reader throws its material away at
+    /// the end of every turn, and this span deliberately crosses turns.
+    pub(crate) fn summarize_read_aloud_session(&mut self, cx: &mut Context<Self>) {
+        let Some(read_aloud) = self.read_aloud.clone() else {
+            return;
+        };
+        let entry_count = self.thread.read(cx).entries().len();
+        let watermark = self.read_aloud_catch_up_watermark.min(entry_count);
+        let span = self.read_aloud_catch_up_span(watermark, cx);
+        // Advance before speaking, not after: the span is "since you asked",
+        // and asking is what just happened. A model failure therefore costs
+        // the span rather than repeating it on the next press — which is the
+        // right way round, because a second press that replayed a failed
+        // catch-up would be indistinguishable from the button not working.
+        self.read_aloud_catch_up_since = Some(Instant::now());
+        self.read_aloud_catch_up_watermark = entry_count;
+
+        let Some((span, blocks)) = span else {
+            read_aloud.update(cx, |read_aloud, cx| {
+                read_aloud.announce(NOTHING_NEW_SINCE_LAST_CATCH_UP, cx);
+            });
+            return;
+        };
+        let summary_model = self.require_read_aloud_summary_model(cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_summary_model(summary_model);
+            read_aloud.catch_up(span, blocks, cx);
+        });
+    }
+
+    /// The material for a catch-up covering every entry from `watermark` on,
+    /// and the prose blocks it should wash while speaking.
+    ///
+    /// `None` when there is nothing there at all — no new entries and no
+    /// actions — which is what a second press in a row means. New prose with
+    /// no actions behind it is *not* nothing: a turn that only wrote is still
+    /// a turn the listener missed, and it goes to the model with an empty
+    /// account rather than being answered with "nothing new".
+    ///
+    /// Separate from the press so the span itself is testable without a
+    /// model, which is the half of this that can be got wrong quietly.
+    fn read_aloud_catch_up_span(
+        &self,
+        watermark: usize,
+        cx: &App,
+    ) -> Option<(read_aloud::CatchUpSpan, Vec<Entity<Markdown>>)> {
+        let entries = self.thread.read(cx).entries();
+        let calls: Vec<read_aloud::ToolCallFacts> = entries
+            .iter()
+            .skip(watermark)
+            .filter_map(|entry| match entry {
+                // A call the user refused, or that a cancellation took down,
+                // never happened — the same rule narration applies live.
+                AgentThreadEntry::ToolCall(tool_call)
+                    if !matches!(
+                        tool_call.status,
+                        ToolCallStatus::Rejected | ToolCallStatus::Canceled
+                    ) =>
+                {
+                    Some(read_aloud_tool_call_facts(tool_call))
+                }
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() && entries.len() <= watermark {
+            return None;
+        }
+        let blocks = Self::latest_assistant_markdown_in(&self.thread, cx)
+            .map_or_else(Vec::new, |(entry_index, _)| {
+                Self::assistant_message_markdowns(entries, entry_index, cx)
+            });
+        if calls.is_empty() && blocks.is_empty() {
+            return None;
+        }
+        let actions: Vec<(read_aloud::ToolCallOutcome, String)> = calls
+            .iter()
+            .map(|facts| (facts.outcome, facts.description(cx)))
+            .collect();
+        let span = read_aloud::CatchUpSpan {
+            activity: read_aloud::bounded_activity(&actions),
+            files_changed: read_aloud::files_changed(calls.iter(), cx),
+            message: blocks
+                .iter()
+                .map(|block| block.read(cx).source().to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            still_streaming: self.thread.read(cx).status() == ThreadStatus::Generating,
+            tool_calls: calls.len(),
+            elapsed: self
+                .read_aloud_catch_up_since
+                .map(|since| Instant::now().saturating_duration_since(since)),
+        };
+        Some((span, blocks))
+    }
+
+    #[cfg(test)]
+    pub(super) fn read_aloud_catch_up_span_for_test(
+        &self,
+        cx: &App,
+    ) -> Option<read_aloud::CatchUpSpan> {
+        self.read_aloud_catch_up_span(self.read_aloud_catch_up_watermark, cx)
+            .map(|(span, _)| span)
+    }
+
     /// Asks narration to start the turn's wrap-up while the agent is still
     /// writing its closing message, so the audio is ready the instant the
     /// turn ends rather than a model round trip afterwards.
@@ -2048,9 +2223,7 @@ impl ThreadView {
         let Some(read_aloud) = self.read_aloud.clone() else {
             return;
         };
-        if read_aloud::ReadAloudSettings::get_global(cx).mode
-            != read_aloud::ReadAloudMode::Narration
-        {
+        if !read_aloud_narrates_unasked(cx) {
             return;
         }
         if entry_index < self.read_aloud_watermark {
@@ -2306,6 +2479,7 @@ impl ThreadView {
                             .tooltip(Tooltip::text("Read Aloud"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_read_aloud(cx))),
                     )
+                    .child(self.render_read_aloud_catch_up_button(cx))
                     .children(mode_toggle)
                     .into_any_element(),
             ));
@@ -2344,6 +2518,7 @@ impl ThreadView {
             )
             .child(sentence_preview)
             .child(voice_menu)
+            .child(self.render_read_aloud_catch_up_button(cx))
             .children(mode_toggle)
             .child(
                 IconButton::new("read-aloud-dismiss", IconName::Close)
@@ -2402,6 +2577,7 @@ impl ThreadView {
                     .color(Color::Muted),
             )
             .child(voice_menu)
+            .child(self.render_read_aloud_catch_up_button(cx))
             .children(mode_toggle)
             .child(
                 IconButton::new("read-aloud-stop", IconName::Close)
@@ -2413,6 +2589,27 @@ impl ThreadView {
         };
 
         Some(Self::float_above_composer(pill.into_any_element()))
+    }
+
+    /// "Catch me up": speaks what has happened since it was last pressed.
+    ///
+    /// On every form of the mini player, including the quiet pill shown when
+    /// nothing is playing — that state, with `auto_play` off, *is* the
+    /// on-demand experience, and a button that only appeared once something
+    /// was already talking would be there exactly when it is not wanted.
+    fn render_read_aloud_catch_up_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Deliberately not `ListCollapse`: that is the narration-mode toggle
+        // sitting right beside it, and two identical glyphs would read as one
+        // control.
+        IconButton::new("read-aloud-catch-up", IconName::ThreadFromSummary)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::for_action_title(
+                "Catch Me Up",
+                &read_aloud::SummarizeSession,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.summarize_read_aloud_session(cx)))
+            .into_any_element()
     }
 
     /// A zero-height anchor: read-aloud controls float above the composer
@@ -13868,6 +14065,11 @@ impl Render for ThreadView {
                 this.toggle_read_aloud(cx);
             }))
             .on_action(
+                cx.listener(|this, _: &read_aloud::SummarizeSession, _window, cx| {
+                    this.summarize_read_aloud_session(cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &read_aloud::TogglePause, _window, cx| {
                     if let Some(read_aloud) = this.read_aloud.clone() {
                         read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
@@ -14476,7 +14678,7 @@ mod tests {
             resolved_locations: Vec::new(),
             raw_input: update.get("rawInput").cloned(),
             raw_input_markdown: None,
-            raw_output: None,
+            raw_output: update.get("rawOutput").cloned(),
             tool_name: None,
             subagent_session_info: None,
             sandbox_authorization_details: None,
@@ -14529,6 +14731,7 @@ mod tests {
                             &facts,
                             &ToolCallStatus::Pending,
                             NarrationTrigger::Settled,
+                            cx,
                         ),
                         "a contentless call must not be spoken when the timer expires"
                     );
@@ -14538,6 +14741,7 @@ mod tests {
                             &facts,
                             &ToolCallStatus::Pending,
                             NarrationTrigger::Settled,
+                            cx,
                         ),
                         "a complete call must not be delayed by the fix for the empty ones"
                     );
@@ -14575,6 +14779,7 @@ mod tests {
                     &facts,
                     &ToolCallStatus::Pending,
                     NarrationTrigger::TurnEnded,
+                    cx,
                 ),
                 "the turn-end sweep speaks whatever is left"
             );
@@ -14583,6 +14788,7 @@ mod tests {
                     &facts,
                     &ToolCallStatus::Failed,
                     NarrationTrigger::Updated,
+                    cx,
                 ),
                 "so does a terminal status, and a failure most of all"
             );
@@ -14591,6 +14797,7 @@ mod tests {
                     &facts,
                     &ToolCallStatus::Pending,
                     NarrationTrigger::Updated,
+                    cx,
                 ),
                 "but an ordinary update still waits for the label to settle"
             );
@@ -14982,6 +15189,148 @@ mod tests {
         editor.update_in(cx, |editor, window, cx| {
             let snapshot = editor.snapshot(window, cx);
             assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
+        });
+    }
+
+    /// The output capture, one merged record per call: what `acp_thread` hands
+    /// the view once a call has finished.
+    fn captured_output_calls() -> Vec<serde_json::Value> {
+        let capture: serde_json::Value =
+            serde_json::from_str(read_aloud::CLAUDE_CODE_TOOL_OUTPUT_CAPTURE)
+                .expect("the output capture parses");
+        let mut calls: Vec<(String, serde_json::Value)> = Vec::new();
+        for update in capture["updates"]
+            .as_array()
+            .expect("the capture is a list of updates")
+        {
+            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            let index = match calls.iter().position(|(seen, _)| *seen == id) {
+                Some(index) => index,
+                None => {
+                    calls.push((id, serde_json::json!({})));
+                    calls.len() - 1
+                }
+            };
+            let merged = &mut calls[index].1;
+            for key in ["kind", "title", "rawInput", "rawOutput", "status", "locations"] {
+                if let Some(value) = update.get(key) {
+                    merged[key] = value.clone();
+                }
+            }
+        }
+        calls.into_iter().map(|(_, call)| call).collect()
+    }
+
+    /// The seam this task exists for on the input side: `rawOutput` is where
+    /// what a command *found* actually lives, and until now the view dropped
+    /// it on the floor.
+    #[gpui::test]
+    fn a_finished_calls_output_reaches_narration(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let calls = captured_output_calls();
+            assert_eq!(calls.len(), 91);
+            let mut carried = 0;
+            for call in &calls {
+                let tool_call = captured_tool_call(call, ToolCallStatus::Completed, cx);
+                let facts = read_aloud_tool_call_facts(&tool_call);
+                if facts.output.is_some() {
+                    carried += 1;
+                }
+            }
+            assert!(
+                carried >= 80,
+                "the capture's calls carry output through the view; only {carried} did"
+            );
+        });
+    }
+
+    /// The line the user heard. A command that has arrived but has not been
+    /// described yet must not be spoken when the settle timer fires — and
+    /// must still be spoken once it is described.
+    #[gpui::test]
+    fn a_shell_keyword_is_not_ready_until_it_is_described(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let half_arrived = serde_json::json!({
+                "toolCallId": "toolu_01LdeLBUQxPp2ir5aY8qkpwD",
+                "kind": "execute",
+                "title": "Terminal",
+                "rawInput": {
+                    "command": "for h in \"x-hostname-override: www.bartrhomes.com\" \
+                                \"Host: www.localhost:3033\"; do echo \"=== $h ===\"; \
+                                curl -s -o /tmp/rr.out; done",
+                },
+            });
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &half_arrived,
+                ToolCallStatus::Pending,
+                cx,
+            ));
+            assert!(facts.is_shell_noise(cx), "{}", facts.spoken_key(cx));
+            assert!(
+                !read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Pending,
+                    NarrationTrigger::Settled,
+                    cx,
+                ),
+                "the settle timer must not speak \"for h in\""
+            );
+
+            let mut described = half_arrived.clone();
+            described["rawInput"]["description"] =
+                serde_json::json!("Test robots.txt with hostname override and Host header");
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &described,
+                ToolCallStatus::Pending,
+                cx,
+            ));
+            assert!(!facts.is_shell_noise(cx));
+            assert!(
+                read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Pending,
+                    NarrationTrigger::Settled,
+                    cx,
+                ),
+                "and the update one message later is what speaks"
+            );
+            assert_eq!(
+                facts.spoken_key(cx),
+                "Test robots.txt with hostname override and Host header"
+            );
+        });
+    }
+
+    /// A description that never arrives must not resurrect the keyword at the
+    /// turn-end sweep: the sweep forces readiness, and the queue is what
+    /// refuses.
+    #[gpui::test]
+    fn the_turn_end_sweep_does_not_speak_a_shell_keyword(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let never_described = serde_json::json!({
+                "toolCallId": "call",
+                "kind": "execute",
+                "title": "Terminal",
+                "rawInput": { "command": "echo \"=== robots.ts ===\"; cat robots.ts" },
+            });
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &never_described,
+                ToolCallStatus::Completed,
+                cx,
+            ));
+            assert!(
+                read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Completed,
+                    NarrationTrigger::TurnEnded,
+                    cx,
+                ),
+                "the sweep still forces the decision"
+            );
+            assert!(
+                facts.is_shell_noise(cx),
+                "and the decision is that there is nothing worth saying"
+            );
         });
     }
 }

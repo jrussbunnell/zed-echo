@@ -159,6 +159,22 @@ impl WrapUpBudget {
 /// that two dozen of them cannot crowd out the message they are context for.
 pub(crate) const MAX_ACTION_CHARS: usize = 200;
 
+/// The most of the whole assembled activity block a prompt is given, however
+/// many actions survived [`bounded_activity`]'s count cap.
+///
+/// The count cap alone stopped bounding anything once actions started
+/// carrying their output: two dozen actions each at the per-action ceiling is
+/// an order of magnitude more prompt than the same two dozen commands were,
+/// on a path with a five-second budget.
+///
+/// Set above what the count cap can produce at its worst — twenty-four
+/// actions of a two-hundred-character action, a two-hundred-character output
+/// excerpt and their joining text — so that it is a backstop against the
+/// constants moving, not a second working limit that quietly halves the
+/// account of a busy turn. A cap that bites in the ordinary case would trade
+/// the completeness of the account for a saving nothing asked for.
+const MAX_ACTIVITY_BLOCK_CHARS: usize = 12_000;
+
 /// The most of an agent's stated purpose that is worth speaking. Unlike the
 /// prompt-facing cap this one is measured in *seconds of audio*: 160
 /// characters is around ten seconds, which is already a long time to hold a
@@ -369,6 +385,82 @@ impl RawToolInput {
     }
 }
 
+/// What a finished tool call *found*, out of the agent's `rawOutput`.
+///
+/// Narration used to say only what the agent was about to do and never what
+/// came back, so a wrap-up could say "it checked the sitemap" but never "the
+/// sitemap only has the static routes" — the one sentence the listener wanted.
+/// The measured capture settles where that text lives: on the final
+/// `tool_call_update` of every one of its ninety-one calls, `rawOutput` is
+/// either the command's own combined output as a plain string, or — for a
+/// failure — the string `"Exit code 1"` followed by whatever the command
+/// printed. That single field carries the stdout, the stderr and the exit
+/// code, so nothing has to be threaded out of `_meta`.
+///
+/// An object is probed for the conventional stdout/stderr spellings and
+/// nothing else. Deliberately: the shapes a *structured* `rawOutput` takes in
+/// the capture are an edit tool's `structuredPatch`/`oldString`/`newString`,
+/// which is the diff body — kilobytes of it, saying nothing a listener wants
+/// and crowding out everything that does. The files an edit touched are named
+/// from the call's own path, which is the useful half of a diff and the only
+/// half worth speaking.
+pub fn tool_output(raw_output: Option<&serde_json::Value>) -> Option<String> {
+    /// The keys an agent might put a command's own output under.
+    const OUTPUT_KEYS: &[&str] = &["stdout", "output", "stderr", "result", "text"];
+    let nonempty = |text: &str| -> Option<String> {
+        let trimmed = text.trim();
+        trimmed
+            .chars()
+            .any(char::is_alphanumeric)
+            .then(|| trimmed.to_string())
+    };
+    match raw_output? {
+        serde_json::Value::String(text) => nonempty(text),
+        // ACP's own content-block list, which is what an MCP-backed tool
+        // answers with. Only the text blocks say anything a listener could
+        // hear; the rest are tool references and images.
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<String> = blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str().and_then(nonempty))
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        serde_json::Value::Object(object) => {
+            let parts: Vec<String> = OUTPUT_KEYS
+                .iter()
+                .filter_map(|key| object.get(*key)?.as_str().and_then(nonempty))
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// `text` shortened to `limit` characters, keeping both ends when it has to
+/// cut.
+///
+/// Which end matters is not the same for both kinds of output, and this is
+/// the cheapest way not to have to choose. A long *successful* command puts
+/// the answer at the end — the test tally, the last line of a listing, the
+/// HTTP status of the final request — so the tail gets three quarters of the
+/// budget. A *failed* one puts "Exit code 1" and the first error line at the
+/// very front, and that is the sentence the wrap-up is supposed to lead on.
+/// Taking a head slice as well costs a quarter of the budget and removes the
+/// only case where the truncation could silently eat the failure.
+fn excerpt(text: &str, limit: usize) -> String {
+    let characters = text.chars().count();
+    if characters <= limit {
+        return text.to_string();
+    }
+    let head_chars = limit / 4;
+    let tail_chars = limit.saturating_sub(head_chars);
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text.chars().skip(characters - tail_chars).collect();
+    format!("{} … {}", head.trim_end(), tail.trim_start())
+}
+
 /// What narration knows about one tool call.
 ///
 /// The title is deliberately the *last* source consulted. Zed's own tools
@@ -405,6 +497,10 @@ pub struct ToolCallFacts {
     pub url: Option<String>,
     /// What a Search call is looking for.
     pub query: Option<String>,
+    /// What the call *found*, once it has finished: see [`tool_output`].
+    /// Never spoken directly — it is prompt material only, so that a summary
+    /// can say what came back instead of only what was attempted.
+    pub output: Option<String>,
     /// Whether the agent's structured input has arrived. See
     /// [`Self::awaiting_input`].
     pub input: ToolCallInput,
@@ -424,6 +520,7 @@ impl ToolCallFacts {
             path: None,
             url: None,
             query: None,
+            output: None,
             input: ToolCallInput::default(),
             outcome: ToolCallOutcome::default(),
         }
@@ -482,7 +579,7 @@ impl ToolCallFacts {
     /// running, and Claude Code's Bash tool routinely carries multi-line
     /// heredoc scripts. Two dozen of those would be tens of kilobytes of
     /// prompt on a path that has a two-second race to lose.
-    pub(crate) fn description(&self, cx: &App) -> String {
+    pub fn description(&self, cx: &App) -> String {
         let label = self.label.read(cx).source().trim().to_string();
         // The agent's own statement of purpose is strictly better prompt
         // input than the command that implements it: it is shorter, it is
@@ -498,10 +595,7 @@ impl ToolCallFacts {
                 NarrationKind::Execute => format!("ran a command — {purpose}"),
                 kind => format!("{} something — {purpose}", kind.past_verb()),
             };
-            return match self.outcome {
-                ToolCallOutcome::Failed => format!("{described} — it FAILED"),
-                ToolCallOutcome::Pending | ToolCallOutcome::Succeeded => described,
-            };
+            return self.with_outcome_and_output(described);
         }
         let target = self
             .structured_target()
@@ -523,9 +617,42 @@ impl ToolCallFacts {
             (_, None) if !label.is_empty() => truncate_chars(&label, MAX_ACTION_CHARS).to_string(),
             (kind, None) => format!("{} something", kind.past_verb()),
         };
-        match self.outcome {
+        self.with_outcome_and_output(described)
+    }
+
+    /// Appends how the call ended and, bounded, what it printed.
+    ///
+    /// The failure marker stays in front of the output because it is the one
+    /// thing the prompts are told to lead on, and because the output of a
+    /// failure is its explanation — reading better in that order than the
+    /// reverse.
+    fn with_outcome_and_output(&self, described: String) -> String {
+        let described = match self.outcome {
             ToolCallOutcome::Failed => format!("{described} — it FAILED"),
             ToolCallOutcome::Pending | ToolCallOutcome::Succeeded => described,
+        };
+        // A write's output is never news. In the capture it is either the
+        // diff body — `structuredPatch`, `oldString`, `newString` — or the
+        // string "The file … has been updated successfully", and seventeen
+        // edits' worth of that is two and a half kilobytes of prompt saying
+        // what the file name already said. The file *is* the outcome for
+        // these kinds; that it failed still carries, above.
+        if matches!(
+            self.kind,
+            NarrationKind::Edit | NarrationKind::Delete | NarrationKind::Move
+        ) {
+            return described;
+        }
+        match self.output.as_deref().map(str::trim).filter(|output| {
+            output
+                .chars()
+                .any(|character| character.is_alphanumeric())
+        }) {
+            Some(output) => format!(
+                "{described} — it printed: {}",
+                excerpt(output, MAX_ACTION_CHARS)
+            ),
+            None => described,
         }
     }
 
@@ -570,6 +697,40 @@ impl ToolCallFacts {
             return None;
         }
         Some(truncate_chars(trimmed, MAX_PURPOSE_CHARS).to_string())
+    }
+
+    /// Whether the terse line this call would produce right now is a shell
+    /// construct rather than the name of a job — "Running echo", "Running for
+    /// p in", "Running until". Both of those were reported from a live
+    /// session.
+    ///
+    /// They come from the command shortener doing exactly what it is told:
+    /// `for h in "…" "…"; do curl …; done` has no program at the front to
+    /// name, so the first three tokens are a loop header. The agent's own
+    /// `description` is the cure and it arrives — every execute call in the
+    /// measured session eventually carries one — but it arrives in the update
+    /// *after* the command, and the settle timer can fire in the gap.
+    ///
+    /// So this is checked twice, for the two different questions it answers:
+    /// the owning view treats it as "not settled yet", which buys the
+    /// description one more update to arrive, and the queue treats it as
+    /// "never say this", which is what happens when it never does. Silence is
+    /// the right answer there: the listener loses one line out of a burst and
+    /// keeps their sense that the narrator knows what it is looking at.
+    pub fn is_shell_noise(&self, cx: &App) -> bool {
+        if self.kind != NarrationKind::Execute {
+            return false;
+        }
+        let label = self.label.read(cx).source().trim().to_string();
+        match tool_call_target(
+            self.kind,
+            self.stated_purpose().as_deref(),
+            self.structured_target(),
+            &label,
+        ) {
+            ToolCallTarget::Named(target) => is_shell_keyword(&target),
+            _ => false,
+        }
     }
 
     /// The structured field this kind cares about, trimmed and non-empty.
@@ -740,12 +901,23 @@ pub(crate) struct NarrationQueue {
 
 impl NarrationQueue {
     /// Queues one tool call. Returns whether anything was queued: a call
-    /// about the same thing as the one before it adds nothing to a listener.
+    /// about the same thing as the one before it adds nothing to a listener,
+    /// and neither does one whose only sayable form is a shell keyword.
+    ///
+    /// This is the single gate every templated tool line goes through — both
+    /// `actions` detail and the `steps` path for a call with no prose in
+    /// front of it — so refusing here is what makes "skip it" mean skipped
+    /// rather than skipped-in-one-of-two-places. A call refused here never
+    /// enters the backlog, so a run of them collapses to nothing at all
+    /// rather than to a gap the queue would try to speak, and the
+    /// continuation state (`last_tool_key`, `last_tool_kind`) is left
+    /// untouched so the next real call still reads as the first of its run.
     pub fn push_tool_call(&mut self, facts: ToolCallFacts, cx: &mut App) -> bool {
         let label = facts.label.read(cx).source().trim().to_string();
         let kind = facts.kind;
         let key = facts.heard_key(cx);
         if key.trim().is_empty()
+            || facts.is_shell_noise(cx)
             || self
                 .last_tool_key
                 .as_ref()
@@ -1154,6 +1326,37 @@ fn code_span(label: &str) -> Option<&str> {
 /// recited.
 const MAX_COMMAND_TOKENS: usize = 3;
 
+/// Whether a shortened command names a job or merely the shell construct it
+/// is wrapped in.
+///
+/// Only the first word is consulted, because that is the one the verb lands
+/// in front of: "Running `for p in`" is wrong because of the `for`, and
+/// `echo "=== robots.ts ==="; cat app/…` is wrong because of the `echo` — in
+/// both cases the real work is somewhere the shortener will not reach.
+fn is_shell_keyword(target: &str) -> bool {
+    /// Shell keywords and the builtins that only ever appear as scaffolding.
+    ///
+    /// Every entry is a word that can *only* be a shell construct, never a
+    /// program worth naming: the loop and conditional keywords, the two
+    /// builtins agents scatter through composite commands (`echo` as a
+    /// section header, `cd` as a prefix the stripper did not catch because
+    /// nothing followed it), and `test`/`[` which are conditionals spelled as
+    /// commands. `until` and `elif` are here for the same reason as the rest
+    /// — `until` alone produced five of the fifty-seven execute calls in the
+    /// measured session.
+    ///
+    /// Nothing that could be a real job is on this list. `git`, `grep`,
+    /// `pnpm`, `curl` and the rest still narrate exactly as they did.
+    const SHELL_KEYWORDS: &[&str] = &[
+        "[", "case", "cd", "do", "done", "echo", "elif", "esac", "fi", "for", "if", "test", "then",
+        "until", "while",
+    ];
+    target
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| SHELL_KEYWORDS.contains(&word.to_lowercase().as_str()))
+}
+
 /// The sayable part of a shell command: the program and its most meaningful
 /// arguments, stopping at the first flag, quoted argument, or shell
 /// operator. `cd … && cargo test -p read_aloud` becomes "cargo test";
@@ -1457,6 +1660,7 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
          file paths — name a file the way you would say it aloud (\"the sync design spec\", \
          not \"docs/sync_design.md\").\n\
          - Never open with \"The agent\", \"It is\", \"Currently\", or \"Here\".\n\
+         - If an action printed something back, what it showed beats what it was.\n\
          - If everything worth saying is already in what you have said out loud, reply \
          with exactly: {NOTHING_TO_ADD}\n\
          - No preamble, no sign-off, no quotes around the reply.\n\n\
@@ -1468,6 +1672,119 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
          Reply with the one sentence and nothing else.",
         already = already_said(recent),
     )
+}
+
+/// How many actions a summary's account may name. A span that does more than
+/// this has a summary shaped by its prose, not by an exhaustive list of every
+/// file it touched.
+pub const MAX_ACTIVITY_ACTIONS: usize = 24;
+
+/// The account a summary prompt is given, out of everything that happened:
+/// every failure, then as many of the most recent other actions as the caps
+/// leave room for, in the order they happened.
+///
+/// Failures are never the thing dropped. "The tests failed" is what a
+/// supervising listener is there for, and a span long enough to overflow this
+/// is exactly the span where they were not watching. They do not get an
+/// unlimited number of places either: a span with a hundred and fifty failed
+/// calls would otherwise put tens of kilobytes into a prompt that has seconds
+/// to answer. Past the count cap the most recent failures are the ones kept,
+/// because the last thing that broke is what the listener has to act on.
+///
+/// Two caps rather than one, because they bound different things. The count
+/// cap keeps the account from becoming a log; the character cap
+/// ([`MAX_ACTIVITY_BLOCK_CHARS`]) keeps it bounded now that each line can
+/// carry what the command printed, which is not a length this code chooses.
+/// The character cap trims from the *front*, for the same reason the count
+/// cap does: the most recent actions are the ones the listener has not
+/// already heard about.
+///
+/// Shared by the turn wrap-up and the on-demand catch-up so the two can never
+/// disagree about what a bounded account is.
+pub fn bounded_activity(actions: &[(ToolCallOutcome, String)]) -> Vec<String> {
+    let failures = actions
+        .iter()
+        .filter(|(outcome, _)| *outcome == ToolCallOutcome::Failed)
+        .count();
+    let mut failures_kept = failures.min(MAX_ACTIVITY_ACTIONS);
+    let mut others_kept = MAX_ACTIVITY_ACTIONS.saturating_sub(failures_kept);
+    // Walk newest first so "keep the most recent" is a simple countdown,
+    // then put the survivors back in the order they happened.
+    let mut kept: Vec<(ToolCallOutcome, String)> = actions
+        .iter()
+        .rev()
+        .filter(|(outcome, _)| {
+            let budget = if *outcome == ToolCallOutcome::Failed {
+                &mut failures_kept
+            } else {
+                &mut others_kept
+            };
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            true
+        })
+        .cloned()
+        .collect();
+    let block = |kept: &[(ToolCallOutcome, String)]| -> usize {
+        kept.iter().map(|(_, line)| line.chars().count()).sum()
+    };
+    // `kept` is newest-first here, so the oldest is at the back. Successes go
+    // first and failures only once nothing else is left: the character cap
+    // must not become a second way for "the tests failed" to fall out of the
+    // prompt, which is the whole reason the count cap protects them.
+    for failures_too in [false, true] {
+        while block(&kept) > MAX_ACTIVITY_BLOCK_CHARS && kept.len() > 1 {
+            let Some(oldest) = kept.iter().rposition(|(outcome, _)| {
+                failures_too || *outcome != ToolCallOutcome::Failed
+            }) else {
+                break;
+            };
+            kept.remove(oldest);
+        }
+    }
+    kept.reverse();
+    kept.into_iter().map(|(_, line)| line).collect()
+}
+
+/// The files a run of tool calls changed, named once each and in the order
+/// they were first touched.
+///
+/// A span that edited the same file six times has changed one file, and
+/// saying so is the difference between a summary that sounds like a person
+/// and one that sounds like a log. Bounded like the activity list and for the
+/// same reason: the account is remembered in full but only a prompt's worth
+/// of it is sent.
+///
+/// Named from the call's own path, never from its `rawOutput`: an edit tool's
+/// structured output is the diff body, which is the half of an edit a
+/// listener has no use for.
+pub fn files_changed<'a>(
+    calls: impl IntoIterator<Item = &'a ToolCallFacts>,
+    cx: &App,
+) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for facts in calls {
+        if files.len() >= MAX_ACTIVITY_ACTIONS {
+            break;
+        }
+        if !matches!(
+            facts.kind,
+            NarrationKind::Edit | NarrationKind::Delete | NarrationKind::Move
+        ) {
+            continue;
+        }
+        let named = match facts.path.as_deref().map(str::trim) {
+            Some(path) if !path.is_empty() => path.to_string(),
+            _ => facts.label.read(cx).source().trim().to_string(),
+        };
+        let file: String = named.chars().take(MAX_ACTION_CHARS).collect();
+        if !file.is_empty() && !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
 }
 
 /// Everything the turn's wrap-up is written from.
@@ -1493,10 +1810,17 @@ pub struct WrapUpMaterial<'a> {
     /// The files the turn changed, named once each.
     pub files_changed: &'a [String],
     /// What narration has already said out loud, so the wrap-up builds on it
-    /// instead of reciting the turn again.
+    /// instead of reciting the turn again. Normally empty for a catch-up —
+    /// somebody who asks to be caught up has by definition not been
+    /// listening — which is why no branch is needed for it.
     pub recent: &'a [String],
     /// How much of a wrap-up this turn has earned.
     pub budget: WrapUpBudget,
+    /// Whether this is an on-demand catch-up rather than a turn's sign-off.
+    /// It changes only the framing: the span may cover several turns and the
+    /// agent may still be working, so "the turn is finishing" would be a lie
+    /// and the listener has missed everything rather than the last minute.
+    pub catching_up: bool,
 }
 
 /// The prompt for the turn wrap-up: what was done, what was found, and what
@@ -1529,15 +1853,23 @@ pub fn wrap_up_prompt(material: WrapUpMaterial<'_>) -> String {
             bulleted(material.files_changed)
         )
     };
+    let occasion = if material.catching_up {
+        "They have not been listening and have just asked you to catch them up on \
+         everything below, which may span several turns and may still be going."
+    } else {
+        "The turn is finishing, so give them the wrap-up."
+    };
     format!(
         "You are narrating a coding agent's work out loud to someone who is not looking at \
-         the screen. The turn is finishing, so give them the wrap-up. Your reply is spoken \
+         the screen. {occasion} Your reply is spoken \
          by a text-to-speech voice.\n\n\
          Say what was done, what was found or decided, and anything they have to act on.\n\n\
          Rules:\n\
          - {sentences}, and under {words} words in total.\n\
          - If anything failed — a command, a test, a build — say that first and say what \
          failed. It is the most important thing they need to hear.\n\
+         - When an action printed something, say what it showed, not that it ran. What came \
+         back is the point; that a command was run is not.\n\
          - Otherwise lead with the outcome, then what it took.\n\
          - Spoken English only. No markdown, no code, no backticks, no command lines, no \
          lists, no file paths spelled out — name a file the way you would say it aloud.\n\
@@ -1547,6 +1879,8 @@ pub fn wrap_up_prompt(material: WrapUpMaterial<'_>) -> String {
          - No preamble, no sign-off, no quotes around the reply.\n\n\
          Good reply: \"The read-aloud tests fail — two of them, on the segmenter. \
          Everything else is wired up and building.\"\n\
+         Good reply: \"The production robots file is live, but the sitemap only has the \
+         thirteen static URLs — nothing from the CMS.\"\n\
          Bad reply: \"To wrap up, the agent has made changes to several files.\"\n\n\
          {already}{did}{changed}{closing}\
          Reply with the wrap-up and nothing else.",
@@ -2477,6 +2811,7 @@ mod tests {
             files_changed,
             recent,
             budget: brief_budget(),
+            catching_up: false,
         }
     }
 
@@ -2584,6 +2919,7 @@ mod tests {
                 files_changed: &[],
                 recent: &[],
                 budget: WrapUpBudget::for_turn(tool_calls, None),
+                catching_up: false,
             })
         };
         assert!(of(1).contains("under twenty-five words"));
@@ -3217,5 +3553,537 @@ mod tests {
         cx.update(|cx| {
             assert!(facts.spoken_key(cx).chars().count() <= MAX_PURPOSE_CHARS);
         });
+    }
+
+    /// One call from the output capture, merged the way `acp_thread` merges
+    /// it: `rawInput` is resent whole on every update, `rawOutput` and the
+    /// terminal status arrive at the end.
+    struct CapturedCall {
+        kind: NarrationKind,
+        title: String,
+        /// Every `rawInput` this call was sent, in arrival order — the shape
+        /// the settle race is decided by, not just the final one.
+        raw_inputs: Vec<serde_json::Value>,
+        raw_output: Option<serde_json::Value>,
+        failed: bool,
+    }
+
+    impl CapturedCall {
+        /// The facts as of the *last* update: what a wrap-up sees.
+        fn facts(&self, cx: &mut App) -> ToolCallFacts {
+            self.facts_at(self.raw_inputs.len().saturating_sub(1), cx)
+        }
+
+        /// The facts as of update `index`: what narration sees mid-refinement.
+        fn facts_at(&self, index: usize, cx: &mut App) -> ToolCallFacts {
+            let raw = RawToolInput::from_json(self.raw_inputs.get(index));
+            let label = cx.new(|cx| Markdown::new(self.title.clone().into(), None, None, cx));
+            ToolCallFacts {
+                purpose: raw.purpose,
+                command: raw.command,
+                path: raw.path,
+                url: raw.url,
+                query: raw.query,
+                output: tool_output(self.raw_output.as_ref()),
+                input: raw.input,
+                outcome: if self.failed {
+                    ToolCallOutcome::Failed
+                } else {
+                    ToolCallOutcome::Succeeded
+                },
+                ..ToolCallFacts::from_label("call", label, self.kind)
+            }
+        }
+    }
+
+    /// The output capture, one entry per call, in arrival order. Parsed, never
+    /// transcribed: every claim about outputs in this file is measured from
+    /// the same bytes the user's session produced.
+    fn captured_calls(section: &str) -> Vec<CapturedCall> {
+        let capture: serde_json::Value = serde_json::from_str(crate::CLAUDE_CODE_TOOL_OUTPUT_CAPTURE)
+            .expect("the output capture parses");
+        let mut calls: Vec<(String, CapturedCall)> = Vec::new();
+        for update in capture[section]
+            .as_array()
+            .expect("the capture section is a list of updates")
+        {
+            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            let position = calls.iter().position(|(seen, _)| *seen == id);
+            let index = match position {
+                Some(index) => index,
+                None => {
+                    calls.push((
+                        id,
+                        CapturedCall {
+                            kind: NarrationKind::Other,
+                            title: String::new(),
+                            raw_inputs: Vec::new(),
+                            raw_output: None,
+                            failed: false,
+                        },
+                    ));
+                    calls.len() - 1
+                }
+            };
+            let call = &mut calls[index].1;
+            if let Some(kind) = update["kind"].as_str() {
+                call.kind = match kind {
+                    "read" => NarrationKind::Read,
+                    "edit" => NarrationKind::Edit,
+                    "delete" => NarrationKind::Delete,
+                    "move" => NarrationKind::Move,
+                    "search" => NarrationKind::Search,
+                    "execute" => NarrationKind::Execute,
+                    "fetch" => NarrationKind::Fetch,
+                    _ => NarrationKind::Other,
+                };
+            }
+            if let Some(title) = update["title"].as_str() {
+                call.title = title.to_string();
+            }
+            if let Some(raw_input) = update.get("rawInput") {
+                call.raw_inputs.push(raw_input.clone());
+            }
+            if let Some(raw_output) = update.get("rawOutput") {
+                call.raw_output = Some(raw_output.clone());
+            }
+            if update["status"] == "failed" {
+                call.failed = true;
+            }
+        }
+        calls.into_iter().map(|(_, call)| call).collect()
+    }
+
+    /// What the output capture actually says. Every design premise below is
+    /// one of these numbers; if a future capture moves them, the premises move
+    /// with them and the tests that rest on them are suspect.
+    #[gpui::test]
+    fn the_output_capture_says_what_the_outcome_work_assumes(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
+        assert_eq!(calls.len(), 91, "the session made ninety-one calls");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.raw_inputs.first() == Some(&serde_json::json!({})))
+                .count(),
+            80,
+            "eighty arrive with an empty payload"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.raw_output.is_some())
+                .count(),
+            91,
+            "every call ends up carrying a rawOutput — this is the material \
+             narration was ignoring"
+        );
+        cx.update(|cx| {
+            let described = calls
+                .iter()
+                .filter(|call| call.kind == NarrationKind::Execute)
+                .filter(|call| call.facts(cx).purpose.is_some())
+                .count();
+            let executes = calls
+                .iter()
+                .filter(|call| call.kind == NarrationKind::Execute)
+                .count();
+            assert_eq!(executes, 57, "fifty-seven of them run a command");
+            assert_eq!(
+                described, executes,
+                "every execute call states its purpose *eventually* — which is \
+                 why waiting one more update is the right answer to a shell \
+                 keyword, and skipping is only the fallback"
+            );
+        });
+    }
+
+    /// The line the user heard, at the exact moment the capture shows it being
+    /// possible: the command has arrived, the description has not.
+    #[gpui::test]
+    fn a_half_arrived_command_is_never_spoken_as_a_shell_keyword(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
+        cx.update(|cx| {
+            let mut keyword_moments = 0;
+            for call in &calls {
+                for index in 0..call.raw_inputs.len() {
+                    let facts = call.facts_at(index, cx);
+                    if !facts.is_shell_noise(cx) {
+                        continue;
+                    }
+                    keyword_moments += 1;
+                    let mut queue = NarrationQueue::default();
+                    assert!(
+                        !queue.push_tool_call(facts.clone(), cx),
+                        "a call whose only sayable form is {:?} must not be queued",
+                        facts.spoken_key(cx)
+                    );
+                    assert_eq!(queue.len(), 0, "and it must not leave a gap behind either");
+                }
+            }
+            assert!(
+                keyword_moments >= 12,
+                "the capture holds at least a dozen moments where the shortener \
+                 would have said a shell keyword; found {keyword_moments}"
+            );
+        });
+    }
+
+    /// …and the same calls, once their description has landed, are spoken.
+    /// Skipping must not be a way to lose a line permanently.
+    #[gpui::test]
+    fn the_same_calls_speak_once_their_purpose_arrives(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
+        cx.update(|cx| {
+            let mut recovered = 0;
+            for call in &calls {
+                let noisy_early = (0..call.raw_inputs.len())
+                    .any(|index| call.facts_at(index, cx).is_shell_noise(cx));
+                if !noisy_early {
+                    continue;
+                }
+                let final_facts = call.facts(cx);
+                assert!(
+                    !final_facts.is_shell_noise(cx),
+                    "the description that arrives one update later is what names \
+                     this call: {:?}",
+                    final_facts.spoken_key(cx)
+                );
+                let mut queue = NarrationQueue::default();
+                assert!(
+                    queue.push_tool_call(final_facts, cx),
+                    "so the call is spoken, only later"
+                );
+                recovered += 1;
+            }
+            assert!(recovered >= 12, "found {recovered}");
+        });
+    }
+
+    /// Real commands are untouched. A skip list that swallowed `git` or
+    /// `pnpm` would be a worse bug than the one it fixes.
+    #[gpui::test]
+    fn ordinary_commands_still_narrate(cx: &mut TestAppContext) {
+        let labels: Vec<_> = (0..6).map(|_| markdown("Terminal", cx)).collect();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            for (label, command) in labels.into_iter().zip([
+                "git log --oneline -5",
+                "pnpm build",
+                "grep -rn needle crates/",
+                "curl -s https://example.com",
+                "cargo test -p read_aloud",
+                "testify --all",
+            ]) {
+                let facts = ToolCallFacts {
+                    command: Some(command.to_string()),
+                    input: ToolCallInput::Present,
+                    ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+                };
+                assert!(
+                    !facts.is_shell_noise(cx),
+                    "{command} names a real job and must still be spoken"
+                );
+            }
+        });
+    }
+
+    /// Every keyword the report names, checked one at a time so a missing
+    /// entry fails by name rather than by count.
+    #[gpui::test]
+    fn each_shell_keyword_is_skipped(cx: &mut TestAppContext) {
+        let commands = [
+            "for p in a b; do echo $p; done",
+            "if [ -f x ]; then cat x; fi",
+            "while read line; do echo $line; done",
+            "until curl -s localhost; do sleep 1; done",
+            "echo \"=== robots ===\"; cat robots.ts",
+            "cd /tmp",
+            "then cat x",
+            "fi",
+            "done",
+            "case $x in a) ls;; esac",
+            "esac",
+            "do ls",
+            "test -f Cargo.toml",
+            "elif ls",
+        ];
+        let labels: Vec<_> = commands.iter().map(|_| markdown("Terminal", cx)).collect();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            for (label, command) in labels.into_iter().zip(commands) {
+                let facts = ToolCallFacts {
+                    command: Some(command.to_string()),
+                    input: ToolCallInput::Present,
+                    ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+                };
+                assert!(
+                    facts.is_shell_noise(cx),
+                    "{command:?} would be spoken as {:?}",
+                    facts.spoken_key(cx)
+                );
+            }
+        });
+    }
+
+    /// A stated purpose outranks the shortener, so a described `for` loop is
+    /// never skipped — the agent said what it was for.
+    #[gpui::test]
+    async fn a_described_shell_construct_is_not_skipped(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            command: Some("for h in a b; do curl -s $h; done".to_string()),
+            purpose: Some("Verify robots and sitemap across all three hosts".to_string()),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert!(!facts.is_shell_noise(cx));
+            assert_eq!(
+                facts.spoken_key(cx),
+                "Verify robots and sitemap across all three hosts"
+            );
+        });
+    }
+
+    /// The material the user asked for: what came back, not just what ran.
+    #[gpui::test]
+    fn a_commands_output_reaches_the_prompt(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
+        cx.update(|cx| {
+            let with_output = calls
+                .iter()
+                .map(|call| call.facts(cx))
+                .filter(|facts| facts.output.is_some())
+                .count();
+            assert!(
+                with_output >= 80,
+                "the capture's calls carry output; found {with_output}"
+            );
+            let described: Vec<String> = calls
+                .iter()
+                .filter(|call| call.kind != NarrationKind::Edit)
+                .map(|call| call.facts(cx).description(cx))
+                .collect();
+            let printing = described
+                .iter()
+                .filter(|line| line.contains("it printed:"))
+                .count();
+            assert_eq!(
+                (printing, described.len()),
+                (69, 74),
+                "sixty-nine of the seventy-four non-write calls printed something \
+                 a summary could use, and all sixty-nine reach the account a \
+                 prompt is built from; the other five are MCP calls whose output \
+                 is a list of tool references"
+            );
+            for line in &described {
+                assert!(
+                    line.chars().count() <= 2 * MAX_ACTION_CHARS + 80,
+                    "no single action may flood the prompt: {} characters",
+                    line.chars().count()
+                );
+            }
+        });
+    }
+
+    /// An edit's `rawOutput` is the diff body. Naming the file is the useful
+    /// half of an edit; reading a patch out is not.
+    #[gpui::test]
+    fn an_edits_structured_output_never_reaches_the_prompt(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
+        cx.update(|cx| {
+            let edits: Vec<ToolCallFacts> = calls
+                .iter()
+                .filter(|call| call.kind == NarrationKind::Edit)
+                .map(|call| call.facts(cx))
+                .collect();
+            assert_eq!(edits.len(), 17, "the session made seventeen edits");
+            for facts in &edits {
+                let description = facts.description(cx);
+                assert!(
+                    !description.contains("it printed:"),
+                    "a write's own output is either a patch or a receipt, and \
+                     neither is worth a word of the prompt: {description}"
+                );
+                assert!(
+                    !description.contains("structuredPatch")
+                        && !description.contains("oldString")
+                        && !description.contains("updated successfully"),
+                    "and none of it may leak in by another route: {description}"
+                );
+            }
+            let files = files_changed(edits.iter(), cx);
+            assert!(
+                !files.is_empty(),
+                "the files an edit touched are what a summary names instead"
+            );
+        });
+    }
+
+    /// A non-zero exit is the thing a supervising listener is there for, and
+    /// it must survive every bound between the wire and the prompt.
+    #[gpui::test]
+    fn a_failure_reaches_the_prompt_whatever_it_printed(cx: &mut TestAppContext) {
+        let failures = captured_calls("failures");
+        assert_eq!(failures.len(), 3, "three real failed calls are captured");
+        cx.update(|cx| {
+            for call in &failures {
+                let facts = call.facts(cx);
+                assert_eq!(facts.outcome, ToolCallOutcome::Failed);
+                let description = facts.description(cx);
+                assert!(
+                    description.contains("it FAILED"),
+                    "the failure itself is always stated: {description}"
+                );
+                assert!(
+                    description.contains("Exit code 1"),
+                    "and so is the exit code the agent sent: {description}"
+                );
+            }
+            // The same call, drowned in output. The head slice is what keeps
+            // the exit code in the prompt when the tail cannot.
+            let flooded = ToolCallFacts {
+                command: Some("cargo test --workspace".to_string()),
+                output: Some(format!("Exit code 1\n{}", "noise ".repeat(4_000))),
+                outcome: ToolCallOutcome::Failed,
+                input: ToolCallInput::Present,
+                ..ToolCallFacts::from_label(
+                    "call",
+                    cx.new(|cx| Markdown::new("Terminal".into(), None, None, cx)),
+                    NarrationKind::Execute,
+                )
+            };
+            let description = flooded.description(cx);
+            assert!(
+                description.contains("Exit code 1"),
+                "twenty-four kilobytes of output may not bury it: {description}"
+            );
+            assert!(
+                description.chars().count() <= 2 * MAX_ACTION_CHARS + 80,
+                "and it is still bounded"
+            );
+        });
+    }
+
+    /// A long *successful* output keeps its end, where the answer usually is.
+    #[test]
+    fn a_long_output_keeps_both_ends() {
+        let text = format!("{}ANSWER", "x".repeat(5_000));
+        let excerpted = excerpt(&text, MAX_ACTION_CHARS);
+        assert!(excerpted.ends_with("ANSWER"), "{excerpted}");
+        assert!(excerpted.starts_with("xxx"));
+        assert!(excerpted.chars().count() <= MAX_ACTION_CHARS + 3);
+        assert_eq!(excerpt("short", MAX_ACTION_CHARS), "short");
+    }
+
+    /// The assembled block is bounded by its own size, not only by how many
+    /// actions it holds — which is what changed the moment actions started
+    /// carrying output.
+    #[test]
+    fn the_activity_block_is_bounded_in_characters() {
+        let actions: Vec<(ToolCallOutcome, String)> = (0..MAX_ACTIVITY_ACTIONS)
+            .map(|index| {
+                (
+                    ToolCallOutcome::Succeeded,
+                    format!("ran a command — step {index} — it printed: {}", "y".repeat(600)),
+                )
+            })
+            .collect();
+        let block = bounded_activity(&actions);
+        let characters: usize = block.iter().map(|line| line.chars().count()).sum();
+        assert!(
+            characters <= MAX_ACTIVITY_BLOCK_CHARS,
+            "{characters} characters of activity"
+        );
+        assert!(!block.is_empty(), "and it never trims away to nothing");
+        assert!(
+            block.last().is_some_and(|line| line.contains(&format!(
+                "step {}",
+                MAX_ACTIVITY_ACTIONS - 1
+            ))),
+            "the most recent actions are the ones kept"
+        );
+    }
+
+    /// The character cap must not become a second way for "the tests failed"
+    /// to fall out of the prompt.
+    #[test]
+    fn the_character_cap_never_drops_a_failure() {
+        let mut actions: Vec<(ToolCallOutcome, String)> = vec![(
+            ToolCallOutcome::Failed,
+            format!("ran a command — the tests — it FAILED — it printed: {}", "z".repeat(300)),
+        )];
+        actions.extend((0..MAX_ACTIVITY_ACTIONS).map(|index| {
+            (
+                ToolCallOutcome::Succeeded,
+                format!("ran a command — step {index} — it printed: {}", "y".repeat(900)),
+            )
+        }));
+        let block = bounded_activity(&actions);
+        let characters: usize = block.iter().map(|line| line.chars().count()).sum();
+        assert!(characters <= MAX_ACTIVITY_BLOCK_CHARS, "{characters}");
+        assert!(
+            block.iter().any(|line| line.contains("it FAILED")),
+            "the oldest action is the failure, and it is the one thing that \
+             may not be trimmed: {block:?}"
+        );
+    }
+
+    /// …and it must not bite on an ordinary turn either. A cap that halves
+    /// the account of every busy turn is a worse bug than the flooding it
+    /// prevents.
+    #[test]
+    fn an_ordinary_turns_account_is_complete() {
+        // A typical measured line: a purpose, and an output excerpt at its
+        // per-action ceiling.
+        let actions: Vec<(ToolCallOutcome, String)> = (0..MAX_ACTIVITY_ACTIONS)
+            .map(|index| {
+                (
+                    ToolCallOutcome::Succeeded,
+                    format!(
+                        "ran a command — Check the marketing routes for step {index} — \
+                         it printed: {}",
+                        "y".repeat(MAX_ACTION_CHARS)
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bounded_activity(&actions).len(),
+            MAX_ACTIVITY_ACTIONS,
+            "every action a turn is allowed to report still reaches the prompt"
+        );
+    }
+
+    /// A catch-up is not a turn's sign-off, and the prompt must not claim it
+    /// is — the span may cover an hour and the agent may still be working.
+    #[test]
+    fn the_catch_up_prompt_says_it_is_a_catch_up() {
+        let material = |catching_up| {
+            wrap_up_prompt(WrapUpMaterial {
+                message: "Done.",
+                still_streaming: false,
+                activity: &[],
+                files_changed: &[],
+                recent: &[],
+                budget: brief_budget(),
+                catching_up,
+            })
+        };
+        assert!(material(false).contains("The turn is finishing"));
+        assert!(!material(true).contains("The turn is finishing"));
+        assert!(material(true).contains("catch them up"));
+        for prompt in [material(false), material(true)] {
+            assert!(
+                prompt.contains("say that first"),
+                "both still lead on a failure"
+            );
+            assert!(
+                prompt.contains("say what it showed"),
+                "and both ask for what came back"
+            );
+        }
     }
 }
