@@ -10,8 +10,8 @@ pub use inworld::{
 };
 pub use narration::{
     MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, MAX_WRAP_UP_CHARS, NOTHING_TO_ADD, NarrationKind,
-    SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallOutcome, WrapUpBudget,
-    WrapUpMaterial, step_prompt, summary_prompt, wrap_up_prompt,
+    RawToolInput, SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts, ToolCallInput,
+    ToolCallOutcome, WrapUpBudget, WrapUpMaterial, step_prompt, summary_prompt, wrap_up_prompt,
 };
 
 pub use player::{Player, PlayerEvent};
@@ -24,6 +24,19 @@ pub use sink::{AudioSink, RodioSink};
 // `test-support`, so downstream crates (e.g. agent_ui's own tests) can build
 // a `ReadAloud` without a network or an audio device, the same way this
 // crate's own tests do.
+/// A real Claude Code session's tool-call traffic, captured over ACP from
+/// this build of Zed: every `tool_call` and `tool_call_update` notification of
+/// a 128-message session, in arrival order, with the fields narration reads
+/// verbatim. Shared with `agent_ui`'s tests, which own the half of the
+/// pipeline that turns a protocol payload into [`ToolCallFacts`].
+///
+/// Three rounds of fixes to narration were built on an *inferred* protocol
+/// shape and all three missed. Regression tests for this path are built from
+/// this capture rather than from hand-written approximations.
+#[cfg(any(test, feature = "test-support"))]
+pub const CLAUDE_CODE_TOOL_CALL_CAPTURE: &str =
+    include_str!("../test_fixtures/claude_code_tool_calls.json");
+
 #[cfg(any(test, feature = "test-support"))]
 pub use narration::FakeSummaryModel;
 #[cfg(any(test, feature = "test-support"))]

@@ -159,6 +159,13 @@ impl WrapUpBudget {
 /// that two dozen of them cannot crowd out the message they are context for.
 pub(crate) const MAX_ACTION_CHARS: usize = 200;
 
+/// The most of an agent's stated purpose that is worth speaking. Unlike the
+/// prompt-facing cap this one is measured in *seconds of audio*: 160
+/// characters is around ten seconds, which is already a long time to hold a
+/// listener on one tool call. The longest purpose in the captured session is
+/// 51 characters.
+const MAX_PURPOSE_CHARS: usize = 160;
+
 /// The most of a message that is worth sending to the summary model. Longer
 /// messages are truncated rather than skipped: the opening carries the
 /// decisions, and the tail is usually code or a recap.
@@ -277,6 +284,91 @@ pub enum ToolCallOutcome {
     Failed,
 }
 
+/// Whether an agent's structured input for a tool call has arrived yet.
+///
+/// Deliberately three states rather than an `Option`, because the
+/// distinction that decides whether narration may speak is between *no
+/// `rawInput` field at all* and *a `rawInput` that arrived empty* —
+/// `Option::is_some()` reports both of the last two as input, and that is the
+/// bug that survived three rounds of fixes. In a captured Claude Code
+/// session, six of twenty-eight tool calls opened with `rawInput: {}` and the
+/// title "Terminal", filled the command in a later update, and carried
+/// `status: "pending"` throughout; a present-but-empty container is the only
+/// signal that separates them from the twenty-two that arrived complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolCallInput {
+    /// The call carried no structured input at all. The agent may simply not
+    /// send any, so this is *not* treated as "more is coming".
+    #[default]
+    Absent,
+    /// Structured input arrived and was contentless.
+    Empty,
+    /// Structured input arrived carrying at least one field.
+    Present,
+}
+
+/// What narration can read out of an agent's `rawInput`, plus whether that
+/// input has arrived at all.
+///
+/// `rawInput` is the agent's own tool schema, so every key here is a
+/// convention rather than a contract; the common spellings are probed and
+/// anything unrecognised degrades to the title. The extraction lives in this
+/// crate rather than in the caller so that a captured protocol payload can be
+/// fed to it verbatim in a test.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawToolInput {
+    /// `description`: the agent's plain-English statement of what the call is
+    /// for. See [`ToolCallFacts::purpose`].
+    pub purpose: Option<String>,
+    pub command: Option<String>,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub query: Option<String>,
+    pub input: ToolCallInput,
+}
+
+impl RawToolInput {
+    pub fn from_json(raw_input: Option<&serde_json::Value>) -> Self {
+        /// The keys an agent might put a shell command under.
+        const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "shell_command"];
+        /// …a file path under. `path` is Zed's own edit and read tools;
+        /// `file_path` is Claude Code's.
+        const PATH_KEYS: &[&str] = &["file_path", "path", "abs_path", "absolute_path", "filename"];
+        const URL_KEYS: &[&str] = &["url", "uri"];
+        /// …a search's subject under. `regex` is Zed's grep tool; `pattern`
+        /// is Claude Code's Grep and Glob.
+        const QUERY_KEYS: &[&str] = &["pattern", "regex", "query", "glob"];
+        /// …a statement of intent under.
+        const PURPOSE_KEYS: &[&str] = &["description", "purpose", "intent", "explanation"];
+
+        let object = raw_input.and_then(serde_json::Value::as_object);
+        let input = match (raw_input, object) {
+            (None, _) | (Some(serde_json::Value::Null), _) => ToolCallInput::Absent,
+            (Some(_), Some(object)) if object.is_empty() => ToolCallInput::Empty,
+            (Some(_), _) => ToolCallInput::Present,
+        };
+        let field = |keys: &[&str]| -> Option<String> {
+            let object = object?;
+            keys.iter().find_map(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        };
+        Self {
+            purpose: field(PURPOSE_KEYS),
+            command: field(COMMAND_KEYS),
+            path: field(PATH_KEYS),
+            url: field(URL_KEYS),
+            query: field(QUERY_KEYS),
+            input,
+        }
+    }
+}
+
 /// What narration knows about one tool call.
 ///
 /// The title is deliberately the *last* source consulted. Zed's own tools
@@ -296,6 +388,15 @@ pub struct ToolCallFacts {
     /// The agent's own title. Still what is spoken for the kinds whose
     /// titles read as prose, and the fallback for every kind.
     pub label: Entity<Markdown>,
+    /// The agent's own one-line statement of what this call is *for*, from
+    /// `rawInput.description` — "Search almanac for launch readiness" rather
+    /// than `codealmanac search "launch readiness" --limit 10 2>&1 | head`.
+    ///
+    /// This outranks every other source because it is the only one that
+    /// describes intent instead of mechanism, and it is the thing a listener
+    /// who cannot see the screen actually needs. It costs no model call and
+    /// adds no latency: it arrives in the same payload as the command.
+    pub purpose: Option<String>,
     /// The command an Execute call runs.
     pub command: Option<String>,
     /// The file a Read, Edit, Delete or Move call is about.
@@ -304,6 +405,9 @@ pub struct ToolCallFacts {
     pub url: Option<String>,
     /// What a Search call is looking for.
     pub query: Option<String>,
+    /// Whether the agent's structured input has arrived. See
+    /// [`Self::awaiting_input`].
+    pub input: ToolCallInput,
     pub outcome: ToolCallOutcome,
 }
 
@@ -315,12 +419,34 @@ impl ToolCallFacts {
             id: id.into(),
             kind,
             label,
+            purpose: None,
             command: None,
             path: None,
             url: None,
             query: None,
+            input: ToolCallInput::default(),
             outcome: ToolCallOutcome::default(),
         }
+    }
+
+    /// Whether this call has announced itself without yet saying anything
+    /// about what it is doing — an empty payload that the agent has promised
+    /// to fill.
+    ///
+    /// The caller must not narrate such a call on a timer: the whole point of
+    /// the settle timer is to wait out a label that is still changing, and an
+    /// empty payload's label does not change, so the timer expires on the
+    /// placeholder and speaks it. That is "running terminal". Status is no
+    /// help either — all twenty-eight calls in the capture, complete and
+    /// empty alike, said `pending`.
+    ///
+    /// Only [`ToolCallInput::Empty`] waits. [`ToolCallInput::Absent`] means
+    /// the agent sent no structured input at all, and waiting on input that
+    /// was never promised would delay every such call to the end of the turn.
+    pub fn awaiting_input(&self) -> bool {
+        self.input == ToolCallInput::Empty
+            && self.stated_purpose().is_none()
+            && self.structured_target().is_none()
     }
 
     /// What narration's line for this call is *about* — the command, the
@@ -332,7 +458,13 @@ impl ToolCallFacts {
     /// commands sharing one generic title collapse into a single utterance.
     pub fn spoken_key(&self, cx: &App) -> String {
         let label = self.label.read(cx).source().trim().to_string();
-        match tool_call_target(self.kind, self.structured_target(), &label) {
+        match tool_call_target(
+            self.kind,
+            self.stated_purpose().as_deref(),
+            self.structured_target(),
+            &label,
+        ) {
+            ToolCallTarget::Stated(purpose) => purpose,
             ToolCallTarget::Named(target) => target,
             ToolCallTarget::Unnamed => self.kind.unnamed_phrase().to_string(),
             ToolCallTarget::Label => label,
@@ -352,6 +484,25 @@ impl ToolCallFacts {
     /// prompt on a path that has a two-second race to lose.
     pub(crate) fn description(&self, cx: &App) -> String {
         let label = self.label.read(cx).source().trim().to_string();
+        // The agent's own statement of purpose is strictly better prompt
+        // input than the command that implements it: it is shorter, it is
+        // about intent, and it does not spend the prompt on a heredoc. For
+        // the file-shaped kinds the file is still the better fact, so a
+        // purpose only stands in where there is no structured target at all —
+        // the same precedence [`tool_call_target`] uses.
+        let purpose = self
+            .stated_purpose()
+            .filter(|_| self.kind == NarrationKind::Execute || self.structured_target().is_none());
+        if let Some(purpose) = purpose {
+            let described = match self.kind {
+                NarrationKind::Execute => format!("ran a command — {purpose}"),
+                kind => format!("{} something — {purpose}", kind.past_verb()),
+            };
+            return match self.outcome {
+                ToolCallOutcome::Failed => format!("{described} — it FAILED"),
+                ToolCallOutcome::Pending | ToolCallOutcome::Succeeded => described,
+            };
+        }
         let target = self
             .structured_target()
             .map(|target| truncate_chars(target, MAX_ACTION_CHARS));
@@ -398,6 +549,29 @@ impl ToolCallFacts {
         crate::segmenter::spoken_path_component(&key).unwrap_or(key)
     }
 
+    /// [`Self::purpose`] in a state fit to be spoken: whitespace collapsed to
+    /// single spaces, trailing sentence punctuation removed so a period can be
+    /// added back uniformly, and bounded.
+    ///
+    /// Bounded because this is agent-controlled prose on a path with a
+    /// two-second budget. The longest description in the captured session is
+    /// 51 characters, so the cap is headroom rather than a working limit;
+    /// anything past it is a runaway that would be read aloud in full.
+    /// A purpose with no letters or digits in it is not a sentence, and
+    /// speaking it produces no audio at all while still counting as the
+    /// call's line — so the call goes unheard *and* takes its neighbours with
+    /// it, because duplicate suppression compares the same empty string every
+    /// time. Such a purpose is discarded and the ordinary resolution runs.
+    fn stated_purpose(&self) -> Option<String> {
+        let purpose = self.purpose.as_deref()?;
+        let collapsed = purpose.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = collapsed.trim_end_matches(['.', '!', ';', ',', ' ']);
+        if !trimmed.chars().any(char::is_alphanumeric) {
+            return None;
+        }
+        Some(truncate_chars(trimmed, MAX_PURPOSE_CHARS).to_string())
+    }
+
     /// The structured field this kind cares about, trimmed and non-empty.
     fn structured_target(&self) -> Option<&str> {
         let field = match self.kind {
@@ -414,8 +588,17 @@ impl ToolCallFacts {
     }
 }
 
-/// Resolution order, per kind: structured input first, the agent's own title
-/// second, the kind's templated phrase last.
+/// Resolution order for an Execute call: the agent's stated purpose first,
+/// its command second, its own title third, the kind's templated phrase last.
+/// For every other kind, structured input first, the title second, the
+/// templated phrase last — with the stated purpose displacing the templated
+/// phrase, since anything the agent wrote beats a phrase that names nothing.
+///
+/// Purpose leads for Execute because a command is *mechanism*: "Running grep"
+/// tells a listener who cannot see the screen almost nothing, while "Searching
+/// almanac for launch readiness" is the whole point of the call. It does not
+/// lead for the file-shaped kinds, where the file is the point and the agent
+/// sends no description anyway.
 ///
 /// **Every** kind ends at the templated phrase, never at nothing. A kind that
 /// falls through to a title it does not have is the reported bug all over
@@ -424,7 +607,12 @@ impl ToolCallFacts {
 /// calls all titled "Search", and comparing those titles suppresses two of
 /// them. The templated phrase is a poor line, but it is a line, and it is the
 /// same one for every such call so the *first* is still spoken.
-fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) -> ToolCallTarget {
+fn tool_call_target(
+    kind: NarrationKind,
+    purpose: Option<&str>,
+    structured: Option<&str>,
+    label: &str,
+) -> ToolCallTarget {
     // A title only speaks for itself if there is one.
     let titled = || {
         if label.trim().is_empty() {
@@ -433,11 +621,16 @@ fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) 
             ToolCallTarget::Label
         }
     };
-    match kind {
-        NarrationKind::Execute => structured
-            .and_then(spoken_command)
-            .or_else(|| spoken_command(label))
-            .map_or(ToolCallTarget::Unnamed, ToolCallTarget::Named),
+    let stated = || purpose.map(|purpose| ToolCallTarget::Stated(purpose.to_string()));
+    let resolved = match kind {
+        NarrationKind::Execute => {
+            return stated().unwrap_or_else(|| {
+                structured
+                    .and_then(spoken_command)
+                    .or_else(|| spoken_command(label))
+                    .map_or(ToolCallTarget::Unnamed, ToolCallTarget::Named)
+            });
+        }
         NarrationKind::Read | NarrationKind::Edit => structured
             .map(str::to_string)
             .or_else(|| label_path(label))
@@ -454,11 +647,18 @@ fn tool_call_target(kind: NarrationKind, structured: Option<&str>, label: &str) 
             .or_else(|| label_url(label))
             .map_or_else(titled, ToolCallTarget::Named),
         NarrationKind::Other => titled(),
+    };
+    match resolved {
+        ToolCallTarget::Unnamed => stated().unwrap_or(ToolCallTarget::Unnamed),
+        resolved => resolved,
     }
 }
 
 /// What narration's line for a call is about, before a verb goes in front.
 enum ToolCallTarget {
+    /// The agent said what the call is for, in its own words. That sentence
+    /// *is* the line — no verb goes in front of it and it is not a code span.
+    Stated(String),
     /// A concrete thing: the command, the path, the URL, the pattern.
     Named(String),
     /// Nothing concrete could be resolved, and the title does not read as
@@ -556,8 +756,13 @@ impl NarrationQueue {
         let continuing = self.last_tool_kind == Some(kind);
         self.last_tool_key = Some((kind, key));
         self.last_tool_kind = Some(kind);
-        let narration = match generated_phrase(kind, facts.structured_target(), &label, continuing)
-        {
+        let narration = match generated_phrase(
+            kind,
+            facts.stated_purpose().as_deref(),
+            facts.structured_target(),
+            &label,
+            continuing,
+        ) {
             Some(phrase) => {
                 self.remember(&phrase);
                 Narration {
@@ -784,6 +989,7 @@ impl NarrationQueue {
 /// is what keeps a run of reads from chanting.
 fn generated_phrase(
     kind: NarrationKind,
+    purpose: Option<&str>,
     structured: Option<&str>,
     label: &str,
     continuing: bool,
@@ -795,12 +1001,86 @@ fn generated_phrase(
             format!("{} `{target}`.", kind.verb())
         }
     };
-    match tool_call_target(kind, structured, label) {
+    match tool_call_target(kind, purpose, structured, label) {
+        ToolCallTarget::Stated(purpose) => Some(format!("{}.", spoken_purpose(&purpose))),
         ToolCallTarget::Named(target) => Some(lead(&target)),
         // Silence is the one thing this must never be: a listener told
         // nothing cannot tell a quiet agent from a broken feature.
         ToolCallTarget::Unnamed => Some(kind.unnamed_phrase().to_string()),
         ToolCallTarget::Label => None,
+    }
+}
+
+/// An agent's stated purpose as a narration line.
+///
+/// Agents write these in the imperative ("Search almanac for launch
+/// readiness") or as a bare noun phrase ("Recent commits and unpushed
+/// count") — nineteen and seven respectively across the twenty-six in the
+/// captured session. Read out verbatim, the imperative ones sound like
+/// instructions *to the listener*, which is exactly backwards in an ear-only
+/// mode whose whole job is reporting what the agent is doing. So the leading
+/// verb is put into the present participle: "Searching almanac for launch
+/// readiness."
+///
+/// The conversion is a lookup, not morphology. English participle spelling
+/// (drop the `e`, double the consonant, `-ie` becomes `-ying`) has enough
+/// exceptions that a rule would eventually mangle a word in the user's ear,
+/// and a mangled word is worse than a slightly stiff sentence. A first word
+/// that is not in the table — every noun phrase, and any verb not measured —
+/// is spoken exactly as written.
+fn spoken_purpose(purpose: &str) -> String {
+    /// Imperative-to-participle pairs. Every entry is a verb measured in the
+    /// captured session or one of the handful of shell-task verbs an agent
+    /// reaches for constantly. Extending it is safe; the fallback is
+    /// verbatim.
+    const PARTICIPLES: &[(&str, &str)] = &[
+        ("add", "Adding"),
+        ("build", "Building"),
+        ("check", "Checking"),
+        ("collect", "Collecting"),
+        ("compare", "Comparing"),
+        ("compute", "Computing"),
+        ("confirm", "Confirming"),
+        ("count", "Counting"),
+        ("create", "Creating"),
+        ("delete", "Deleting"),
+        ("extract", "Extracting"),
+        ("fetch", "Fetching"),
+        ("find", "Finding"),
+        ("gather", "Gathering"),
+        ("generate", "Generating"),
+        ("get", "Getting"),
+        ("inspect", "Inspecting"),
+        ("install", "Installing"),
+        ("list", "Listing"),
+        ("look", "Looking"),
+        ("measure", "Measuring"),
+        ("move", "Moving"),
+        ("print", "Printing"),
+        ("read", "Reading"),
+        ("remove", "Removing"),
+        ("rename", "Renaming"),
+        ("run", "Running"),
+        ("scan", "Scanning"),
+        ("search", "Searching"),
+        ("show", "Showing"),
+        ("test", "Testing"),
+        ("update", "Updating"),
+        ("verify", "Verifying"),
+        ("write", "Writing"),
+    ];
+    let Some((first, rest)) = purpose.split_once(' ') else {
+        // A one-word purpose is a label, not a sentence; converting it would
+        // read worse than leaving it ("Cleanup." not "Cleaning up.").
+        return purpose.to_string();
+    };
+    let lowercased = first.to_lowercase();
+    match PARTICIPLES
+        .iter()
+        .find(|(imperative, _)| *imperative == lowercased)
+    {
+        Some((_, participle)) => format!("{participle} {rest}"),
+        None => purpose.to_string(),
     }
 }
 
@@ -1851,7 +2131,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                generated_phrase(kind, structured, label, false).as_deref(),
+                generated_phrase(kind, None, structured, label, false).as_deref(),
                 expected,
                 "{kind:?} with structured {structured:?} and title {label:?}"
             );
@@ -1878,7 +2158,7 @@ mod tests {
             // No structured input and no title at all: the shape an
             // unrecognised tool schema plus a placeholder produces.
             assert_eq!(
-                generated_phrase(kind, None, "", false).as_deref(),
+                generated_phrase(kind, None, None, "", false).as_deref(),
                 Some(kind.unnamed_phrase()),
                 "{kind:?} must still have a line when nothing resolves"
             );
@@ -2102,6 +2382,7 @@ mod tests {
             generated_phrase(
                 NarrationKind::Execute,
                 None,
+                None,
                 "cd /x; ls -la && grep foo",
                 false
             )
@@ -2109,7 +2390,14 @@ mod tests {
             Some("Running `ls`.")
         );
         assert_eq!(
-            generated_phrase(NarrationKind::Execute, None, "cd /x && cargo test", false).as_deref(),
+            generated_phrase(
+                NarrationKind::Execute,
+                None,
+                None,
+                "cd /x && cargo test",
+                false
+            )
+            .as_deref(),
             Some("Running `cargo test`.")
         );
     }
@@ -2120,6 +2408,7 @@ mod tests {
         assert_eq!(
             generated_phrase(
                 NarrationKind::Read,
+                None,
                 None,
                 "Read file `crates/read\\_aloud/src/player.rs`",
                 false
@@ -2416,5 +2705,517 @@ mod tests {
             }
         });
         assert_eq!(queue.recent_lines().len(), RECENT_LINES);
+    }
+
+    /// One `tool_call` or `tool_call_update` from the captured session, with
+    /// only the fields narration reads.
+    struct CapturedUpdate {
+        kind: Option<NarrationKind>,
+        title: Option<String>,
+        status: Option<String>,
+        raw_input: Option<serde_json::Value>,
+        locations: usize,
+    }
+
+    /// The capture, in arrival order. Parsed rather than transcribed: three
+    /// rounds of fixes to this path were written against an *inferred*
+    /// protocol shape and all three missed, so nothing here is retyped by
+    /// hand.
+    fn captured_updates() -> Vec<CapturedUpdate> {
+        let capture: serde_json::Value =
+            serde_json::from_str(crate::CLAUDE_CODE_TOOL_CALL_CAPTURE).expect("the capture parses");
+        capture["updates"]
+            .as_array()
+            .expect("the capture is a list of updates")
+            .iter()
+            .map(|update| CapturedUpdate {
+                kind: update["kind"].as_str().map(|kind| match kind {
+                    "read" => NarrationKind::Read,
+                    "edit" => NarrationKind::Edit,
+                    "delete" => NarrationKind::Delete,
+                    "move" => NarrationKind::Move,
+                    "search" => NarrationKind::Search,
+                    "execute" => NarrationKind::Execute,
+                    "fetch" => NarrationKind::Fetch,
+                    _ => NarrationKind::Other,
+                }),
+                title: update["title"].as_str().map(str::to_string),
+                status: update["status"].as_str().map(str::to_string),
+                raw_input: update.get("rawInput").cloned(),
+                locations: update["locations"].as_array().map_or(0, Vec::len),
+            })
+            .collect()
+    }
+
+    /// The measurement everything else in this file's tool-call handling now
+    /// rests on. If a future capture replaces this one and these numbers move,
+    /// the design premises move with them and every test below is suspect.
+    #[test]
+    fn the_capture_says_what_the_design_assumes() {
+        let updates = captured_updates();
+        let arrivals: Vec<_> = updates
+            .iter()
+            .filter(|update| update.kind.is_some() && update.status.is_some())
+            .collect();
+        // Only the initial notifications carry both a kind and a status.
+        assert_eq!(arrivals.len(), 28, "the session made twenty-eight calls");
+        assert!(
+            arrivals
+                .iter()
+                .all(|arrival| arrival.status.as_deref() == Some("pending")),
+            "every call arrives `pending`, complete or not — which is exactly \
+             why a status-based gate cannot work"
+        );
+        let empty: Vec<_> = arrivals
+            .iter()
+            .filter(|arrival| {
+                RawToolInput::from_json(arrival.raw_input.as_ref()).input == ToolCallInput::Empty
+            })
+            .collect();
+        assert_eq!(empty.len(), 6, "six of the twenty-eight arrive contentless");
+        assert!(
+            empty
+                .iter()
+                .all(|arrival| arrival.title.as_deref() == Some("Terminal")),
+            "the contentless ones are all titled `Terminal`"
+        );
+        assert!(
+            arrivals.iter().all(|arrival| arrival.raw_input.is_some()),
+            "and `is_some()` is true for all twenty-eight, contentless or not: \
+             the check that survived three rounds of fixes cannot tell them apart"
+        );
+        assert!(
+            arrivals
+                .iter()
+                .filter(|arrival| arrival.kind == Some(NarrationKind::Read))
+                .all(|arrival| arrival.locations > 0),
+            "a read arrives complete: a file path, a real title, and populated \
+             `locations`. Nothing about that path needed changing."
+        );
+        let with_purpose = updates
+            .iter()
+            .filter(|update| {
+                RawToolInput::from_json(update.raw_input.as_ref())
+                    .purpose
+                    .is_some()
+            })
+            .count();
+        assert!(
+            with_purpose >= 26,
+            "the agent states a purpose for its own calls, and we were throwing \
+             it away; got {with_purpose}"
+        );
+    }
+
+    /// Only `execute` calls carry a description. `read` carries a file path
+    /// and populated `locations` and needs none; no other kind appears in the
+    /// capture at all. Asserted so a later reader does not have to take the
+    /// grep on faith.
+    #[test]
+    fn only_execute_calls_state_a_purpose() {
+        let mut kinds_with_purpose = std::collections::BTreeSet::new();
+        let mut kinds_seen = std::collections::BTreeSet::new();
+        let mut current = None;
+        for update in captured_updates() {
+            current = update.kind.or(current);
+            let Some(kind) = current else { continue };
+            kinds_seen.insert(format!("{kind:?}"));
+            if RawToolInput::from_json(update.raw_input.as_ref())
+                .purpose
+                .is_some()
+            {
+                kinds_with_purpose.insert(format!("{kind:?}"));
+            }
+        }
+        assert_eq!(
+            kinds_seen,
+            ["Execute".to_string(), "Read".to_string()].into(),
+            "the capture only exercises two kinds"
+        );
+        assert_eq!(
+            kinds_with_purpose,
+            ["Execute".to_string()].into(),
+            "a purpose only ever arrives on an execute call"
+        );
+    }
+
+    /// `Option::is_some()` reports a present-but-empty container as present.
+    /// That is the whole bug.
+    #[test]
+    fn an_empty_payload_is_not_the_same_as_a_missing_one() {
+        assert_eq!(
+            RawToolInput::from_json(None).input,
+            ToolCallInput::Absent,
+            "an agent that sends no structured input at all is not waiting to"
+        );
+        let empty = serde_json::json!({});
+        assert!(Some(&empty).is_some(), "the trap, stated");
+        assert_eq!(
+            RawToolInput::from_json(Some(&empty)).input,
+            ToolCallInput::Empty
+        );
+        let present = serde_json::json!({"command": "ls -la"});
+        assert_eq!(
+            RawToolInput::from_json(Some(&present)).input,
+            ToolCallInput::Present
+        );
+    }
+
+    /// The exact three-step trace the capture shows for a contentless call,
+    /// replayed. The listener heard "running terminal" because the middle
+    /// step — the only one that changes anything — used to arrive after the
+    /// settle timer had already spoken.
+    #[gpui::test]
+    async fn a_contentless_execute_call_waits_for_its_command(cx: &mut TestAppContext) {
+        let terminal = markdown("Terminal", cx);
+        let refined = markdown("echo \"=== PRD counts ===\" && ls -1 docs/prds/", cx);
+        cx.run_until_parked();
+        let facts = |label: Entity<Markdown>, raw: serde_json::Value| {
+            let raw = RawToolInput::from_json(Some(&raw));
+            ToolCallFacts {
+                purpose: raw.purpose,
+                command: raw.command,
+                input: raw.input,
+                ..ToolCallFacts::from_label("empty", label, NarrationKind::Execute)
+            }
+        };
+        let arrival = facts(terminal.clone(), serde_json::json!({}));
+        assert!(
+            arrival.awaiting_input(),
+            "`rawInput: {{}}` with the title `Terminal` has nothing to say yet"
+        );
+        cx.update(|cx| {
+            assert_eq!(
+                arrival.spoken_key(cx),
+                "Terminal",
+                "and if it is spoken anyway, this is the word the user heard"
+            );
+        });
+
+        let raw_command = facts(
+            terminal,
+            serde_json::json!({"command": "cd /Users/j/bartr && echo \"=== PRD counts ===\""}),
+        );
+        assert!(
+            !raw_command.awaiting_input(),
+            "the first refinement carries a command, so the wait is over"
+        );
+
+        let described = facts(
+            refined,
+            serde_json::json!({
+                "command": "echo \"=== PRD counts ===\" && ls -1 docs/prds/",
+                "description": "List PRD folders and contents",
+            }),
+        );
+        assert!(!described.awaiting_input());
+        cx.update(|cx| {
+            assert_eq!(described.spoken_key(cx), "List PRD folders and contents");
+        });
+        let mut queue = NarrationQueue::default();
+        cx.update(|cx| assert!(queue.push_tool_call(described, cx)));
+        assert_eq!(
+            queue.recent_lines(),
+            &["Listing PRD folders and contents.".to_string()],
+        );
+    }
+
+    /// Every purpose in the capture, and the line it becomes. Nineteen are
+    /// imperative and take a participle; seven are noun phrases and are
+    /// spoken exactly as the agent wrote them.
+    #[test]
+    fn every_captured_purpose_reads_as_narration() {
+        for (purpose, expected) in [
+            (
+                "List PRD folders and contents",
+                "Listing PRD folders and contents",
+            ),
+            ("List repo root and docs", "Listing repo root and docs"),
+            (
+                "Search almanac for launch readiness",
+                "Searching almanac for launch readiness",
+            ),
+            (
+                "Check roadmap/product doc sizes and launch mentions",
+                "Checking roadmap/product doc sizes and launch mentions",
+            ),
+            (
+                "Compute checkbox progress for in-progress PRDs",
+                "Computing checkbox progress for in-progress PRDs",
+            ),
+            (
+                "Checkbox completion per in-progress and review PRD",
+                "Checkbox completion per in-progress and review PRD",
+            ),
+            (
+                "Search almanac for launch blockers and list topics",
+                "Searching almanac for launch blockers and list topics",
+            ),
+            (
+                "Find launch references in almanac",
+                "Finding launch references in almanac",
+            ),
+            (
+                "Recent commits and unpushed count",
+                "Recent commits and unpushed count",
+            ),
+            (
+                "Check waitlist backend existence",
+                "Checking waitlist backend existence",
+            ),
+            (
+                "Check review PRD remaining items",
+                "Checking review PRD remaining items",
+            ),
+            (
+                "Check shipped PRDs and waitlist wizard state",
+                "Checking shipped PRDs and waitlist wizard state",
+            ),
+            (
+                "Inspect v2 marketing components and CTA targets",
+                "Inspecting v2 marketing components and CTA targets",
+            ),
+            (
+                "List app routes for marketing surface",
+                "Listing app routes for marketing surface",
+            ),
+            (
+                "Collect marketing link targets",
+                "Collecting marketing link targets",
+            ),
+            ("Extract marketing hrefs", "Extracting marketing hrefs"),
+            (
+                "Extract marketing hrefs (quoted glob)",
+                "Extracting marketing hrefs (quoted glob)",
+            ),
+            (
+                "Look for WorkOS pages in almanac",
+                "Looking for WorkOS pages in almanac",
+            ),
+            (
+                "Search remember history for WorkOS 500",
+                "Searching remember history for WorkOS 500",
+            ),
+            (
+                "Full marketing route list and sitemap entries",
+                "Full marketing route list and sitemap entries",
+            ),
+            (
+                "Checkbox progress per in-progress PRD",
+                "Checkbox progress per in-progress PRD",
+            ),
+            (
+                "Almanac structure and README",
+                "Almanac structure and README",
+            ),
+            ("Find almanac pages", "Finding almanac pages"),
+            ("App route structure", "App route structure"),
+        ] {
+            assert_eq!(spoken_purpose(purpose), expected, "purpose {purpose:?}");
+        }
+    }
+
+    /// The whole capture, replayed. Every narrated call must produce a line
+    /// that says what the agent is doing — and they must differ, because a
+    /// run of identical lines is silence with extra steps.
+    #[gpui::test]
+    async fn replaying_the_capture_produces_distinct_meaningful_lines(cx: &mut TestAppContext) {
+        // Each call's facts as of its *last* update, which is what narration
+        // ends up speaking once the contentless ones have been refined.
+        let mut final_state: Vec<(NarrationKind, String, serde_json::Value)> = Vec::new();
+        let mut current: Option<usize> = None;
+        for update in captured_updates() {
+            match (update.kind, update.status.as_deref()) {
+                (Some(kind), Some(_)) => {
+                    current = Some(final_state.len());
+                    final_state.push((
+                        kind,
+                        update.title.clone().unwrap_or_default(),
+                        update.raw_input.clone().unwrap_or(serde_json::Value::Null),
+                    ));
+                }
+                _ => {
+                    let Some(index) = current.and_then(|index| final_state.get_mut(index)) else {
+                        continue;
+                    };
+                    if let Some(title) = update.title.clone() {
+                        index.1 = title;
+                    }
+                    if let Some(raw_input) = update.raw_input.clone() {
+                        index.2 = raw_input;
+                    }
+                }
+            }
+        }
+        assert_eq!(final_state.len(), 28);
+
+        let labels: Vec<_> = final_state
+            .iter()
+            .map(|(_, title, _)| markdown(title, cx))
+            .collect();
+        cx.run_until_parked();
+        let mut queue = NarrationQueue::default();
+        let mut spoken = Vec::new();
+        cx.update(|cx| {
+            for (index, ((kind, _, raw_input), label)) in final_state.iter().zip(labels).enumerate()
+            {
+                let raw = RawToolInput::from_json(Some(raw_input));
+                let facts = ToolCallFacts {
+                    purpose: raw.purpose,
+                    command: raw.command,
+                    path: raw.path,
+                    url: raw.url,
+                    query: raw.query,
+                    input: raw.input,
+                    ..ToolCallFacts::from_label(index.to_string(), label, *kind)
+                };
+                assert!(
+                    !facts.awaiting_input(),
+                    "every call in the capture is eventually refined; #{index} was not"
+                );
+                if queue.push_tool_call(facts, cx) {
+                    spoken.push(queue.recent_lines().last().cloned().unwrap_or_default());
+                }
+            }
+        });
+
+        assert!(
+            !spoken
+                .iter()
+                .any(|line| line.to_lowercase().contains("terminal")),
+            "the reported bug: {spoken:#?}"
+        );
+        assert!(
+            !spoken
+                .iter()
+                .any(|line| line == NarrationKind::Execute.unnamed_phrase()),
+            "no call should fall through to the templated phrase: {spoken:#?}"
+        );
+        assert_eq!(
+            spoken.len(),
+            28,
+            "every one of the twenty-eight calls says something: {spoken:#?}"
+        );
+        assert!(
+            spoken.windows(2).all(|pair| pair[0] != pair[1]),
+            "no line repeats the one before it: {spoken:#?}"
+        );
+        // Two purposes genuinely recur later in the session ("List PRD
+        // folders and contents", "Recent commits and unpushed count"). They
+        // are far apart, so suppressing them would leave the listener with
+        // silence where a real call happened.
+        let distinct: std::collections::BTreeSet<_> = spoken.iter().collect();
+        assert_eq!(distinct.len(), 26, "{spoken:#?}");
+        assert!(
+            spoken.contains(&"Searching almanac for launch readiness.".to_string()),
+            "{spoken:#?}"
+        );
+        assert!(
+            spoken.contains(
+                &"Reading `/Users/joshuar.bunnell/code/bartrhomes/bartr/PRODUCT.md`.".to_string()
+            ),
+            "a read still narrates its file: {spoken:#?}"
+        );
+    }
+
+    /// The prompts get the purpose too — it is shorter than the command and
+    /// it is about intent, which is what a summarizing model needs.
+    #[gpui::test]
+    async fn a_prompts_account_of_a_call_uses_the_stated_purpose(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            purpose: Some("Search almanac for launch readiness".to_string()),
+            command: Some(
+                "codealmanac search \"launch readiness\" --limit 10 2>&1 | head -50".to_string(),
+            ),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert_eq!(
+                facts.description(cx),
+                "ran a command — Search almanac for launch readiness"
+            );
+            let failed = ToolCallFacts {
+                outcome: ToolCallOutcome::Failed,
+                ..facts.clone()
+            };
+            assert!(
+                failed.description(cx).ends_with("— it FAILED"),
+                "the failure guarantee survives the new source"
+            );
+        });
+    }
+
+    /// A read's file is still the point; a description would not improve it,
+    /// and the capture sends none.
+    #[gpui::test]
+    async fn a_purpose_does_not_displace_a_file(cx: &mut TestAppContext) {
+        let label = markdown("Read PRODUCT.md", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            purpose: Some("Understand the product".to_string()),
+            path: Some("/repo/PRODUCT.md".to_string()),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Read)
+        };
+        cx.update(|cx| {
+            assert_eq!(facts.spoken_key(cx), "/repo/PRODUCT.md");
+            assert_eq!(facts.description(cx), "read /repo/PRODUCT.md");
+        });
+    }
+
+    /// …but it beats saying nothing. A kind that resolves to its templated
+    /// phrase takes the agent's words instead.
+    #[gpui::test]
+    async fn a_purpose_displaces_a_templated_phrase(cx: &mut TestAppContext) {
+        let label = markdown("", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            purpose: Some("Find every caller of the poll loop".to_string()),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Search)
+        };
+        cx.update(|cx| {
+            assert_eq!(facts.spoken_key(cx), "Find every caller of the poll loop");
+        });
+    }
+
+    /// A purpose that is nothing but punctuation is worse than no purpose:
+    /// it produces no audio, and every call carrying it compares equal, so
+    /// the whole run is suppressed and the turn goes silent.
+    #[gpui::test]
+    async fn a_purpose_with_nothing_to_say_is_discarded(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            purpose: Some("…".to_string()),
+            command: Some("cargo test -p read_aloud".to_string()),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert_eq!(
+                facts.spoken_key(cx),
+                "cargo test",
+                "the command still names the call"
+            );
+        });
+    }
+
+    /// Agent-controlled prose on a path with a two-second budget.
+    #[gpui::test]
+    async fn a_runaway_purpose_is_bounded(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            purpose: Some("Check ".repeat(400)),
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert!(facts.spoken_key(cx).chars().count() <= MAX_PURPOSE_CHARS);
+        });
     }
 }

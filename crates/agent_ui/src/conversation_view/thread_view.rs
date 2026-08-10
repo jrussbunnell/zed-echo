@@ -756,37 +756,13 @@ fn narration_kind(kind: &acp::ToolKind) -> read_aloud::NarrationKind {
 /// of the turn, because every following call had the same title.
 ///
 /// `raw_input` is the agent's own tool schema, so the key it uses is a
-/// convention rather than a contract; the common spellings are probed and
-/// anything unrecognised degrades to the title.
+/// convention rather than a contract; [`read_aloud::RawToolInput`] probes the
+/// common spellings and anything unrecognised degrades to the title.
 fn read_aloud_tool_call_facts(tool_call: &acp_thread::ToolCall) -> read_aloud::ToolCallFacts {
-    /// The keys an agent might put a shell command under.
-    const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "shell_command"];
-    /// …a file path under. `path` is Zed's own edit and read tools;
-    /// `file_path` is Claude Code's.
-    const PATH_KEYS: &[&str] = &["file_path", "path", "abs_path", "absolute_path", "filename"];
-    const URL_KEYS: &[&str] = &["url", "uri"];
-    /// …a search's subject under. `regex` is Zed's grep tool; `pattern` is
-    /// Claude Code's Grep and Glob.
-    const QUERY_KEYS: &[&str] = &["pattern", "regex", "query", "glob"];
-
-    let raw_input = tool_call
-        .raw_input
-        .as_ref()
-        .and_then(|input| input.as_object());
-    let field = |keys: &[&str]| -> Option<String> {
-        let object = raw_input?;
-        keys.iter().find_map(|key| {
-            object
-                .get(*key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-    };
+    let raw = read_aloud::RawToolInput::from_json(tool_call.raw_input.as_ref());
     // ACP populates `locations` independently of the title, so a call whose
     // input schema is unrecognised can still name its file.
-    let path = field(PATH_KEYS).or_else(|| {
+    let path = raw.path.or_else(|| {
         tool_call
             .locations
             .first()
@@ -797,12 +773,54 @@ fn read_aloud_tool_call_facts(tool_call: &acp_thread::ToolCall) -> read_aloud::T
         id: tool_call.id.0.to_string(),
         kind: narration_kind(&tool_call.kind),
         label: tool_call.label.clone(),
-        command: field(COMMAND_KEYS),
+        purpose: raw.purpose,
+        command: raw.command,
         path,
-        url: field(URL_KEYS),
-        query: field(QUERY_KEYS),
+        url: raw.url,
+        query: raw.query,
+        input: raw.input,
         outcome: read_aloud_tool_call_outcome(&tool_call.status),
     }
+}
+
+/// Why narration is looking at a tool call, which decides how much longer it
+/// is willing to wait before speaking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NarrationTrigger {
+    /// The call arrived, or one of its fields changed.
+    Updated,
+    /// The settle timer expired without the call's line changing.
+    Settled,
+    /// The turn ended. Nothing more is coming for any call still waiting.
+    TurnEnded,
+}
+
+/// Whether narration may speak this call now.
+///
+/// Pure so the decision is testable without a view, because getting it wrong
+/// is what the listener hears.
+///
+/// A terminal status short-circuits every wait — no refinement can follow a
+/// call that has finished — and so does the end of the turn.
+///
+/// Otherwise the call has to be *settled*: its line held still for
+/// [`TOOL_LABEL_SETTLE`]. The exception, and the reason this function exists,
+/// is a call whose payload arrived empty. Its line cannot change while the
+/// payload is empty, so it is trivially "settled" the instant it arrives and
+/// the timer speaks the placeholder — "running terminal". An empty payload
+/// means *not ready yet*, and the wait continues until content arrives or a
+/// backstop fires.
+fn read_aloud_tool_call_is_ready(
+    facts: &read_aloud::ToolCallFacts,
+    status: &ToolCallStatus,
+    trigger: NarrationTrigger,
+) -> bool {
+    if trigger == NarrationTrigger::TurnEnded
+        || matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+    {
+        return true;
+    }
+    trigger == NarrationTrigger::Settled && !facts.awaiting_input()
 }
 
 /// The rungs [`ThreadView::read_aloud_summary_model`] walks, as a function of
@@ -1600,7 +1618,11 @@ impl ThreadView {
                             if let Some(previous) = entry_index.checked_sub(1) {
                                 this.narrate_read_aloud_message(previous, cx);
                             }
-                            this.note_read_aloud_tool_call(entry_index, false, cx);
+                            this.note_read_aloud_tool_call(
+                                entry_index,
+                                NarrationTrigger::Updated,
+                                cx,
+                            );
                         }
                         NewEntryKind::Other => {}
                     }
@@ -1624,7 +1646,7 @@ impl ThreadView {
                             this.speculate_read_aloud_wrap_up(*entry_ix, cx);
                         }
                     } else {
-                        this.note_read_aloud_tool_call(*entry_ix, false, cx);
+                        this.note_read_aloud_tool_call(*entry_ix, NarrationTrigger::Updated, cx);
                     }
                 }
                 AcpThreadEvent::Stopped(_) => {
@@ -1789,12 +1811,17 @@ impl ThreadView {
     /// refinement can follow a call that has finished — and the turn-end
     /// sweep is the backstop for anything still waiting.
     ///
+    /// That signal has one hole, and [`read_aloud_tool_call_is_ready`] is
+    /// what plugs it: a call whose payload arrives *empty* has a label that
+    /// cannot change, so it looks settled immediately and the timer speaks
+    /// the placeholder.
+    ///
     /// Dedupe is per tool-call id, not per label, so a call whose label moves
     /// again later never produces a second utterance.
     fn note_read_aloud_tool_call(
         &mut self,
         entry_index: usize,
-        force: bool,
+        trigger: NarrationTrigger,
         cx: &mut Context<Self>,
     ) {
         let Some(read_aloud) = self.read_aloud.clone() else {
@@ -1822,11 +1849,8 @@ impl ThreadView {
         }
         let facts = read_aloud_tool_call_facts(tool_call);
         let outcome = facts.outcome;
-        // Nothing further can refine a call that has already finished.
-        let settled = matches!(
-            tool_call.status,
-            ToolCallStatus::Completed | ToolCallStatus::Failed
-        );
+        let ready = read_aloud_tool_call_is_ready(&facts, &tool_call.status, trigger);
+        let awaiting_input = facts.awaiting_input();
         let call_id = tool_call.id.clone();
         let key = facts.spoken_key(cx);
 
@@ -1848,12 +1872,16 @@ impl ThreadView {
         }
         let moved = state.last_key != key;
         state.last_key = key.clone();
-        if !force && !settled {
-            // Still moving, or not yet still for long enough. Either way the
-            // step it belongs to must not close underneath it, so the reader
-            // is told the agent is mid-action.
+        if !ready {
+            // Still moving, not yet still for long enough, or still empty.
+            // Either way the step it belongs to must not close underneath it,
+            // so the reader is told the agent is mid-action.
             self.hold_read_aloud_step(cx);
-            if moved || self.read_aloud_label_settle.is_none() {
+            // An empty payload has nothing to time: its line cannot move
+            // until content arrives, and the update that brings the content
+            // re-enters here and arms the timer then. Re-arming on every
+            // expiry instead would spin a timer for the life of the call.
+            if moved || (self.read_aloud_label_settle.is_none() && !awaiting_input) {
                 self.arm_read_aloud_label_settle(cx);
             }
             return;
@@ -1907,7 +1935,7 @@ impl ThreadView {
                 .collect()
         };
         for entry_index in settled {
-            self.note_read_aloud_tool_call(entry_index, true, cx);
+            self.note_read_aloud_tool_call(entry_index, NarrationTrigger::Settled, cx);
         }
     }
 
@@ -1947,7 +1975,7 @@ impl ThreadView {
                 .collect()
         };
         for entry_index in waiting {
-            self.note_read_aloud_tool_call(entry_index, true, cx);
+            self.note_read_aloud_tool_call(entry_index, NarrationTrigger::TurnEnded, cx);
         }
     }
 
@@ -14414,6 +14442,195 @@ mod tests {
             .expect("the fake provider has a model")
             .clone();
         ConfiguredModel { provider, model }
+    }
+
+    /// One `tool_call` notification from the captured Claude Code session,
+    /// rebuilt as the thread entry narration sees. Only the transport shim is
+    /// written here; every field it copies is the capture's own.
+    fn captured_tool_call(
+        update: &serde_json::Value,
+        status: ToolCallStatus,
+        cx: &mut App,
+    ) -> acp_thread::ToolCall {
+        let title = update["title"].as_str().unwrap_or_default().to_string();
+        acp_thread::ToolCall {
+            id: acp::ToolCallId::new(update["toolCallId"].as_str().unwrap_or("call")),
+            label: cx.new(|cx| markdown::Markdown::new(title.into(), None, None, cx)),
+            kind: match update["kind"].as_str() {
+                Some("read") => acp::ToolKind::Read,
+                Some("execute") => acp::ToolKind::Execute,
+                _ => acp::ToolKind::Other,
+            },
+            content: Vec::new(),
+            status,
+            locations: update["locations"]
+                .as_array()
+                .map(|locations| {
+                    locations
+                        .iter()
+                        .filter_map(|location| location["path"].as_str())
+                        .map(|path| acp::ToolCallLocation::new(PathBuf::from(path)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            resolved_locations: Vec::new(),
+            raw_input: update.get("rawInput").cloned(),
+            raw_input_markdown: None,
+            raw_output: None,
+            tool_name: None,
+            subagent_session_info: None,
+            sandbox_authorization_details: None,
+            sandbox_fallback_authorization_details: None,
+            sandbox_not_applied: None,
+        }
+    }
+
+    /// Every initial `tool_call` notification in the capture, in order.
+    fn captured_arrivals() -> Vec<serde_json::Value> {
+        let capture: serde_json::Value =
+            serde_json::from_str(read_aloud::CLAUDE_CODE_TOOL_CALL_CAPTURE)
+                .expect("the capture parses");
+        capture["updates"]
+            .as_array()
+            .expect("the capture is a list of updates")
+            .iter()
+            .filter(|update| update["sessionUpdate"] == "tool_call")
+            .cloned()
+            .collect()
+    }
+
+    /// The bug the user heard for days, at the seam where it lived.
+    ///
+    /// Six of the capture's twenty-eight calls arrive with `rawInput: {}` and
+    /// the title "Terminal". Their `raw_input` is `Some`, so the check that
+    /// stood here for three rounds of fixes saw structured input; their
+    /// status is `pending`, exactly like the twenty-two that arrived
+    /// complete, so a status gate cannot separate them either. Only the
+    /// emptiness of the payload can.
+    #[gpui::test]
+    fn the_capture_separates_contentless_arrivals_from_complete_ones(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let arrivals = captured_arrivals();
+            assert_eq!(arrivals.len(), 28);
+            let mut waiting = 0;
+            let mut with_purpose = 0;
+            for update in &arrivals {
+                let tool_call = captured_tool_call(update, ToolCallStatus::Pending, cx);
+                assert!(
+                    tool_call.raw_input.is_some(),
+                    "`is_some()` is true for all twenty-eight — it cannot be the gate"
+                );
+                let facts = read_aloud_tool_call_facts(&tool_call);
+                if facts.awaiting_input() {
+                    waiting += 1;
+                    assert_eq!(update["title"], "Terminal");
+                    assert!(
+                        !read_aloud_tool_call_is_ready(
+                            &facts,
+                            &ToolCallStatus::Pending,
+                            NarrationTrigger::Settled,
+                        ),
+                        "a contentless call must not be spoken when the timer expires"
+                    );
+                } else {
+                    assert!(
+                        read_aloud_tool_call_is_ready(
+                            &facts,
+                            &ToolCallStatus::Pending,
+                            NarrationTrigger::Settled,
+                        ),
+                        "a complete call must not be delayed by the fix for the empty ones"
+                    );
+                }
+                if facts.purpose.is_some() {
+                    with_purpose += 1;
+                }
+            }
+            assert_eq!(waiting, 6, "six arrive contentless");
+            assert_eq!(
+                with_purpose, 20,
+                "twenty state their purpose on arrival; the other six state it \
+                 in the refinement that fills the command in"
+            );
+        });
+    }
+
+    /// A call that never gets its payload is still spoken — late, but spoken.
+    /// Silence is the one outcome this path may never produce.
+    #[gpui::test]
+    fn a_contentless_call_is_still_spoken_by_the_backstops(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let empty = captured_arrivals()
+                .into_iter()
+                .find(|update| update["rawInput"] == serde_json::json!({}))
+                .expect("the capture has contentless arrivals");
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &empty,
+                ToolCallStatus::Pending,
+                cx,
+            ));
+            assert!(facts.awaiting_input());
+            assert!(
+                read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Pending,
+                    NarrationTrigger::TurnEnded,
+                ),
+                "the turn-end sweep speaks whatever is left"
+            );
+            assert!(
+                read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Failed,
+                    NarrationTrigger::Updated,
+                ),
+                "so does a terminal status, and a failure most of all"
+            );
+            assert!(
+                !read_aloud_tool_call_is_ready(
+                    &facts,
+                    &ToolCallStatus::Pending,
+                    NarrationTrigger::Updated,
+                ),
+                "but an ordinary update still waits for the label to settle"
+            );
+        });
+    }
+
+    /// The refinement trace the capture shows for a contentless call, driven
+    /// through the same function the view calls.
+    #[gpui::test]
+    fn a_refined_payload_ends_the_wait_and_names_the_purpose(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut update = serde_json::json!({
+                "toolCallId": "toolu_01TdExhzUnCcAbaJWY5HLrFH",
+                "kind": "execute",
+                "title": "Terminal",
+                "rawInput": {},
+            });
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &update,
+                ToolCallStatus::Pending,
+                cx,
+            ));
+            assert!(facts.awaiting_input());
+
+            update["rawInput"] = serde_json::json!({
+                "command": "echo \"=== PRD counts ===\" && ls -1 docs/prds/",
+                "description": "List PRD folders and contents",
+            });
+            let facts = read_aloud_tool_call_facts(&captured_tool_call(
+                &update,
+                ToolCallStatus::Pending,
+                cx,
+            ));
+            assert!(!facts.awaiting_input());
+            assert_eq!(
+                facts.spoken_key(cx),
+                "List PRD folders and contents",
+                "the agent's own words, not a shortened `echo`"
+            );
+        });
     }
 
     /// The regression this whole rung ladder exists for: the user drives an

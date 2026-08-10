@@ -8446,6 +8446,147 @@ pub(crate) mod tests {
         );
     }
 
+    /// The bug the user heard for days, replayed through the whole stack
+    /// from the protocol payload to the audio.
+    ///
+    /// Taken verbatim from a captured Claude Code session: six of its
+    /// twenty-eight tool calls arrive as `rawInput: {}` with the title
+    /// "Terminal", then refine twice — first to a raw `cd …`-prefixed
+    /// command, then to the real command plus a `description`. All three
+    /// notifications carry `status: "pending"`, so nothing but the emptiness
+    /// of the payload separates the arrival from a call that is ready.
+    ///
+    /// Narrating on the settle timer spoke the placeholder, because an empty
+    /// payload's label cannot change and so is trivially "settled". What the
+    /// listener got was "running terminal", once, and then silence for the
+    /// rest of the turn as every following "Terminal" compared equal.
+    #[gpui::test]
+    async fn test_read_aloud_narration_waits_out_a_contentless_tool_call(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        // The updates are pushed one at a time with the clock advanced
+        // between them, because the timing *is* the bug: batching them into
+        // one `set_next_prompt_updates` delivers the refinement before the
+        // settle timer ever runs, and the test passes over broken code.
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let update = |update: acp::SessionUpdate, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| connection.send_update(session_id, update, cx));
+            cx.run_until_parked();
+        };
+
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("toolu_01TdExhzUnCcAbaJWY5HLrFH", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(json!({})),
+            ),
+            cx,
+        );
+        // A second call arriving complete, as they do in the capture — 22 of
+        // the 28 do. This one *does* arm the settle timer, and when it fires
+        // it sweeps every un-narrated call of the turn, the empty one
+        // included. Without that second call the empty one is protected by
+        // never arming a timer at all, and the sweep's own guard goes
+        // untested.
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(
+                    "toolu_019Mmi2z8uyXdxHbdyK8ZQDG",
+                    "git log --oneline -30 | cat",
+                )
+                .kind(acp::ToolKind::Execute)
+                .status(acp::ToolCallStatus::Pending)
+                .raw_input(json!({
+                    "command": "git log --oneline -30 | cat",
+                    "description": "Recent commits and unpushed count",
+                })),
+            ),
+            cx,
+        );
+        // Well past `TOOL_LABEL_SETTLE`. This is the moment narration used to
+        // decide the label had stopped changing and say "running terminal".
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec!["Recent commits and unpushed count.".to_string()],
+            "the complete call speaks on time; the empty one has nothing to \
+             say yet, however long it sits there, got {:?}",
+            provider.spoken()
+        );
+
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("toolu_01TdExhzUnCcAbaJWY5HLrFH"),
+                acp::ToolCallUpdateFields::new()
+                    .title("cd /Users/j/bartr && echo \"=== PRD counts ===\"")
+                    .raw_input(json!({
+                        "command": "cd /Users/j/bartr && echo \"=== PRD counts ===\"",
+                    })),
+            )),
+            cx,
+        );
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("toolu_01TdExhzUnCcAbaJWY5HLrFH"),
+                acp::ToolCallUpdateFields::new()
+                    .title("echo \"=== PRD counts ===\"")
+                    .raw_input(json!({
+                        "command": "echo \"=== PRD counts ===\"",
+                        "description": "List PRD folders and contents",
+                    })),
+            )),
+            cx,
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "Recent commits and unpushed count.".to_string(),
+                "Listing PRD folders and contents.".to_string(),
+            ],
+            "the agent's own description of the call, spoken once and only \
+             after it arrived, got {:?}",
+            provider.spoken()
+        );
+
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("toolu_01TdExhzUnCcAbaJWY5HLrFH"),
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+            cx,
+        );
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert_eq!(
+            provider.spoken(),
+            vec![
+                "Recent commits and unpushed count.".to_string(),
+                "Listing PRD folders and contents.".to_string(),
+            ],
+            "and neither the completion nor the turn-end sweep says it twice, \
+             got {:?}",
+            provider.spoken()
+        );
+    }
+
     /// The same defect for files. Claude Code's Read and Edit calls are
     /// titled "Read file" and "Edit file" with the path in `raw_input`; ACP
     /// also populates `locations` independently of the title, so a call whose
