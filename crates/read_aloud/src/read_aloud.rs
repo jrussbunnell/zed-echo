@@ -541,15 +541,6 @@ pub struct ReadAloud {
     /// off, so an older request is answering a question that no longer
     /// exists. Dropping the task cancels the call.
     catch_up: Option<Task<()>>,
-    /// A finished catch-up is waiting in the narration queue and outranks the
-    /// full-prose FIFO.
-    ///
-    /// Without this, a catch-up pressed in full mode waits for every message
-    /// already queued behind the one being read — potentially minutes — and
-    /// then answers a question about a span that has stopped being current.
-    /// The prose is not discarded, only overtaken: it was queued by the
-    /// stream, and this was asked for just now.
-    catch_up_waiting: bool,
     /// Blocks washed while the current narration sounds, for narrations
     /// whose spoken text is not in the document (a summary). Empty
     /// otherwise, which is what makes full mode's highlighting untouched.
@@ -650,7 +641,6 @@ impl ReadAloud {
             wrap_up: None,
             wrap_up_issues: 0,
             catch_up: None,
-            catch_up_waiting: false,
             narration_wash: Vec::new(),
             narration_message_pending_parse: None,
             narration_parse_observations: Vec::new(),
@@ -926,7 +916,6 @@ impl ReadAloud {
         // something the user already moved on from" failure every other
         // generation here is cancelled to avoid.
         self.catch_up = None;
-        self.catch_up_waiting = false;
         self.clear_narration_wash(cx);
         // `self.speaking` is deliberately retained so the stopped-form
         // controls have a message to preview and restart.
@@ -1008,7 +997,6 @@ impl ReadAloud {
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
         self.catch_up = None;
-        self.catch_up_waiting = false;
         self.clear_highlight(cx);
         self.speaking = None;
         self.message_complete = false;
@@ -1367,13 +1355,11 @@ impl ReadAloud {
                 this.note_model_result(summary.is_some(), cx);
                 match (summary, reply) {
                     (Some(summary), _) => this.narrate_summary(summary, blocks, cx),
-                    (None, Ok(_)) => {
-                        this.narrate_opening_sentences(
-                            blocks,
-                            "the summary model returned nothing speakable",
-                            cx,
-                        );
-                    }
+                    (None, Ok(_)) => this.narrate_opening_sentences(
+                        blocks,
+                        "the summary model returned nothing speakable",
+                        cx,
+                    ),
                     (None, Err(error)) => {
                         this.narrate_opening_sentences(blocks, &format!("{error:#}"), cx);
                     }
@@ -2057,10 +2043,7 @@ impl ReadAloud {
         let Some(model) = self.summary_model.clone() else {
             // The same last rung the wrap-up takes, and the owning view has
             // already said out loud that there is no model.
-            if self.narrate_opening_sentences(blocks, "no summary model is available", cx) {
-                self.catch_up_waiting = true;
-                cx.emit(ReadAloudEvent::CaughtUp);
-            }
+            self.deliver_catch_up_opening(blocks, "no summary model is available", cx);
             return;
         };
         let prompt = narration::wrap_up_prompt(narration::WrapUpMaterial {
@@ -2093,14 +2076,11 @@ impl ReadAloud {
                     // that reads as broken, so the newest message's own
                     // opening goes out instead.
                     None => {
-                        if this.narrate_opening_sentences(
+                        this.deliver_catch_up_opening(
                             blocks,
                             "the summary model did not answer the catch-up",
                             cx,
-                        ) {
-                            this.catch_up_waiting = true;
-                            cx.emit(ReadAloudEvent::CaughtUp);
-                        }
+                        );
                     }
                 }
             })
@@ -2121,8 +2101,7 @@ impl ReadAloud {
         // status behind the answer to a button press.
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
-        self.narration.push_summary(spoken, Vec::new(), cx);
-        self.catch_up_waiting = true;
+        self.narration.push_catch_up(spoken, Vec::new(), cx);
         self.start_next_narration_if_idle(cx);
     }
 
@@ -2133,6 +2112,43 @@ impl ReadAloud {
         blocks: Vec<Entity<Markdown>>,
         cx: &mut Context<Self>,
     ) {
+        let spoken = cx.new(|cx| Markdown::new(line.into(), None, None, cx));
+        self.deliver_catch_up_narration(spoken, blocks, cx);
+    }
+
+    /// The catch-up's last rung, when no model could be had or the one there
+    /// was did not answer: the newest message's own opening.
+    ///
+    /// Delivered as the catch-up it stands in for rather than as an ordinary
+    /// summary, so it displaces queued status, overtakes waiting prose, and
+    /// reports itself heard on exactly the same terms. Returns whether there
+    /// was anything to say at all.
+    fn deliver_catch_up_opening(
+        &mut self,
+        blocks: Vec<Entity<Markdown>>,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(opening) = Self::opening_sentences(&blocks, narration::OPENING_SENTENCES, cx)
+        else {
+            log::warn!(
+                "read_aloud: a catch-up could not be summarized ({reason}) and the newest \
+                 message has no opening to fall back on; nothing was said"
+            );
+            return false;
+        };
+        log::warn!("read_aloud: a catch-up fell back to the message's opening ({reason})");
+        let spoken = cx.new(|cx| Markdown::new(opening.into(), None, None, cx));
+        self.deliver_catch_up_narration(spoken, blocks, cx);
+        true
+    }
+
+    fn deliver_catch_up_narration(
+        &mut self,
+        spoken: Entity<Markdown>,
+        blocks: Vec<Entity<Markdown>>,
+        cx: &mut Context<Self>,
+    ) {
         // Status about work this is about to summarize anyway is worse than
         // silence in front of it. Only what has not started speaking is
         // dropped: the queue holds what is *next*, never what is sounding, so
@@ -2140,14 +2156,8 @@ impl ReadAloud {
         self.narration.clear();
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
-        let spoken = cx.new(|cx| Markdown::new(line.into(), None, None, cx));
-        self.narration.push_summary(spoken, blocks, cx);
-        self.catch_up_waiting = true;
+        self.narration.push_catch_up(spoken, blocks, cx);
         self.start_next_narration_if_idle(cx);
-        // The span reached the listener, so the view may retire it. Emitted
-        // here and in the two fallbacks — never on cancellation, which is what
-        // keeps a catch-up nobody heard from consuming what it was about.
-        cx.emit(ReadAloudEvent::CaughtUp);
     }
 
     /// The turn has ended. In `actions` detail this condenses the turn's
@@ -2252,15 +2262,12 @@ impl ReadAloud {
     /// own opening sentences. Not a summary, but it names the subject,
     /// which is most of what an ambient listener needs — and it degrades to
     /// something useful rather than to silence.
-    /// Returns whether anything was actually said: a message with no
-    /// speakable opening produces silence, and a caller that has to tell the
-    /// listener *something* needs to know that happened.
     fn narrate_opening_sentences(
         &mut self,
         blocks: Vec<Entity<Markdown>>,
         reason: &str,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         if !self.logged_summary_fallback {
             self.logged_summary_fallback = true;
             log::warn!(
@@ -2270,10 +2277,9 @@ impl ReadAloud {
         }
         let Some(opening) = Self::opening_sentences(&blocks, narration::OPENING_SENTENCES, cx)
         else {
-            return false;
+            return;
         };
         self.narrate_summary(opening, blocks, cx);
-        true
     }
 
     /// A message's prose blocks joined the way a reader would see them.
@@ -2344,7 +2350,7 @@ impl ReadAloud {
     /// loop's idle branch — because they are the same decision, and the poll
     /// loop is the one that actually runs when a message is already sounding.
     fn prose_has_the_floor(&self) -> bool {
-        !self.pending.is_empty() && !self.catch_up_waiting
+        !self.pending.is_empty() && !self.narration.holds_catch_up()
     }
 
     /// Pops one narration and speaks it. Returns whether the poll loop
@@ -2378,9 +2384,14 @@ impl ReadAloud {
         let Some(next) = self.narration.pop() else {
             return false;
         };
-        // Whatever was waiting has now taken the floor, so the full-prose
-        // FIFO gets its precedence back for anything queued behind it.
-        self.catch_up_waiting = false;
+        // Taking the floor is the moment a catch-up is actually heard, and
+        // the only moment the owning view may retire the span it covered. A
+        // catch-up that is dropped instead — by a stop, a thread switch, the
+        // backlog cap — never gets here, so the span stays the user's to ask
+        // for again.
+        if next.catch_up {
+            cx.emit(ReadAloudEvent::CaughtUp);
+        }
         // `switch_to` clears the previous narration's wash, so the new one
         // is only recorded once it has taken over.
         self.switch_to(next.spoken, true, cx);
@@ -7331,6 +7342,103 @@ mod tests {
         assert!(
             caught_up < second,
             "the button press overtakes prose that was already waiting: {spoken:?}"
+        );
+    }
+
+    /// The full-prose FIFO must never be stranded by a catch-up that has been
+    /// and gone.
+    ///
+    /// Priority used to be a latch on the reader rather than a property of
+    /// what was queued, and the latch could be left set with an empty queue —
+    /// two ways in the fallback paths alone. `prose_has_the_floor` then said
+    /// no forever: the poll loop skipped `pending`, found nothing to pop, and
+    /// exited with work outstanding. Full-mode prose went silent with no
+    /// error, which is both the cross-entity FIFO invariant and the poll-loop
+    /// liveness invariant at once.
+    #[gpui::test]
+    async fn queued_prose_is_never_stranded_by_a_catch_up(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        // No model, so the catch-up takes its fallback rung — one of the two
+        // paths that used to set the latch after the queue had already been
+        // drained.
+        read_aloud.update(cx, |read_aloud, _| read_aloud.set_summary_model(None));
+
+        let speaking = markdown_entity("The first message.", cx);
+        let queued = markdown_entity("The second message.", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&speaking, true, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&queued, true, cx);
+        });
+        cx.run_until_parked();
+
+        let closing = markdown_entity("The catch-up says this.", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.catch_up(a_span(&["ran a command — build"], 1), vec![closing], cx);
+        });
+        cx.run_until_parked();
+        drain_narration(&sink, cx);
+
+        let spoken = provider.spoken();
+        assert!(
+            spoken.contains(&"The second message.".to_string()),
+            "the queued message must still be read — it was only overtaken, \
+             and nothing may leave the FIFO holding work forever: {spoken:?}"
+        );
+        assert!(
+            spoken.contains(&"The catch-up says this.".to_string()),
+            "and the catch-up itself was said: {spoken:?}"
+        );
+        read_aloud.read_with(cx, |read_aloud, _| {
+            assert!(
+                !read_aloud.narration.holds_catch_up(),
+                "nothing is left claiming priority once the queue has drained"
+            );
+        });
+    }
+
+    /// The other stranding path: an explicit request for a message clears the
+    /// narration queue, and the priority state has to go with it.
+    #[gpui::test]
+    async fn playing_a_message_clears_the_catch_ups_claim_on_the_floor(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        // Something already sounding, so the announcement has to wait.
+        let sounding = markdown_entity("The first message.", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&sounding, true, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.announce("Nothing new since the last catch-up.", cx);
+            assert!(
+                read_aloud.narration.holds_catch_up(),
+                "queued behind what is sounding"
+            );
+            let message = cx.new(|cx| Markdown::new("A message.".into(), None, None, cx));
+            read_aloud.play_from_top(&message, true, cx);
+            assert!(
+                !read_aloud.narration.holds_catch_up(),
+                "the queue was cleared, so nothing may still be claiming the floor"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken(),
+            vec!["The first message.".to_string(), "A message.".to_string()],
+            "and the message the user asked for is what speaks"
         );
     }
 }

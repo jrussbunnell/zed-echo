@@ -402,9 +402,13 @@ pub fn tool_output(raw_output: Option<&serde_json::Value>) -> Option<String> {
         trimmed
             .chars()
             .any(char::is_alphanumeric)
-            .then(|| excerpt(trimmed, MAX_ACTION_CHARS))
+            .then(|| trimmed.to_string())
     };
-    match raw_output? {
+    // Excerpted once, at the end, over whatever was assembled. Excerpting each
+    // *block* instead bounds nothing: a content-block list with twenty text
+    // blocks then yields twenty excerpts joined, and the ceiling the whole
+    // account rests on is a per-action bound that no longer holds.
+    let assembled = match raw_output? {
         serde_json::Value::String(text) => nonempty(text),
         // ACP's own content-block list, which is what an MCP-backed tool
         // answers with. Only the text blocks say anything a listener could
@@ -425,7 +429,8 @@ pub fn tool_output(raw_output: Option<&serde_json::Value>) -> Option<String> {
             (!parts.is_empty()).then(|| parts.join("\n"))
         }
         _ => None,
-    }
+    };
+    assembled.map(|text| excerpt(&text, MAX_ACTION_CHARS))
 }
 
 /// `text` shortened to `limit` characters, keeping both ends when it has to
@@ -836,6 +841,19 @@ pub(crate) struct Narration {
     /// verbatim) and gets the ordinary highlight treatment instead.
     pub wash: Vec<Entity<Markdown>>,
     progress: Option<Progress>,
+    /// Whether this is the answer to an explicit catch-up request.
+    ///
+    /// Two things read it, and both used to be a latch on the reader that
+    /// could be left set with an empty queue — stranding the full-prose FIFO
+    /// and killing the poll loop with work outstanding. Kept on the item
+    /// instead, both questions answer themselves: the state cannot outlive
+    /// the thing it describes.
+    ///
+    /// * the full-prose FIFO stands aside while one is queued, because it was
+    ///   asked for just now and the prose has been waiting anyway;
+    /// * and popping one is what tells the owning view the span was actually
+    ///   heard, rather than merely queued and then perhaps dropped by a stop.
+    pub catch_up: bool,
 }
 
 /// The narration backlog: FIFO, with three rules that keep spoken length
@@ -930,6 +948,7 @@ impl NarrationQueue {
                     spoken: cx.new(|cx| Markdown::new(phrase.into(), None, None, cx)),
                     wash: vec![facts.label],
                     progress: Some(Progress { kind, count: 1 }),
+                    catch_up: false,
                 }
             }
             None => {
@@ -938,6 +957,7 @@ impl NarrationQueue {
                     spoken: facts.label,
                     wash: Vec::new(),
                     progress: Some(Progress { kind, count: 1 }),
+                    catch_up: false,
                 }
             }
         };
@@ -957,6 +977,7 @@ impl NarrationQueue {
             spoken: text,
             wash: Vec::new(),
             progress: None,
+            catch_up: false,
         });
         self.collapse_backlog(cx);
         self.enforce_cap();
@@ -971,6 +992,34 @@ impl NarrationQueue {
         message: Vec<Entity<Markdown>>,
         cx: &mut App,
     ) {
+        self.push_spoken(spoken, message, false, cx);
+    }
+
+    /// Queues the answer to an explicit catch-up request. Identical to
+    /// [`Self::push_summary`] but marked, so the reader can let it overtake
+    /// queued prose and can tell when it was actually heard. See
+    /// [`Narration::catch_up`].
+    pub fn push_catch_up(
+        &mut self,
+        spoken: Entity<Markdown>,
+        message: Vec<Entity<Markdown>>,
+        cx: &mut App,
+    ) {
+        self.push_spoken(spoken, message, true, cx);
+    }
+
+    /// Whether a catch-up is queued and has not been spoken yet.
+    pub fn holds_catch_up(&self) -> bool {
+        self.pending.iter().any(|narration| narration.catch_up)
+    }
+
+    fn push_spoken(
+        &mut self,
+        spoken: Entity<Markdown>,
+        message: Vec<Entity<Markdown>>,
+        catch_up: bool,
+        cx: &mut App,
+    ) {
         self.last_tool_key = None;
         self.last_tool_kind = None;
         self.remember(&spoken.read(cx).source().clone());
@@ -978,6 +1027,7 @@ impl NarrationQueue {
             spoken,
             wash: message,
             progress: None,
+            catch_up,
         });
         // A burst already queued in front of this collapses rather than
         // being discarded by the cap: a count keeps the information, a
@@ -1083,6 +1133,7 @@ impl NarrationQueue {
                 spoken: text,
                 wash: Vec::new(),
                 progress: Some(Progress { kind, count }),
+                catch_up: false,
             },
         );
     }
@@ -1669,8 +1720,8 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
 ///
 /// **This is also what bounds the account in characters**, which is what the
 /// brief asked for once actions started carrying their output. Every line
-/// [`ToolCallFacts::description`] produces is at most a [`MAX_ACTION_CHARS`]
-/// action plus a [`MAX_ACTION_CHARS`] output excerpt plus its joining text, so
+/// [`ToolCallFacts::description`] produces is at most a `MAX_ACTION_CHARS`
+/// action plus a `MAX_ACTION_CHARS` output excerpt plus its joining text, so
 /// the whole block is under eleven thousand characters and no input can
 /// exceed it. Raising either cap raises that ceiling with it, which is the
 /// thing to check.
@@ -1696,7 +1747,7 @@ pub const MAX_ACTIVITY_ACTIONS: usize = 24;
 /// because the last thing that broke is what the listener has to act on.
 ///
 /// The block's size in characters is bounded by this count and the per-action
-/// bound together; see [`MAX_ACTIVITY_BLOCK_CHARS`] for the arithmetic.
+/// bound together; see [`MAX_ACTIVITY_ACTIONS`] for the arithmetic.
 ///
 /// Shared by the turn wrap-up and the on-demand catch-up so the two can never
 /// disagree about what a bounded account is.
@@ -3976,6 +4027,43 @@ mod tests {
                 "and it is still bounded"
             );
         });
+    }
+
+    /// A tool that answers with many content blocks must not get one excerpt
+    /// per block.
+    ///
+    /// The whole account's size rests on a per-action bound: twenty-four
+    /// actions of at most an action plus an output excerpt. Excerpting each
+    /// block instead of the assembled text quietly makes the per-action bound
+    /// `blocks × 203`, which is not a bound at all — and it is invisible to
+    /// the capture, whose seven content-block results have at most one text
+    /// block each.
+    #[test]
+    fn a_multi_block_result_is_excerpted_once() {
+        let blocks: Vec<serde_json::Value> = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "text",
+                    "text": format!("block {index} opens {} and ends block {index}",
+                        "x".repeat(400)),
+                })
+            })
+            .collect();
+        let printed = tool_output(Some(&serde_json::json!(blocks)))
+            .expect("the text blocks are the sayable part");
+        assert!(
+            printed.chars().count() <= MAX_ACTION_CHARS + 3,
+            "twenty blocks must cost what one does, got {} characters",
+            printed.chars().count()
+        );
+        assert!(
+            printed.contains("block 0 opens"),
+            "the head of the whole result is still the head: {printed}"
+        );
+        assert!(
+            printed.contains("ends block 19"),
+            "and its tail is still the tail, which is where an answer lands: {printed}"
+        );
     }
 
     /// A long *successful* output keeps its end, where the answer usually is.

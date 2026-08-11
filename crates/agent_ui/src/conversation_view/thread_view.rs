@@ -1775,19 +1775,17 @@ impl ThreadView {
                     // new" about work that had just been redone.
                     this.read_aloud_catch_up_watermark =
                         this.read_aloud_catch_up_watermark.min(range.start);
-                    // Tool-call ids are scoped to the message they belong to,
-                    // so a regenerated turn reuses them — a remembered
-                    // "unfinished" id would pull in whatever call inherited
-                    // it. The entries are back in the span anyway, by index.
-                    this.read_aloud_catch_up_unfinished.clear();
-                    // …and a span in flight is about entries that no longer
-                    // exist, so it must not be committed if it lands.
+                    // A span in flight is about entries that no longer exist,
+                    // so it must not be committed if it lands.
                     this.read_aloud_catch_up_in_flight = None;
                     // Tool-call ids are scoped to the message they belong to,
                     // so a regenerated turn can reuse one. Remembering that
                     // the *removed* call was narrated would silence its
-                    // replacement.
+                    // replacement, and a remembered "unfinished" id would pull
+                    // in whatever call inherited it. Both sets go; the entries
+                    // are back in the span anyway, by index.
                     this.read_aloud_tool_calls.clear();
+                    this.read_aloud_catch_up_unfinished.clear();
                     this.read_aloud_label_settle = None;
                 }
                 _ => {}
@@ -2212,29 +2210,48 @@ impl ThreadView {
         HashSet<acp::ToolCallId>,
     )> {
         let entries = self.thread.read(cx).entries();
-        let calls: Vec<(acp::ToolCallId, read_aloud::ToolCallFacts)> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(entry_index, entry)| match entry {
-                // A call the user refused, or that a cancellation took down,
-                // never happened — the same rule narration applies live.
-                AgentThreadEntry::ToolCall(tool_call)
-                    if !matches!(
-                        tool_call.status,
-                        ToolCallStatus::Rejected | ToolCallStatus::Canceled
-                    ) =>
-                {
-                    // `acp_thread` mutates a tool call in place, so a call
-                    // that was pending when the watermark passed it keeps its
-                    // index below the mark while its outcome and its output
-                    // arrive later. Those are pulled back in by id.
-                    (entry_index >= watermark
-                        || self.read_aloud_catch_up_unfinished.contains(&tool_call.id))
-                    .then(|| (tool_call.id.clone(), read_aloud_tool_call_facts(tool_call)))
-                }
-                _ => None,
-            })
-            .collect();
+        // Whatever is still running when this span retires has not finished
+        // happening, so the next span gets it back — collected over everything
+        // considered, including the calls carried in from last time that are
+        // still going.
+        let mut unfinished: HashSet<acp::ToolCallId> = HashSet::default();
+        let mut calls: Vec<(acp::ToolCallId, read_aloud::ToolCallFacts)> = Vec::new();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            // A call the user refused, or that a cancellation took down, never
+            // happened — the same rule narration applies live.
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+            if matches!(
+                tool_call.status,
+                ToolCallStatus::Rejected | ToolCallStatus::Canceled
+            ) {
+                continue;
+            }
+            // `acp_thread` mutates a tool call in place, so a call that was
+            // pending when the watermark passed it keeps its index below the
+            // mark while its outcome and its output arrive later. Those are
+            // pulled back in by id.
+            let fresh = entry_index >= watermark;
+            let carried = self.read_aloud_catch_up_unfinished.contains(&tool_call.id);
+            if !fresh && !carried {
+                continue;
+            }
+            let facts = read_aloud_tool_call_facts(tool_call);
+            let still_running = facts.outcome == read_aloud::ToolCallOutcome::Pending;
+            if still_running {
+                unfinished.insert(tool_call.id.clone());
+            }
+            // A carried call that is *still* running has already been reported
+            // exactly as it stands, so it is not news. Without this it counted
+            // as activity forever, and "nothing new since the last catch-up"
+            // became unreachable for as long as anything was in flight — which
+            // on a long turn is most of the time.
+            if !fresh && still_running {
+                continue;
+            }
+            calls.push((tool_call.id.clone(), facts));
+        }
         if calls.is_empty() && entries.len() <= watermark {
             return None;
         }
@@ -2260,13 +2277,6 @@ impl ThreadView {
         let actions: Vec<(read_aloud::ToolCallOutcome, String)> = calls
             .iter()
             .map(|(_, facts)| (facts.outcome, facts.description(cx)))
-            .collect();
-        // Whatever is still running when this span retires has not finished
-        // happening, so the next span gets it back.
-        let unfinished: HashSet<acp::ToolCallId> = calls
-            .iter()
-            .filter(|(_, facts)| facts.outcome == read_aloud::ToolCallOutcome::Pending)
-            .map(|(id, _)| id.clone())
             .collect();
         let span = read_aloud::CatchUpSpan {
             activity: read_aloud::bounded_activity(&actions),

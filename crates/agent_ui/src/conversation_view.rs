@@ -13418,6 +13418,59 @@ pub(crate) mod tests {
             "a cancelled catch-up spoke nothing, so it consumed nothing"
         );
 
+        // The narrower window, and the one that survived the first fix: the
+        // answer is written and *queued* — behind whatever is sounding — and
+        // is then dropped by the same glance at another thread. Queued is not
+        // heard, so it still consumes nothing.
+        thread_view.update(cx, |view, cx| view.read_aloud_activated(cx));
+        cx.run_until_parked();
+        // Prose, so the fallback rung has something to say — without it the
+        // press produces no narration at all and this proves nothing.
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "Rebuilt the site and linted it. Both are clean.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        // Something sounding, so the answer has to wait its turn. The fake
+        // sink holds its audio until drained, so this stays true.
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("call-2", "Terminal")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Completed)
+                        .raw_input(json!({
+                            "command": "pnpm lint",
+                            "description": "Lint the marketing site",
+                        }))
+                        .raw_output(json!("clean")),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let queued_span = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("two calls to report now");
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| view.read_aloud_deactivated(cx));
+        cx.run_until_parked();
+        let after_queued = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("an answer that was queued and dropped was never heard");
+        assert_eq!(
+            after_queued.tool_calls, queued_span.tool_calls,
+            "the span is retired when the answer takes the floor, not when it \
+             joins the queue"
+        );
+
         connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
         send.await.unwrap();
         cx.run_until_parked();
@@ -13478,6 +13531,18 @@ pub(crate) mod tests {
             "the press was answered, so the watermark has moved past the call"
         );
 
+        // Pressed again while it is *still* running: it has already been
+        // reported exactly as it stands, so there is nothing new to say. This
+        // is what made "nothing new" unreachable for as long as anything was
+        // in flight, which on a long turn is most of the time.
+        assert!(
+            thread_view
+                .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+                .is_none(),
+            "a call carried forward while it is still running is not activity \
+             in its own right"
+        );
+
         // …and fails a minute later, with nothing else happening at all.
         update(
             acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
@@ -13499,6 +13564,18 @@ pub(crate) mod tests {
             "a call that was pending at the press and failed after it must \
              still be reported: {:?}",
             span.activity
+        );
+
+        // …and once the failure *has* been reported there is nothing left.
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            thread_view
+                .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+                .is_none(),
+            "the call has finished and been spoken about; the set that carried \
+             it forward is empty again"
         );
 
         connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
