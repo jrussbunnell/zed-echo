@@ -159,22 +159,6 @@ impl WrapUpBudget {
 /// that two dozen of them cannot crowd out the message they are context for.
 pub(crate) const MAX_ACTION_CHARS: usize = 200;
 
-/// The most of the whole assembled activity block a prompt is given, however
-/// many actions survived [`bounded_activity`]'s count cap.
-///
-/// The count cap alone stopped bounding anything once actions started
-/// carrying their output: two dozen actions each at the per-action ceiling is
-/// an order of magnitude more prompt than the same two dozen commands were,
-/// on a path with a five-second budget.
-///
-/// Set above what the count cap can produce at its worst — twenty-four
-/// actions of a two-hundred-character action, a two-hundred-character output
-/// excerpt and their joining text — so that it is a backstop against the
-/// constants moving, not a second working limit that quietly halves the
-/// account of a busy turn. A cap that bites in the ordinary case would trade
-/// the completeness of the account for a saving nothing asked for.
-const MAX_ACTIVITY_BLOCK_CHARS: usize = 12_000;
-
 /// The most of an agent's stated purpose that is worth speaking. Unlike the
 /// prompt-facing cap this one is measured in *seconds of audio*: 160
 /// characters is around ten seconds, which is already a long time to hold a
@@ -397,13 +381,19 @@ impl RawToolInput {
 /// printed. That single field carries the stdout, the stderr and the exit
 /// code, so nothing has to be threaded out of `_meta`.
 ///
-/// An object is probed for the conventional stdout/stderr spellings and
-/// nothing else. Deliberately: the shapes a *structured* `rawOutput` takes in
-/// the capture are an edit tool's `structuredPatch`/`oldString`/`newString`,
-/// which is the diff body — kilobytes of it, saying nothing a listener wants
-/// and crowding out everything that does. The files an edit touched are named
-/// from the call's own path, which is the useful half of a diff and the only
-/// half worth speaking.
+/// **Excerpted here rather than at the prompt**, so nothing downstream ever
+/// holds a whole command's output: a `cat` of a large file or a long session
+/// would otherwise put megabytes into [`ToolCallFacts`], and every one of them
+/// gets cloned again when a catch-up span is assembled. There is no consumer
+/// of the untruncated text.
+///
+/// The object branch is **speculative**, and labelled as such because a
+/// previous round of this work was built on an inferred protocol shape three
+/// times running. Measured against the capture: every one of the ninety-one
+/// `rawOutput`s is a string or an ACP content-block list, and *none* is an
+/// object. It probes the conventional stdout/stderr spellings only, so an
+/// agent that answers with `{"structuredPatch": …}` yields nothing rather
+/// than a diff body — but no agent in evidence does.
 pub fn tool_output(raw_output: Option<&serde_json::Value>) -> Option<String> {
     /// The keys an agent might put a command's own output under.
     const OUTPUT_KEYS: &[&str] = &["stdout", "output", "stderr", "result", "text"];
@@ -412,7 +402,7 @@ pub fn tool_output(raw_output: Option<&serde_json::Value>) -> Option<String> {
         trimmed
             .chars()
             .any(char::is_alphanumeric)
-            .then(|| trimmed.to_string())
+            .then(|| excerpt(trimmed, MAX_ACTION_CHARS))
     };
     match raw_output? {
         serde_json::Value::String(text) => nonempty(text),
@@ -648,10 +638,9 @@ impl ToolCallFacts {
                 .chars()
                 .any(|character| character.is_alphanumeric())
         }) {
-            Some(output) => format!(
-                "{described} — it printed: {}",
-                excerpt(output, MAX_ACTION_CHARS)
-            ),
+            // Already excerpted by `tool_output`, so this is a bounded string
+            // however large the command's output was.
+            Some(output) => format!("{described} — it printed: {output}"),
             None => described,
         }
     }
@@ -1677,6 +1666,21 @@ pub fn step_prompt(prose: &str, tool_lines: &[String], recent: &[String]) -> Str
 /// How many actions a summary's account may name. A span that does more than
 /// this has a summary shaped by its prose, not by an exhaustive list of every
 /// file it touched.
+///
+/// **This is also what bounds the account in characters**, which is what the
+/// brief asked for once actions started carrying their output. Every line
+/// [`ToolCallFacts::description`] produces is at most a [`MAX_ACTION_CHARS`]
+/// action plus a [`MAX_ACTION_CHARS`] output excerpt plus its joining text, so
+/// the whole block is under eleven thousand characters and no input can
+/// exceed it. Raising either cap raises that ceiling with it, which is the
+/// thing to check.
+///
+/// A separate character cap was tried and removed. To bind at all it had to
+/// sit below that product, which meant it quietly halved the account of an
+/// ordinary busy turn — trading the completeness of the account for a saving
+/// nothing asked for. Set above the product it could never fire, and a bound
+/// that cannot fire is not a safety net, it is a line of code that reads like
+/// one.
 pub const MAX_ACTIVITY_ACTIONS: usize = 24;
 
 /// The account a summary prompt is given, out of everything that happened:
@@ -1691,13 +1695,8 @@ pub const MAX_ACTIVITY_ACTIONS: usize = 24;
 /// to answer. Past the count cap the most recent failures are the ones kept,
 /// because the last thing that broke is what the listener has to act on.
 ///
-/// Two caps rather than one, because they bound different things. The count
-/// cap keeps the account from becoming a log; the character cap
-/// ([`MAX_ACTIVITY_BLOCK_CHARS`]) keeps it bounded now that each line can
-/// carry what the command printed, which is not a length this code chooses.
-/// The character cap trims from the *front*, for the same reason the count
-/// cap does: the most recent actions are the ones the listener has not
-/// already heard about.
+/// The block's size in characters is bounded by this count and the per-action
+/// bound together; see [`MAX_ACTIVITY_BLOCK_CHARS`] for the arithmetic.
 ///
 /// Shared by the turn wrap-up and the on-demand catch-up so the two can never
 /// disagree about what a bounded account is.
@@ -1727,23 +1726,6 @@ pub fn bounded_activity(actions: &[(ToolCallOutcome, String)]) -> Vec<String> {
         })
         .cloned()
         .collect();
-    let block = |kept: &[(ToolCallOutcome, String)]| -> usize {
-        kept.iter().map(|(_, line)| line.chars().count()).sum()
-    };
-    // `kept` is newest-first here, so the oldest is at the back. Successes go
-    // first and failures only once nothing else is left: the character cap
-    // must not become a second way for "the tests failed" to fall out of the
-    // prompt, which is the whole reason the count cap protects them.
-    for failures_too in [false, true] {
-        while block(&kept) > MAX_ACTIVITY_BLOCK_CHARS && kept.len() > 1 {
-            let Some(oldest) = kept.iter().rposition(|(outcome, _)| {
-                failures_too || *outcome != ToolCallOutcome::Failed
-            }) else {
-                break;
-            };
-            kept.remove(oldest);
-        }
-    }
     kept.reverse();
     kept.into_iter().map(|(_, line)| line).collect()
 }
@@ -3900,17 +3882,37 @@ mod tests {
                 .map(|call| call.facts(cx))
                 .collect();
             assert_eq!(edits.len(), 17, "the session made seventeen edits");
+            // What the capture actually contains, so the assertions below are
+            // known to be firing at something. Every edit's `rawOutput` is a
+            // plain string, and sixteen of the seventeen are the receipt.
+            let receipts = edits
+                .iter()
+                .filter(|facts| {
+                    facts
+                        .output
+                        .as_deref()
+                        .is_some_and(|output| output.contains("updated successfully"))
+                })
+                .count();
+            assert_eq!(
+                receipts, 16,
+                "the material this is protecting the prompt from is present: \
+                 sixteen \"the file … has been updated successfully\" receipts"
+            );
             for facts in &edits {
+                assert!(
+                    facts.output.is_some(),
+                    "every edit does carry output — it is dropped by kind, not \
+                     by the extraction, which is the thing under test"
+                );
                 let description = facts.description(cx);
                 assert!(
                     !description.contains("it printed:"),
-                    "a write's own output is either a patch or a receipt, and \
-                     neither is worth a word of the prompt: {description}"
+                    "a write's own output is a receipt or a patch, and neither \
+                     is worth a word of the prompt: {description}"
                 );
                 assert!(
-                    !description.contains("structuredPatch")
-                        && !description.contains("oldString")
-                        && !description.contains("updated successfully"),
+                    !description.contains("updated successfully"),
                     "and none of it may leak in by another route: {description}"
                 );
             }
@@ -3943,10 +3945,19 @@ mod tests {
                 );
             }
             // The same call, drowned in output. The head slice is what keeps
-            // the exit code in the prompt when the tail cannot.
+            // the exit code in the prompt when the tail cannot — and the
+            // excerpt is taken at extraction, so nothing downstream ever
+            // holds the twenty-four kilobytes.
+            let printed = serde_json::json!(format!("Exit code 1\n{}", "noise ".repeat(4_000)));
+            let output = tool_output(Some(&printed));
+            assert!(
+                output.as_ref().is_some_and(|output| output.chars().count()
+                    <= MAX_ACTION_CHARS + 3),
+                "the excerpt is taken before the text is stored, not at the prompt"
+            );
             let flooded = ToolCallFacts {
                 command: Some("cargo test --workspace".to_string()),
-                output: Some(format!("Exit code 1\n{}", "noise ".repeat(4_000))),
+                output,
                 outcome: ToolCallOutcome::Failed,
                 input: ToolCallInput::Present,
                 ..ToolCallFacts::from_label(
@@ -3978,83 +3989,61 @@ mod tests {
         assert_eq!(excerpt("short", MAX_ACTION_CHARS), "short");
     }
 
-    /// The assembled block is bounded by its own size, not only by how many
-    /// actions it holds — which is what changed the moment actions started
-    /// carrying output.
-    #[test]
-    fn the_activity_block_is_bounded_in_characters() {
-        let actions: Vec<(ToolCallOutcome, String)> = (0..MAX_ACTIVITY_ACTIONS)
-            .map(|index| {
-                (
-                    ToolCallOutcome::Succeeded,
-                    format!("ran a command — step {index} — it printed: {}", "y".repeat(600)),
-                )
-            })
-            .collect();
-        let block = bounded_activity(&actions);
-        let characters: usize = block.iter().map(|line| line.chars().count()).sum();
-        assert!(
-            characters <= MAX_ACTIVITY_BLOCK_CHARS,
-            "{characters} characters of activity"
-        );
-        assert!(!block.is_empty(), "and it never trims away to nothing");
-        assert!(
-            block.last().is_some_and(|line| line.contains(&format!(
-                "step {}",
-                MAX_ACTIVITY_ACTIONS - 1
-            ))),
-            "the most recent actions are the ones kept"
-        );
-    }
+    /// The ceiling `MAX_ACTIVITY_ACTIONS` and `MAX_ACTION_CHARS` imply
+    /// together, spelled out so the test below asserts the arithmetic rather
+    /// than restating a constant.
+    const MAX_ACTIVITY_BLOCK_CHARS: usize = MAX_ACTIVITY_ACTIONS * (2 * MAX_ACTION_CHARS + 48);
 
-    /// The character cap must not become a second way for "the tests failed"
-    /// to fall out of the prompt.
-    #[test]
-    fn the_character_cap_never_drops_a_failure() {
-        let mut actions: Vec<(ToolCallOutcome, String)> = vec![(
-            ToolCallOutcome::Failed,
-            format!("ran a command — the tests — it FAILED — it printed: {}", "z".repeat(300)),
-        )];
-        actions.extend((0..MAX_ACTIVITY_ACTIONS).map(|index| {
-            (
-                ToolCallOutcome::Succeeded,
-                format!("ran a command — step {index} — it printed: {}", "y".repeat(900)),
-            )
-        }));
-        let block = bounded_activity(&actions);
-        let characters: usize = block.iter().map(|line| line.chars().count()).sum();
-        assert!(characters <= MAX_ACTIVITY_BLOCK_CHARS, "{characters}");
+    /// The account a real session produces: bounded in number, failures kept
+    /// whatever else goes, and the most recent kept over the oldest.
+    ///
+    /// Driven from all ninety-one captured calls rather than from synthetic
+    /// strings, because the two things that actually bind here — the count cap
+    /// and the failure protection — only bind on an input larger than the cap,
+    /// and the capture is one.
+    #[gpui::test]
+    fn a_real_sessions_account_is_bounded_and_keeps_its_failures(cx: &mut TestAppContext) {
+        let calls = captured_calls("updates");
         assert!(
-            block.iter().any(|line| line.contains("it FAILED")),
-            "the oldest action is the failure, and it is the one thing that \
-             may not be trimmed: {block:?}"
+            calls.len() > MAX_ACTIVITY_ACTIONS,
+            "the capture has to overflow the cap for this to test anything"
         );
-    }
+        cx.update(|cx| {
+            let mut actions: Vec<(ToolCallOutcome, String)> = calls
+                .iter()
+                .map(|call| {
+                    let facts = call.facts(cx);
+                    (facts.outcome, facts.description(cx))
+                })
+                .collect();
+            // The oldest action in the session, made a failure: the position
+            // the count cap would otherwise drop first.
+            actions[0].0 = ToolCallOutcome::Failed;
+            actions[0].1 = format!("{} — it FAILED", actions[0].1);
 
-    /// …and it must not bite on an ordinary turn either. A cap that halves
-    /// the account of every busy turn is a worse bug than the flooding it
-    /// prevents.
-    #[test]
-    fn an_ordinary_turns_account_is_complete() {
-        // A typical measured line: a purpose, and an output excerpt at its
-        // per-action ceiling.
-        let actions: Vec<(ToolCallOutcome, String)> = (0..MAX_ACTIVITY_ACTIONS)
-            .map(|index| {
-                (
-                    ToolCallOutcome::Succeeded,
-                    format!(
-                        "ran a command — Check the marketing routes for step {index} — \
-                         it printed: {}",
-                        "y".repeat(MAX_ACTION_CHARS)
-                    ),
-                )
-            })
-            .collect();
-        assert_eq!(
-            bounded_activity(&actions).len(),
-            MAX_ACTIVITY_ACTIONS,
-            "every action a turn is allowed to report still reaches the prompt"
-        );
+            let block = bounded_activity(&actions);
+            assert_eq!(
+                block.len(),
+                MAX_ACTIVITY_ACTIONS,
+                "the count cap is what bounds a real session's account"
+            );
+            assert!(
+                block.iter().any(|line| line.contains("it FAILED")),
+                "and the failure survives from the very back of a ninety-one \
+                 call session: {block:?}"
+            );
+            assert_eq!(
+                block.last(),
+                actions.last().map(|(_, line)| line),
+                "the most recent action is always in it"
+            );
+            let characters: usize = block.iter().map(|line| line.chars().count()).sum();
+            assert!(
+                characters <= MAX_ACTIVITY_BLOCK_CHARS,
+                "and the block's size follows from the two caps rather than \
+                 needing a third: {characters} characters"
+            );
+        });
     }
 
     /// A catch-up is not a turn's sign-off, and the prompt must not claim it
@@ -4085,5 +4074,83 @@ mod tests {
                 "and both ask for what came back"
             );
         }
+    }
+
+    /// The premise the whole failure guarantee rests on, pinned to the wire.
+    ///
+    /// The reported session ran clean — ninety-one calls, fifty-seven exit
+    /// codes, every one of them zero — so it is no evidence at all about
+    /// failures. The `failures` section is, and it is the only such evidence
+    /// in the repository, which is why `_meta.terminal_exit` is kept there and
+    /// nowhere else: the exit code the agent reported out of band and the
+    /// string it put in `rawOutput` can be read side by side and seen to
+    /// agree.
+    ///
+    /// Two separate things are asserted, because only one of them is
+    /// load-bearing. That a failure is *stated* comes from `status`, which is
+    /// verifiable from either capture. That the exit code and the error text
+    /// reach the prompt comes from `rawOutput`, and rests on these three
+    /// calls alone.
+    #[gpui::test]
+    fn a_failures_exit_code_and_text_both_arrive_in_raw_output(cx: &mut TestAppContext) {
+        let capture: serde_json::Value =
+            serde_json::from_str(crate::CLAUDE_CODE_TOOL_OUTPUT_CAPTURE)
+                .expect("the output capture parses");
+        let terminal: Vec<&serde_json::Value> = capture["failures"]
+            .as_array()
+            .expect("the capture has a failures section")
+            .iter()
+            .filter(|update| update["status"] == "failed")
+            .collect();
+        assert_eq!(terminal.len(), 3, "three real failed calls are captured");
+        for update in terminal {
+            let exit_code = update["_meta"]["terminal_exit"]["exit_code"]
+                .as_i64()
+                .expect("a failed terminal call reports its exit code out of band");
+            assert_ne!(exit_code, 0, "a failure exits non-zero");
+            let printed = tool_output(update.get("rawOutput"))
+                .expect("and puts something in rawOutput");
+            assert!(
+                printed.starts_with(&format!("Exit code {exit_code}")),
+                "the two agree, and the reachable one leads with the code: {printed:?}"
+            );
+        }
+
+        // The other half, and the half that does not depend on those three:
+        // the clean session proves exit codes are *not* in rawOutput when a
+        // command succeeds, so nothing here is inferring the prefix from
+        // ordinary output.
+        cx.update(|_| {
+            let printed_exit_codes = captured_calls("updates")
+                .iter()
+                .filter_map(|call| tool_output(call.raw_output.as_ref()))
+                .filter(|output| output.contains("Exit code"))
+                .count();
+            assert_eq!(
+                printed_exit_codes, 0,
+                "a successful command's rawOutput is its output and nothing else"
+            );
+        });
+    }
+
+    /// …and the load-bearing half, which does not depend on the output text at
+    /// all: a failed call says so whatever it printed, including nothing.
+    #[gpui::test]
+    async fn a_failure_is_stated_even_with_no_output(cx: &mut TestAppContext) {
+        let label = markdown("Terminal", cx);
+        cx.run_until_parked();
+        let facts = ToolCallFacts {
+            command: Some("pnpm test".to_string()),
+            outcome: ToolCallOutcome::Failed,
+            input: ToolCallInput::Present,
+            ..ToolCallFacts::from_label("call", label, NarrationKind::Execute)
+        };
+        cx.update(|cx| {
+            assert!(facts.output.is_none());
+            assert!(
+                facts.description(cx).contains("it FAILED"),
+                "`status` is what carries the failure, not the output text"
+            );
+        });
     }
 }

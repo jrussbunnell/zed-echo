@@ -292,6 +292,14 @@ pub enum ReadAloudEvent {
     /// running and got nothing usable back. Emitted once per reader, so the
     /// view can say so once rather than per message.
     SummaryModelFailing,
+    /// A catch-up actually reached the listener — a summary, or the fallback
+    /// opening when no model could be had.
+    ///
+    /// The owning view holds the watermark, and this is what tells it the
+    /// span was delivered and may be retired. Nothing is emitted when a
+    /// catch-up is cancelled, which is the point: a request that never made a
+    /// sound must not consume the span it was about.
+    CaughtUp,
 }
 
 /// One tool call, as the step that contains it remembers it.
@@ -533,6 +541,15 @@ pub struct ReadAloud {
     /// off, so an older request is answering a question that no longer
     /// exists. Dropping the task cancels the call.
     catch_up: Option<Task<()>>,
+    /// A finished catch-up is waiting in the narration queue and outranks the
+    /// full-prose FIFO.
+    ///
+    /// Without this, a catch-up pressed in full mode waits for every message
+    /// already queued behind the one being read — potentially minutes — and
+    /// then answers a question about a span that has stopped being current.
+    /// The prose is not discarded, only overtaken: it was queued by the
+    /// stream, and this was asked for just now.
+    catch_up_waiting: bool,
     /// Blocks washed while the current narration sounds, for narrations
     /// whose spoken text is not in the document (a summary). Empty
     /// otherwise, which is what makes full mode's highlighting untouched.
@@ -633,6 +650,7 @@ impl ReadAloud {
             wrap_up: None,
             wrap_up_issues: 0,
             catch_up: None,
+            catch_up_waiting: false,
             narration_wash: Vec::new(),
             narration_message_pending_parse: None,
             narration_parse_observations: Vec::new(),
@@ -908,6 +926,7 @@ impl ReadAloud {
         // something the user already moved on from" failure every other
         // generation here is cancelled to avoid.
         self.catch_up = None;
+        self.catch_up_waiting = false;
         self.clear_narration_wash(cx);
         // `self.speaking` is deliberately retained so the stopped-form
         // controls have a message to preview and restart.
@@ -989,6 +1008,7 @@ impl ReadAloud {
         self.narration_message_pending_parse = None;
         self.narration_parse_observations.clear();
         self.catch_up = None;
+        self.catch_up_waiting = false;
         self.clear_highlight(cx);
         self.speaking = None;
         self.message_complete = false;
@@ -1195,19 +1215,33 @@ impl ReadAloud {
     ///
     /// Kept apart from [`Self::narrate_tool_call`] because the two happen at
     /// different times: a call is narrated as soon as what it is doing can
-    /// be named, and whether it worked is only known later. "The tests
-    /// failed" is the single most important thing a supervising listener
-    /// needs, and nothing else in the turn's material carries it.
-    pub fn note_tool_call_outcome(&mut self, id: &str, outcome: ToolCallOutcome, cx: &App) {
+    /// be named, and whether it worked — and what it printed — is only known
+    /// later. "The tests failed, here is what failed" is the single most
+    /// important thing a supervising listener needs, and nothing else in the
+    /// turn's material carries it.
+    ///
+    /// Takes the *current* facts rather than an id and an outcome. It used to
+    /// take the pair and refresh the account from the facts it had stored,
+    /// which were snapshotted when the call was narrated — and a call is
+    /// narrated once, as soon as it can be named, which for anything slower
+    /// than the settle timer is while it is still pending and has printed
+    /// nothing. So the fast calls carried their output into the wrap-up and
+    /// the slow commands whose output is the whole point did not: exactly
+    /// inverted, and invisible to any test that builds facts from a call's
+    /// final state.
+    pub fn note_tool_call_result(&mut self, facts: &ToolCallFacts, cx: &App) {
         let Some(action) = self
             .turn_activity
             .iter_mut()
-            .find(|action| action.id == id)
-            .filter(|action| action.facts.outcome != outcome)
+            .find(|action| action.id == facts.id)
+            .filter(|action| {
+                action.facts.outcome != facts.outcome || action.facts.output != facts.output
+            })
         else {
             return;
         };
-        action.facts.outcome = outcome;
+        action.facts.outcome = facts.outcome;
+        action.facts.output.clone_from(&facts.output);
         action.description = action.facts.description(cx);
     }
 
@@ -1238,6 +1272,19 @@ impl ReadAloud {
             .map(|action| (action.facts.outcome, action.description.clone()))
             .collect();
         narration::bounded_activity(&actions)
+    }
+
+    /// The turn's account exactly as the wrap-up prompt will receive it.
+    ///
+    /// Exposed so the owning view's tests can assert on the composition —
+    /// narrate a pending call, deliver its completion, and see what the
+    /// prompt would say — without needing a language model registry. The
+    /// pieces on either side of that seam were each covered while the seam
+    /// itself was not, which is how the output went missing from every slow
+    /// command's wrap-up.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn turn_account_for_test(&self) -> Vec<String> {
+        self.wrap_up_activity()
     }
 
     /// Takes one finished assistant message. In `actions` detail it is
@@ -1320,11 +1367,13 @@ impl ReadAloud {
                 this.note_model_result(summary.is_some(), cx);
                 match (summary, reply) {
                     (Some(summary), _) => this.narrate_summary(summary, blocks, cx),
-                    (None, Ok(_)) => this.narrate_opening_sentences(
-                        blocks,
-                        "the summary model returned nothing speakable",
-                        cx,
-                    ),
+                    (None, Ok(_)) => {
+                        this.narrate_opening_sentences(
+                            blocks,
+                            "the summary model returned nothing speakable",
+                            cx,
+                        );
+                    }
                     (None, Err(error)) => {
                         this.narrate_opening_sentences(blocks, &format!("{error:#}"), cx);
                     }
@@ -2008,7 +2057,10 @@ impl ReadAloud {
         let Some(model) = self.summary_model.clone() else {
             // The same last rung the wrap-up takes, and the owning view has
             // already said out loud that there is no model.
-            self.narrate_opening_sentences(blocks, "no summary model is available", cx);
+            if self.narrate_opening_sentences(blocks, "no summary model is available", cx) {
+                self.catch_up_waiting = true;
+                cx.emit(ReadAloudEvent::CaughtUp);
+            }
             return;
         };
         let prompt = narration::wrap_up_prompt(narration::WrapUpMaterial {
@@ -2040,11 +2092,16 @@ impl ReadAloud {
                     // Somebody pressed a button; silence is the one answer
                     // that reads as broken, so the newest message's own
                     // opening goes out instead.
-                    None => this.narrate_opening_sentences(
-                        blocks,
-                        "the summary model did not answer the catch-up",
-                        cx,
-                    ),
+                    None => {
+                        if this.narrate_opening_sentences(
+                            blocks,
+                            "the summary model did not answer the catch-up",
+                            cx,
+                        ) {
+                            this.catch_up_waiting = true;
+                            cx.emit(ReadAloudEvent::CaughtUp);
+                        }
+                    }
                 }
             })
             .log_err();
@@ -2059,7 +2116,13 @@ impl ReadAloud {
         self.catch_up = None;
         let spoken = cx.new(|cx| Markdown::new(line.into(), None, None, cx));
         self.narration.clear();
+        // Same reason `deliver_catch_up` clears these: a step's prose parked
+        // on a lagging parse would otherwise resolve afterwards and append
+        // status behind the answer to a button press.
+        self.narration_message_pending_parse = None;
+        self.narration_parse_observations.clear();
         self.narration.push_summary(spoken, Vec::new(), cx);
+        self.catch_up_waiting = true;
         self.start_next_narration_if_idle(cx);
     }
 
@@ -2079,7 +2142,12 @@ impl ReadAloud {
         self.narration_parse_observations.clear();
         let spoken = cx.new(|cx| Markdown::new(line.into(), None, None, cx));
         self.narration.push_summary(spoken, blocks, cx);
+        self.catch_up_waiting = true;
         self.start_next_narration_if_idle(cx);
+        // The span reached the listener, so the view may retire it. Emitted
+        // here and in the two fallbacks — never on cancellation, which is what
+        // keeps a catch-up nobody heard from consuming what it was about.
+        cx.emit(ReadAloudEvent::CaughtUp);
     }
 
     /// The turn has ended. In `actions` detail this condenses the turn's
@@ -2184,12 +2252,15 @@ impl ReadAloud {
     /// own opening sentences. Not a summary, but it names the subject,
     /// which is most of what an ambient listener needs — and it degrades to
     /// something useful rather than to silence.
+    /// Returns whether anything was actually said: a message with no
+    /// speakable opening produces silence, and a caller that has to tell the
+    /// listener *something* needs to know that happened.
     fn narrate_opening_sentences(
         &mut self,
         blocks: Vec<Entity<Markdown>>,
         reason: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if !self.logged_summary_fallback {
             self.logged_summary_fallback = true;
             log::warn!(
@@ -2199,9 +2270,10 @@ impl ReadAloud {
         }
         let Some(opening) = Self::opening_sentences(&blocks, narration::OPENING_SENTENCES, cx)
         else {
-            return;
+            return false;
         };
         self.narrate_summary(opening, blocks, cx);
+        true
     }
 
     /// A message's prose blocks joined the way a reader would see them.
@@ -2254,13 +2326,25 @@ impl ReadAloud {
         // Starting a narration also starts the poll loop, which is what
         // eventually drains everything queued behind it.
         self.start_polling(cx);
-        // The full-prose FIFO owns the floor while it has anything in it —
-        // a message the user explicitly asked for is not interrupted by
-        // status.
-        if !self.pending.is_empty() {
+        if self.prose_has_the_floor() {
             return;
         }
         self.start_next_narration(cx);
+    }
+
+    /// Whether the full-prose FIFO gets the next gap.
+    ///
+    /// It normally does: a message the user explicitly asked for is not
+    /// interrupted by status. A catch-up is the one exception — it is not
+    /// status, it is the thing the user asked for most recently, and prose
+    /// that has been waiting its turn can wait one utterance longer. Nothing
+    /// is dropped; the FIFO keeps its order and speaks afterwards.
+    ///
+    /// Consulted in both places that hand out the floor — here and the poll
+    /// loop's idle branch — because they are the same decision, and the poll
+    /// loop is the one that actually runs when a message is already sounding.
+    fn prose_has_the_floor(&self) -> bool {
+        !self.pending.is_empty() && !self.catch_up_waiting
     }
 
     /// Pops one narration and speaks it. Returns whether the poll loop
@@ -2294,6 +2378,9 @@ impl ReadAloud {
         let Some(next) = self.narration.pop() else {
             return false;
         };
+        // Whatever was waiting has now taken the floor, so the full-prose
+        // FIFO gets its precedence back for anything queued behind it.
+        self.catch_up_waiting = false;
         // `switch_to` clears the previous narration's wash, so the new one
         // is only recorded once it has taken over.
         self.switch_to(next.spoken, true, cx);
@@ -2509,7 +2596,7 @@ impl ReadAloud {
                     if !idle {
                         return true;
                     }
-                    if !this.pending.is_empty() {
+                    if this.prose_has_the_floor() {
                         let (markdown, message_complete) = this.pending.remove(0);
                         log::debug!("read_aloud: switched to a queued entity");
                         this.switch_to(markdown, message_complete, cx);
@@ -4149,6 +4236,24 @@ mod tests {
     /// agents send generic titles and put the content in structured fields;
     /// those are exercised by the tests that build [`ToolCallFacts`]
     /// directly.
+    /// The facts a completion update carries: the id, how the call ended, and
+    /// what it printed. `note_tool_call_result` matches on the id and takes
+    /// only those two fields, so nothing else here has to match the call as it
+    /// was narrated.
+    fn tool_call_result(
+        id: &str,
+        outcome: ToolCallOutcome,
+        output: Option<&str>,
+        cx: &mut Context<ReadAloud>,
+    ) -> ToolCallFacts {
+        let label = cx.new(|cx| Markdown::new("Terminal".into(), None, None, cx));
+        ToolCallFacts {
+            outcome,
+            output: output.map(str::to_string),
+            ..ToolCallFacts::from_label(id, label, NarrationKind::Execute)
+        }
+    }
+
     fn titled_call(label: Entity<Markdown>, kind: NarrationKind) -> ToolCallFacts {
         ToolCallFacts::from_label("call", label, kind)
     }
@@ -5589,7 +5694,8 @@ mod tests {
             );
             // The command's result lands after it was narrated, which is the
             // ordinary case.
-            read_aloud.note_tool_call_outcome("run1", ToolCallOutcome::Failed, cx);
+            let result = tool_call_result("run1", ToolCallOutcome::Failed, None, cx);
+            read_aloud.note_tool_call_result(&result, cx);
         });
         cx.run_until_parked();
 
@@ -5654,11 +5760,13 @@ mod tests {
             });
         }
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.note_tool_call_outcome(
+            let result = tool_call_result(
                 &format!("call{failing_call}"),
                 ToolCallOutcome::Failed,
+                None,
                 cx,
             );
+            read_aloud.note_tool_call_result(&result, cx);
         });
         cx.run_until_parked();
 
@@ -5720,11 +5828,9 @@ mod tests {
                     },
                     cx,
                 );
-                read_aloud.note_tool_call_outcome(
-                    &format!("call{index}"),
-                    ToolCallOutcome::Failed,
-                    cx,
-                );
+                let result =
+                    tool_call_result(&format!("call{index}"), ToolCallOutcome::Failed, None, cx);
+                read_aloud.note_tool_call_result(&result, cx);
             });
         }
         cx.run_until_parked();
@@ -7094,5 +7200,137 @@ mod tests {
                 "the newest message's own opening is the fallback"
             );
         }
+    }
+
+    /// The output side of the ordering trap the input side is so careful
+    /// about: a call is narrated once, as soon as it can be named, and for
+    /// anything slower than the settle timer that is while it is still
+    /// pending and has printed nothing.
+    ///
+    /// So the account of the turn has to *learn* what the call printed when
+    /// the completion arrives. It did not: it refreshed the line from the
+    /// facts snapshotted at narration time, so the fast calls carried their
+    /// output into the wrap-up and the slow commands whose output is the
+    /// whole point did not. Exactly inverted, and invisible to any test that
+    /// builds facts from a call's final state.
+    #[gpui::test]
+    async fn a_slow_commands_output_reaches_the_wrap_up(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = steps_narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("Two tests are failing on the segmenter.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+        let label = cx.new(|cx| Markdown::new_text("Terminal".into(), cx));
+        cx.run_until_parked();
+
+        // Narrated while pending: this is what the settle timer produces for
+        // any command that takes longer than 350 ms, which is every command
+        // whose output is worth hearing.
+        read_aloud.update(cx, |read_aloud, cx| {
+            let pending = ToolCallFacts {
+                command: Some("pnpm test".to_string()),
+                purpose: Some("Run the marketing tests".to_string()),
+                input: ToolCallInput::Present,
+                ..ToolCallFacts::from_label("run1", label.clone(), NarrationKind::Execute)
+            };
+            assert_eq!(pending.outcome, ToolCallOutcome::Pending);
+            assert!(pending.output.is_none(), "nothing has been printed yet");
+            read_aloud.narrate_tool_call(pending, cx);
+        });
+        cx.run_until_parked();
+
+        // Forty seconds later the command finishes and says what happened.
+        read_aloud.update(cx, |read_aloud, cx| {
+            let finished = ToolCallFacts {
+                command: Some("pnpm test".to_string()),
+                purpose: Some("Run the marketing tests".to_string()),
+                output: Some("Exit code 1\n2 failing: segmenter".to_string()),
+                outcome: ToolCallOutcome::Failed,
+                input: ToolCallInput::Present,
+                ..ToolCallFacts::from_label("run1", label.clone(), NarrationKind::Execute)
+            };
+            read_aloud.note_tool_call_result(&finished, cx);
+        });
+
+        let closing = markdown_entity(&long_message_source(), cx);
+        let chars = closing.read_with(cx, |markdown, _| markdown.source().len());
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.speculate_wrap_up(vec![closing], chars, cx);
+        });
+        cx.run_until_parked();
+
+        let prompt = model.prompts().pop().expect("the wrap-up was generated");
+        assert!(
+            prompt.contains("it FAILED"),
+            "the failure reaches the wrap-up: {prompt}"
+        );
+        assert!(
+            prompt.contains("it printed: Exit code 1"),
+            "and so does what failed — the sentence the listener is waiting \
+             for, and the whole reason output is collected: {prompt}"
+        );
+    }
+
+    /// A catch-up pressed in full mode while prose is queued must not wait for
+    /// the queue to drain. The prose is not discarded — it is overtaken.
+    #[gpui::test]
+    async fn a_catch_up_overtakes_queued_prose_without_losing_it(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        // Full mode: the reader is speaking whole messages, and more are
+        // waiting behind the one sounding.
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        let model = FakeSummaryModel::new("It rebuilt the sitemap.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let first = markdown_entity("The first message.", cx);
+        let queued = markdown_entity("The second message.", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&first, true, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&queued, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken(),
+            vec!["The first message.".to_string()],
+            "one message is sounding and another is waiting behind it"
+        );
+
+        let closing = markdown_entity("Done.", cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.catch_up(a_span(&["ran a command — build"], 1), vec![closing], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken(),
+            vec!["The first message.".to_string()],
+            "nothing sounding is cut mid-word"
+        );
+
+        drain_narration(&sink, cx);
+        let spoken = provider.spoken();
+        let caught_up = spoken
+            .iter()
+            .position(|line| line == "It rebuilt the sitemap.")
+            .expect("the catch-up is spoken");
+        let second = spoken
+            .iter()
+            .position(|line| line == "The second message.")
+            .expect("and the queued message is not thrown away");
+        assert!(
+            caught_up < second,
+            "the button press overtakes prose that was already waiting: {spoken:?}"
+        );
     }
 }

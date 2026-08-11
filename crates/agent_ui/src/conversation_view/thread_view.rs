@@ -694,9 +694,9 @@ pub struct ThreadView {
     read_aloud_warned_no_summary_model: bool,
     /// Whether the "the summary model is not answering" toast has been shown.
     read_aloud_warned_model_failing: bool,
-    /// Where the last catch-up left off: the entry count at the moment it was
-    /// asked for. Everything at or after it is what the listener has not been
-    /// told about.
+    /// Where the last *delivered* catch-up left off: the entry count as of the
+    /// press whose summary the listener actually heard. Everything at or after
+    /// it is what they have not been told about.
     ///
     /// An entry index rather than an accumulated log, because the thread
     /// already remembers every tool call of the session with its input, its
@@ -705,11 +705,36 @@ pub struct ThreadView {
     /// press is meant to cover the session, including the part of it that was
     /// restored from history.
     read_aloud_catch_up_watermark: usize,
+    /// Calls that were still running when the watermark passed them. They sit
+    /// below it but have not finished happening, so they are pulled back into
+    /// the next span — otherwise a `pnpm test` that was running at the press
+    /// and fails a minute later is never reported at all, which is a hole in
+    /// the one guarantee this feature exists for.
+    read_aloud_catch_up_unfinished: HashSet<acp::ToolCallId>,
     /// When that watermark was set, so the catch-up's length can be sized by
     /// how long the listener has been away as well as by how much happened.
     /// `None` before the first press — the span is then the session, whose
     /// start this view did not see.
+    ///
+    /// On the executor's clock, not the wall's, so a test can move it.
     read_aloud_catch_up_since: Option<Instant>,
+    /// The span a catch-up is being generated for, held until it is heard.
+    ///
+    /// The watermark advances on **delivery**, not on the press. A catch-up
+    /// can be cancelled — a stop, a glance at another thread — and drops
+    /// without making a sound; advancing at the press meant those entries were
+    /// silently consumed, so coming back and pressing again answered "nothing
+    /// new" about forty entries nobody ever heard. Cancelling in the middle of
+    /// looking at a second session is the brief's own headline case.
+    read_aloud_catch_up_in_flight: Option<CatchUpInFlight>,
+}
+
+/// The watermark a catch-up will move to if it is heard. See
+/// [`ThreadView::read_aloud_catch_up_in_flight`].
+struct CatchUpInFlight {
+    watermark: usize,
+    unfinished: HashSet<acp::ToolCallId>,
+    asked_at: Instant,
 }
 
 /// How long a tool call's label must hold still before narration believes
@@ -1379,7 +1404,9 @@ impl ThreadView {
             read_aloud_warned_no_summary_model: false,
             read_aloud_warned_model_failing: false,
             read_aloud_catch_up_watermark: 0,
+            read_aloud_catch_up_unfinished: HashSet::default(),
             read_aloud_catch_up_since: None,
+            read_aloud_catch_up_in_flight: None,
         };
 
         this.init_read_aloud(cx);
@@ -1522,6 +1549,9 @@ impl ThreadView {
         self.read_aloud_subscriptions.push(cx.subscribe(
             read_aloud,
             |this, _, event, cx| match event {
+                read_aloud::ReadAloudEvent::CaughtUp => {
+                    this.read_aloud_catch_up_delivered();
+                }
                 read_aloud::ReadAloudEvent::SummaryModelFailing => {
                     if this.read_aloud_warned_model_failing {
                         return;
@@ -1746,6 +1776,14 @@ impl ThreadView {
                     this.read_aloud_catch_up_watermark =
                         this.read_aloud_catch_up_watermark.min(range.start);
                     // Tool-call ids are scoped to the message they belong to,
+                    // so a regenerated turn reuses them — a remembered
+                    // "unfinished" id would pull in whatever call inherited
+                    // it. The entries are back in the span anyway, by index.
+                    this.read_aloud_catch_up_unfinished.clear();
+                    // …and a span in flight is about entries that no longer
+                    // exist, so it must not be committed if it lands.
+                    this.read_aloud_catch_up_in_flight = None;
+                    // Tool-call ids are scoped to the message they belong to,
                     // so a regenerated turn can reuse one. Remembering that
                     // the *removed* call was narrated would silence its
                     // replacement.
@@ -1909,7 +1947,6 @@ impl ThreadView {
             return;
         }
         let facts = read_aloud_tool_call_facts(tool_call);
-        let outcome = facts.outcome;
         let ready = read_aloud_tool_call_is_ready(&facts, &tool_call.status, trigger, cx);
         // The two waits have the same shape: the line cannot improve until
         // the agent sends more, so nothing is gained by timing it again.
@@ -1917,10 +1954,13 @@ impl ThreadView {
         let call_id = tool_call.id.clone();
         let key = facts.spoken_key(cx);
 
-        // Whether the call has been narrated or not, how it ended is what the
-        // turn's wrap-up most needs to know.
+        // Whether the call has been narrated or not, how it ended — and what
+        // it printed — is what the turn's wrap-up most needs to know. The
+        // whole facts go over, not just the id and the outcome: the output
+        // only exists on this update, and the facts the reader stored were
+        // taken while the call was still pending.
         read_aloud.update(cx, |read_aloud, cx| {
-            read_aloud.note_tool_call_outcome(&facts.id, outcome, cx);
+            read_aloud.note_tool_call_result(&facts, cx);
         });
 
         let state = self
@@ -2116,26 +2156,39 @@ impl ThreadView {
         };
         let entry_count = self.thread.read(cx).entries().len();
         let watermark = self.read_aloud_catch_up_watermark.min(entry_count);
-        let span = self.read_aloud_catch_up_span(watermark, cx);
-        // Advance before speaking, not after: the span is "since you asked",
-        // and asking is what just happened. A model failure therefore costs
-        // the span rather than repeating it on the next press — which is the
-        // right way round, because a second press that replayed a failed
-        // catch-up would be indistinguishable from the button not working.
-        self.read_aloud_catch_up_since = Some(Instant::now());
-        self.read_aloud_catch_up_watermark = entry_count;
-
-        let Some((span, blocks)) = span else {
+        let Some((span, blocks, unfinished)) = self.read_aloud_catch_up_span(watermark, cx) else {
             read_aloud.update(cx, |read_aloud, cx| {
                 read_aloud.announce(NOTHING_NEW_SINCE_LAST_CATCH_UP, cx);
             });
             return;
         };
+        // Held, not applied. `ReadAloudEvent::CaughtUp` commits it once the
+        // listener has actually heard something; until then a second press
+        // re-asks about the same span rather than being told nothing happened,
+        // which is what impatient double-pressing on a button that is silent
+        // for up to fifteen seconds used to produce.
+        self.read_aloud_catch_up_in_flight = Some(CatchUpInFlight {
+            watermark: entry_count,
+            unfinished,
+            asked_at: cx.background_executor().now(),
+        });
         let summary_model = self.require_read_aloud_summary_model(cx);
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.set_summary_model(summary_model);
             read_aloud.catch_up(span, blocks, cx);
         });
+    }
+
+    /// Retires the span a catch-up just spoke. Called from
+    /// [`read_aloud::ReadAloudEvent::CaughtUp`] and nowhere else, so a
+    /// cancelled request leaves the span intact for the next press.
+    fn read_aloud_catch_up_delivered(&mut self) {
+        let Some(in_flight) = self.read_aloud_catch_up_in_flight.take() else {
+            return;
+        };
+        self.read_aloud_catch_up_watermark = in_flight.watermark;
+        self.read_aloud_catch_up_unfinished = in_flight.unfinished;
+        self.read_aloud_catch_up_since = Some(in_flight.asked_at);
     }
 
     /// The material for a catch-up covering every entry from `watermark` on,
@@ -2153,12 +2206,16 @@ impl ThreadView {
         &self,
         watermark: usize,
         cx: &App,
-    ) -> Option<(read_aloud::CatchUpSpan, Vec<Entity<Markdown>>)> {
+    ) -> Option<(
+        read_aloud::CatchUpSpan,
+        Vec<Entity<Markdown>>,
+        HashSet<acp::ToolCallId>,
+    )> {
         let entries = self.thread.read(cx).entries();
-        let calls: Vec<read_aloud::ToolCallFacts> = entries
+        let calls: Vec<(acp::ToolCallId, read_aloud::ToolCallFacts)> = entries
             .iter()
-            .skip(watermark)
-            .filter_map(|entry| match entry {
+            .enumerate()
+            .filter_map(|(entry_index, entry)| match entry {
                 // A call the user refused, or that a cancellation took down,
                 // never happened — the same rule narration applies live.
                 AgentThreadEntry::ToolCall(tool_call)
@@ -2167,7 +2224,13 @@ impl ThreadView {
                         ToolCallStatus::Rejected | ToolCallStatus::Canceled
                     ) =>
                 {
-                    Some(read_aloud_tool_call_facts(tool_call))
+                    // `acp_thread` mutates a tool call in place, so a call
+                    // that was pending when the watermark passed it keeps its
+                    // index below the mark while its outcome and its output
+                    // arrive later. Those are pulled back in by id.
+                    (entry_index >= watermark
+                        || self.read_aloud_catch_up_unfinished.contains(&tool_call.id))
+                    .then(|| (tool_call.id.clone(), read_aloud_tool_call_facts(tool_call)))
                 }
                 _ => None,
             })
@@ -2175,32 +2238,49 @@ impl ThreadView {
         if calls.is_empty() && entries.len() <= watermark {
             return None;
         }
-        let blocks = Self::latest_assistant_markdown_in(&self.thread, cx)
-            .map_or_else(Vec::new, |(entry_index, _)| {
-                Self::assistant_message_markdowns(entries, entry_index, cx)
-            });
-        if calls.is_empty() && blocks.is_empty() {
-            return None;
-        }
-        let actions: Vec<(read_aloud::ToolCallOutcome, String)> = calls
-            .iter()
-            .map(|facts| (facts.outcome, facts.description(cx)))
-            .collect();
-        let span = read_aloud::CatchUpSpan {
-            activity: read_aloud::bounded_activity(&actions),
-            files_changed: read_aloud::files_changed(calls.iter(), cx),
-            message: blocks
+        // Prose already covered by a previous catch-up is not re-sent, or two
+        // consecutive presses summarize the same paragraph and sound like a
+        // stuck record. The blocks are still handed over for the wash, which
+        // is about what is on screen rather than what is being said.
+        let latest = Self::latest_assistant_markdown_in(&self.thread, cx);
+        let blocks = latest.as_ref().map_or_else(Vec::new, |(entry_index, _)| {
+            Self::assistant_message_markdowns(entries, *entry_index, cx)
+        });
+        let message = match latest {
+            Some((entry_index, _)) if entry_index >= watermark => blocks
                 .iter()
                 .map(|block| block.read(cx).source().to_string())
                 .collect::<Vec<_>>()
                 .join("\n\n"),
+            _ => String::new(),
+        };
+        if calls.is_empty() && message.is_empty() {
+            return None;
+        }
+        let actions: Vec<(read_aloud::ToolCallOutcome, String)> = calls
+            .iter()
+            .map(|(_, facts)| (facts.outcome, facts.description(cx)))
+            .collect();
+        // Whatever is still running when this span retires has not finished
+        // happening, so the next span gets it back.
+        let unfinished: HashSet<acp::ToolCallId> = calls
+            .iter()
+            .filter(|(_, facts)| facts.outcome == read_aloud::ToolCallOutcome::Pending)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let span = read_aloud::CatchUpSpan {
+            activity: read_aloud::bounded_activity(&actions),
+            files_changed: read_aloud::files_changed(calls.iter().map(|(_, facts)| facts), cx),
+            message,
             still_streaming: self.thread.read(cx).status() == ThreadStatus::Generating,
             tool_calls: calls.len(),
-            elapsed: self
-                .read_aloud_catch_up_since
-                .map(|since| Instant::now().saturating_duration_since(since)),
+            elapsed: self.read_aloud_catch_up_since.map(|since| {
+                cx.background_executor()
+                    .now()
+                    .saturating_duration_since(since)
+            }),
         };
-        Some((span, blocks))
+        Some((span, blocks, unfinished))
     }
 
     #[cfg(test)]
@@ -2209,7 +2289,7 @@ impl ThreadView {
         cx: &App,
     ) -> Option<read_aloud::CatchUpSpan> {
         self.read_aloud_catch_up_span(self.read_aloud_catch_up_watermark, cx)
-            .map(|(span, _)| span)
+            .map(|(span, _, _)| span)
     }
 
     /// Asks narration to start the turn's wrap-up while the agent is still

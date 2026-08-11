@@ -13230,6 +13230,12 @@ pub(crate) mod tests {
         cx.run_until_parked();
         drain_read_aloud(&sink, cx);
         let heard_unasked = provider.spoken();
+        assert_eq!(
+            heard_unasked,
+            vec![thread_view::NOTHING_NEW_SINCE_LAST_CATCH_UP.to_string()],
+            "with `auto_play` off the turn itself says nothing; the only line \
+             so far is the first press, got {heard_unasked:?}"
+        );
 
         // The span holds both calls, what they printed, and the failure.
         let span = thread_view
@@ -13353,5 +13359,294 @@ pub(crate) mod tests {
             !provider.spoken().is_empty(),
             "but the button they pressed still speaks"
         );
+    }
+
+    /// A catch-up nobody heard must not consume the span it was about.
+    ///
+    /// The brief's headline case: two sessions running, press catch-up in one,
+    /// glance at the other while the model thinks, come back. The glance
+    /// cancels the request — and used to take forty entries of work with it,
+    /// so the next press said "nothing new" about a span that was never
+    /// spoken.
+    #[gpui::test]
+    async fn test_read_aloud_catch_up_survives_being_cancelled(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (_provider, _sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("call-1", "Terminal")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Completed)
+                        .raw_input(json!({
+                            "command": "pnpm build",
+                            "description": "Rebuild the marketing site",
+                        }))
+                        .raw_output(json!("built in 4s")),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let before = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("a call has happened");
+        assert_eq!(before.tool_calls, 1);
+
+        // Press, then leave for the other thread before anything is spoken.
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        thread_view.update(cx, |view, cx| view.read_aloud_deactivated(cx));
+        cx.run_until_parked();
+
+        let after = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("the span the listener never heard is still theirs to ask for");
+        assert_eq!(
+            after.tool_calls, before.tool_calls,
+            "a cancelled catch-up spoke nothing, so it consumed nothing"
+        );
+
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+    }
+
+    /// A call that was running at the press and fails afterwards is still
+    /// reported. Pressing *while the agent works* is the on-demand case, and
+    /// "the tests failed" is the guarantee.
+    #[gpui::test]
+    async fn test_read_aloud_catch_up_reports_a_call_that_finishes_later(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let update = |update: acp::SessionUpdate, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| connection.send_update(session_id, update, cx));
+            cx.run_until_parked();
+        };
+
+        // Prose, so the press has something to fall back on and therefore
+        // actually delivers — without a delivery the watermark never moves
+        // and this test would pass without the carry-over it is about.
+        update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                "Running the marketing tests now; they take a while.".into(),
+            )),
+            cx,
+        );
+        // Still running when the button is pressed.
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("slow", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(json!({
+                        "command": "pnpm test",
+                        "description": "Run the marketing tests",
+                    })),
+            ),
+            cx,
+        );
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+        assert!(
+            !provider.spoken().is_empty(),
+            "the press was answered, so the watermark has moved past the call"
+        );
+
+        // …and fails a minute later, with nothing else happening at all.
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("slow"),
+                acp::ToolCallUpdateFields::new()
+                    .status(acp::ToolCallStatus::Failed)
+                    .raw_output(json!("Exit code 1\n2 failing: segmenter")),
+            )),
+            cx,
+        );
+
+        let span = thread_view
+            .read_with(cx, |view, cx| view.read_aloud_catch_up_span_for_test(cx))
+            .expect("the failure is new even though the call is not");
+        assert!(
+            span.activity
+                .iter()
+                .any(|line| line.contains("it FAILED") && line.contains("2 failing")),
+            "a call that was pending at the press and failed after it must \
+             still be reported: {:?}",
+            span.activity
+        );
+
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Pressing twice while the first answer is still being written must not
+    /// destroy the span and answer "nothing new" — which is the single most
+    /// likely interaction with a button that is silent for up to fifteen
+    /// seconds.
+    #[gpui::test]
+    async fn test_read_aloud_catch_up_survives_an_impatient_second_press(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (provider, sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("call-1", "Terminal")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Completed)
+                        .raw_input(json!({
+                            "command": "pnpm build",
+                            "description": "Rebuild the marketing site",
+                        }))
+                        .raw_output(json!("built in 4s")),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Two presses in the same beat, before anything can be spoken.
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        thread_view.update(cx, |view, cx| view.summarize_read_aloud_session(cx));
+        cx.run_until_parked();
+        drain_read_aloud(&sink, cx);
+
+        assert!(
+            !provider
+                .spoken()
+                .iter()
+                .any(|line| line == thread_view::NOTHING_NEW_SINCE_LAST_CATCH_UP),
+            "the second press asks about the same span again rather than \
+             being told the first one consumed it, got {:?}",
+            provider.spoken()
+        );
+        assert!(
+            !provider.spoken().is_empty(),
+            "and the listener does hear something"
+        );
+
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
+    }
+
+    /// The composed path the Critical finding lived in: the view builds facts
+    /// on every update, the reader stores them once, and only the completion
+    /// carries what the command printed.
+    ///
+    /// Asserted on the reader's own turn account rather than on audio, because
+    /// no language model is reachable in these tests — but this *is* the block
+    /// the wrap-up prompt is built from, and the seam between the two halves
+    /// is what went untested and shipped broken.
+    #[gpui::test]
+    async fn test_read_aloud_a_slow_commands_output_reaches_the_turn_account(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let (_provider, _sink) = setup_read_aloud_narration(&thread_view, true, cx).await;
+        let reader = thread_view
+            .read_with(cx, |view, _| view.read_aloud_for_test().cloned())
+            .expect("the reader is installed");
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("Do a thing", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let update = |update: acp::SessionUpdate, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| connection.send_update(session_id, update, cx));
+            cx.run_until_parked();
+        };
+
+        // Narrated while pending — a command that takes longer than the settle
+        // timer, which is every command whose output is worth hearing.
+        update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("slow", "Terminal")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(json!({
+                        "command": "pnpm test",
+                        "description": "Run the marketing tests",
+                    })),
+            ),
+            cx,
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(
+            reader.read_with(cx, |reader, _| reader
+                .turn_account_for_test()
+                .iter()
+                .any(|line| line.contains("Run the marketing tests"))),
+            "the call is in the turn's account, with nothing printed yet"
+        );
+
+        // Forty seconds later it fails and says what happened.
+        update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("slow"),
+                acp::ToolCallUpdateFields::new()
+                    .status(acp::ToolCallStatus::Failed)
+                    .raw_output(json!("Exit code 1\n2 failing: segmenter")),
+            )),
+            cx,
+        );
+        let account = reader.read_with(cx, |reader, _| reader.turn_account_for_test());
+        assert!(
+            account
+                .iter()
+                .any(|line| line.contains("it FAILED") && line.contains("2 failing")),
+            "and what it printed reaches the account the wrap-up is written \
+             from — the sentence the listener is waiting for: {account:?}"
+        );
+
+        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        send.await.unwrap();
+        cx.run_until_parked();
     }
 }
