@@ -12325,6 +12325,94 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_navigating_into_a_finished_subagent_renders(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        // Give it a transcript, so the parent's card has entries to preview.
+        cx.update(|_window, cx| {
+            subagent_thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "Do the thing".into(), cx);
+                thread
+                    .upsert_tool_call(
+                        acp::ToolCall::new(acp::ToolCallId::new("child-read"), "Read main.rs")
+                            .status(acp::ToolCallStatus::Completed),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread);
+
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            // Finished, which is the state the card renders its preview for
+            // rather than the embedded live step.
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.subagent_spawned(subagent_session_id.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        // Draw the parent with the finished card expanded...
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _cx| {
+                state.toggle_tool_call_expansion(&acp::ToolCallId::new("task-1"));
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // ...then go into it, which is where the crash was reported.
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(subagent_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.active_thread().map(|thread_view| thread_view
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .session_id()
+                    .clone()),
+                Some(subagent_session_id),
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_subagent_summaries_ignore_ordinary_tool_calls(cx: &mut TestAppContext) {
         init_test(cx);
 

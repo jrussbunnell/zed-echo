@@ -4295,6 +4295,145 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_untagged_update_follows_its_tool_call_into_the_subagent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (connection, project, _load_count, _close_count, updates, _gate, _keep_alive) =
+            connect_fake_agent(cx).await;
+
+        // Claude Code tags the streaming `tool_call` but sends the completing
+        // `tool_call_update` from its post-tool-use hook *untagged*. Applying
+        // that to the parent would fabricate a "Tool call not found" failure
+        // there and leave the subagent's tool call stuck in progress.
+        let session_id = acp::SessionId::new("session-1");
+        let parent = replay_updates(
+            &connection,
+            &project,
+            &updates,
+            &session_id,
+            vec![
+                acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+                    acp::ToolCallId::new("task-1"),
+                    "Research alternatives",
+                )),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(acp::ToolCallId::new("child-read"), "Read main.rs")
+                        .meta(owned_by_subagent("task-1")),
+                ),
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new("child-read"),
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                )),
+            ],
+            cx,
+        )
+        .await;
+
+        parent.read_with(cx, |parent, cx| {
+            let titles: Vec<_> = parent
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::ToolCall(tool_call) => {
+                        Some(tool_call.label.read(cx).source().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                titles,
+                vec!["Research alternatives".to_string()],
+                "the untagged update must not fabricate a tool call in the parent"
+            );
+        });
+
+        let derived_session_id =
+            acp_thread::derived_subagent_session_id(&session_id, &acp::ToolCallId::new("task-1"));
+        let child = cx
+            .update(|cx| connection.local_session_thread(&derived_session_id, cx))
+            .expect("the subagent should have a thread");
+        child.read_with(cx, |child, _cx| {
+            let acp_thread::AgentThreadEntry::ToolCall(tool_call) = &child.entries()[0] else {
+                panic!("expected the subagent's tool call");
+            };
+            assert!(
+                matches!(tool_call.status, acp_thread::ToolCallStatus::Completed),
+                "the untagged update should have completed the subagent's own tool call"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_nested_subagent_belongs_to_the_subagent_that_spawned_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (connection, project, _load_count, _close_count, updates, _gate, _keep_alive) =
+            connect_fake_agent(cx).await;
+
+        let session_id = acp::SessionId::new("session-1");
+        let parent = replay_updates(
+            &connection,
+            &project,
+            &updates,
+            &session_id,
+            vec![
+                acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+                    acp::ToolCallId::new("task-1"),
+                    "Outer subagent",
+                )),
+                // The outer subagent spawns one of its own.
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(acp::ToolCallId::new("task-2"), "Inner subagent")
+                        .meta(owned_by_subagent("task-1")),
+                ),
+                acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new("inner work".into()).meta(owned_by_subagent("task-2")),
+                ),
+            ],
+            cx,
+        )
+        .await;
+
+        let outer =
+            acp_thread::derived_subagent_session_id(&session_id, &acp::ToolCallId::new("task-1"));
+        let inner =
+            acp_thread::derived_subagent_session_id(&outer, &acp::ToolCallId::new("task-2"));
+
+        // The root lists only the outer subagent.
+        parent.read_with(cx, |parent, _cx| {
+            let subagents: Vec<_> = parent
+                .subagent_tool_calls()
+                .map(|(_, _, info)| info.session_id.clone())
+                .collect();
+            assert_eq!(subagents, vec![outer.clone()]);
+        });
+
+        // And the inner one hangs off the outer, not off the root.
+        let outer_thread = cx
+            .update(|cx| connection.local_session_thread(&outer, cx))
+            .expect("the outer subagent should have a thread");
+        outer_thread.read_with(cx, |outer_thread, _cx| {
+            let subagents: Vec<_> = outer_thread
+                .subagent_tool_calls()
+                .map(|(_, _, info)| info.session_id.clone())
+                .collect();
+            assert_eq!(
+                subagents,
+                vec![inner.clone()],
+                "a nested subagent should be listed by the subagent that spawned it"
+            );
+        });
+
+        let inner_thread = cx
+            .update(|cx| connection.local_session_thread(&inner, cx))
+            .expect("the inner subagent should have a thread");
+        inner_thread.read_with(cx, |inner_thread, cx| {
+            assert_eq!(inner_thread.parent_session_id(), Some(&outer));
+            assert!(inner_thread.to_markdown(cx).contains("inner work"));
+        });
+    }
+
+    #[gpui::test]
     async fn test_subagent_thread_is_reused_across_updates(cx: &mut gpui::TestAppContext) {
         let (connection, project, _load_count, _close_count, updates, _gate, _keep_alive) =
             connect_fake_agent(cx).await;
@@ -5241,57 +5380,121 @@ fn handle_read_text_file(
 /// Returns `None` when the subagent can't be given a thread — the parent is
 /// gone, or the update arrived for a session we no longer track — in which case
 /// the caller leaves the update on the parent rather than dropping it.
-fn derived_subagent_thread(
-    parent_session_id: &acp::SessionId,
-    tool_call_id: &acp::ToolCallId,
-    parent_thread: &WeakEntity<AcpThread>,
-    update: &acp::SessionUpdate,
+/// The tool call a session update is about, if it is about one.
+fn updated_tool_call_id(update: &acp::SessionUpdate) -> Option<&acp::ToolCallId> {
+    match update {
+        acp::SessionUpdate::ToolCall(tool_call) => Some(&tool_call.tool_call_id),
+        acp::SessionUpdate::ToolCallUpdate(update) => Some(&update.tool_call_id),
+        _ => None,
+    }
+}
+
+/// Picks the thread a session update belongs to, creating a subagent's thread
+/// the first time one is seen. `None` leaves the update on the session it
+/// arrived for.
+///
+/// A tool call and its updates *must* land in the same thread, and the agent
+/// cannot be relied on to say so consistently: Claude Code tags the streaming
+/// `tool_call` with `parentToolUseId` but omits it on the `tool_call_update`
+/// its post-tool-use hook sends, and on replayed history. An update that
+/// reached the wrong thread would be applied to a tool call that isn't there,
+/// which fabricates a "Tool call not found" failure in the transcript. So
+/// ownership, once learned, outranks the tag's absence.
+fn route_to_subagent(
+    notification: &acp::SessionNotification,
+    session_thread: &WeakEntity<AcpThread>,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) -> Option<WeakEntity<AcpThread>> {
-    let session_id = acp_thread::derived_subagent_session_id(parent_session_id, tool_call_id);
+    let update = &notification.update;
+    let tool_call_id = updated_tool_call_id(update);
 
-    // Remember which subagent owns a tool call, so a permission request — which
-    // names only the tool call and the parent session — can be routed to it.
-    match update {
-        acp::SessionUpdate::ToolCall(tool_call) => {
-            ctx.derived_subagents
-                .borrow_mut()
-                .owners
-                .insert(tool_call.tool_call_id.clone(), session_id.clone());
+    let owner_session_id = match acp_thread::subagent_owner_of_update(update) {
+        // A tool call cannot be owned by the subagent it spawned. Letting that
+        // through would route the spawning call's own completion into the
+        // subagent, leaving the card in the parent running forever.
+        Some(spawning_tool_call_id) if Some(&spawning_tool_call_id) == tool_call_id => {
+            return None;
         }
-        acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
-            ctx.derived_subagents
-                .borrow_mut()
+        Some(spawning_tool_call_id) => {
+            // A subagent nested inside another belongs to *that* subagent's
+            // thread, which is where its spawning tool call lives.
+            let parent_session_id = ctx
+                .derived_subagents
+                .borrow()
                 .owners
-                .insert(tool_call_update.tool_call_id.clone(), session_id.clone());
-        }
-        _ => {}
-    }
-
-    let existing = ctx
-        .derived_subagents
-        .borrow()
-        .thread(&session_id)
-        .map(|thread| thread.downgrade());
-    let thread = match existing {
-        Some(thread) => thread,
-        None => {
-            let created = create_derived_subagent_thread(
-                parent_session_id,
-                tool_call_id,
+                .get(&spawning_tool_call_id)
+                .cloned()
+                .unwrap_or_else(|| notification.session_id.clone());
+            let session_id =
+                acp_thread::derived_subagent_session_id(&parent_session_id, &spawning_tool_call_id);
+            ensure_derived_subagent(
+                &parent_session_id,
+                &spawning_tool_call_id,
                 &session_id,
-                parent_thread,
+                session_thread,
                 cx,
                 ctx,
             )?;
-            created.downgrade()
+            session_id
+        }
+        // Untagged, but about a tool call we already know belongs to a
+        // subagent: follow the tool call, not the tag.
+        None => {
+            let tool_call_id = tool_call_id?;
+            ctx.derived_subagents
+                .borrow()
+                .owners
+                .get(tool_call_id)
+                .cloned()?
         }
     };
 
-    announce_derived_subagent(&session_id, tool_call_id, parent_thread, cx, ctx);
+    if let Some(tool_call_id) = tool_call_id {
+        ctx.derived_subagents
+            .borrow_mut()
+            .owners
+            .insert(tool_call_id.clone(), owner_session_id.clone());
+    }
 
-    Some(thread)
+    ctx.derived_subagents
+        .borrow()
+        .thread(&owner_session_id)
+        .map(|thread| thread.downgrade())
+}
+
+/// Creates the subagent's thread if this is the first time it has been seen,
+/// and makes sure its spawning tool call has been stamped.
+fn ensure_derived_subagent(
+    parent_session_id: &acp::SessionId,
+    tool_call_id: &acp::ToolCallId,
+    session_id: &acp::SessionId,
+    session_thread: &WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) -> Option<()> {
+    // The spawning tool call lives in the parent's thread, which is the
+    // session's own thread unless this subagent is nested inside another.
+    let parent_thread = ctx
+        .derived_subagents
+        .borrow()
+        .thread(parent_session_id)
+        .map(|thread| thread.downgrade())
+        .unwrap_or_else(|| session_thread.clone());
+
+    if ctx.derived_subagents.borrow().thread(session_id).is_none() {
+        create_derived_subagent_thread(
+            parent_session_id,
+            tool_call_id,
+            session_id,
+            &parent_thread,
+            cx,
+            ctx,
+        )?;
+    }
+
+    announce_derived_subagent(session_id, tool_call_id, &parent_thread, cx, ctx);
+    Some(())
 }
 
 fn create_derived_subagent_thread(
@@ -5476,18 +5679,7 @@ fn handle_session_notification(
     // Work the agent attributed to a subagent goes to that subagent's own
     // thread instead of the parent's transcript. The parent keeps only the
     // spawning tool call, which renders as the subagent card.
-    let thread = match acp_thread::subagent_owner_of_update(&notification.update) {
-        Some(tool_call_id) => derived_subagent_thread(
-            &notification.session_id,
-            &tool_call_id,
-            &thread,
-            &notification.update,
-            cx,
-            ctx,
-        )
-        .unwrap_or(thread),
-        None => thread,
-    };
+    let thread = route_to_subagent(&notification, &thread, cx, ctx).unwrap_or(thread);
 
     // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
     if let acp::SessionUpdate::ToolCall(tc) = &notification.update {

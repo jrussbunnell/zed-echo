@@ -3899,6 +3899,32 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    /// Navigates a workspace's agent panel back to `thread_id`'s root thread,
+    /// if it is currently showing a subagent of it.
+    fn show_root_thread(
+        workspace: &Entity<Workspace>,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        let Some(conversation_view) = panel
+            .read(cx)
+            .conversation_view_for_id(thread_id, cx)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(root_session_id) = conversation_view.read(cx).root_session_id().cloned() else {
+            return;
+        };
+        conversation_view.update(cx, |conversation_view, cx| {
+            conversation_view.navigate_to_thread(root_session_id, window, cx);
+        });
+    }
+
     fn is_thread_active_in_workspace(
         &self,
         thread_id: &ThreadId,
@@ -3924,6 +3950,11 @@ impl Sidebar {
         };
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
+            // The conversation may be showing one of this thread's subagents.
+            // Clicking the parent row means "take me to the parent", so go back
+            // out rather than only focusing the panel and leaving the user
+            // looking at the subagent they clicked away from.
+            Self::show_root_thread(workspace, &metadata.thread_id, window, cx);
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
             });

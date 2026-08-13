@@ -4236,6 +4236,84 @@ async fn test_sidebar_toggles_subagent_rows_under_their_parent(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_clicking_the_parent_row_leaves_the_subagent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+
+    let parent_session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&parent_session_id, &project, cx).await;
+
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    let subagent_session_id = acp::SessionId::new("subagent-session");
+    cx.update(|_, cx| {
+        parent_thread.update(cx, |thread, cx| {
+            thread.subagent_spawned(subagent_session_id.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let conversation_view = panel
+        .read_with(cx, |panel, _cx| panel.active_conversation_view().cloned())
+        .expect("expected an active conversation");
+
+    // Go into the subagent, the way clicking a tray row or a nested sidebar
+    // row does.
+    conversation_view.update_in(cx, |view, window, cx| {
+        view.navigate_to_thread(subagent_session_id.clone(), window, cx);
+    });
+    cx.run_until_parked();
+    let showing = |cx: &mut gpui::VisualTestContext| {
+        conversation_view.read_with(cx, |view, cx| {
+            view.active_thread()
+                .map(|thread_view| thread_view.read(cx).thread.read(cx).session_id().clone())
+        })
+    };
+    assert_eq!(showing(cx), Some(subagent_session_id));
+
+    // Clicking the parent row in the sidebar should come back out, without
+    // needing the subagent's own minimize button.
+    let (metadata, workspace) = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&parent_session_id) =>
+                {
+                    match &thread.workspace {
+                        ThreadEntryWorkspace::Open(workspace) => {
+                            Some((thread.metadata.clone(), workspace.clone()))
+                        }
+                        ThreadEntryWorkspace::Closed { .. } => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("expected the parent thread in the sidebar")
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_thread(metadata, &workspace, false, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        showing(cx),
+        Some(parent_session_id),
+        "clicking the parent row should navigate back out of the subagent"
+    );
+}
+
+#[gpui::test]
 async fn test_sidebar_subagent_rows_follow_the_spawn_tool_call_status(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
