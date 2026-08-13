@@ -827,10 +827,20 @@ fn connect_client_future(
         )
 }
 
+/// Tells an agent this client can display a subagent's transcript separately
+/// from the parent's.
+///
+/// Claude Code strips subagent text and thinking for clients that don't say
+/// this, on the reasoning that a client which cannot nest a transcript would
+/// otherwise have the subagent's prose leak into the top-level feed. We route
+/// it into the subagent's own thread instead, so we want it.
+const SUBAGENT_TRANSCRIPT_META_KEY: &str = "subagent-transcript";
+
 fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        (SUBAGENT_TRANSCRIPT_META_KEY.into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -3142,6 +3152,22 @@ mod tests {
             .expect("expected client capabilities meta");
 
         assert!(!meta.contains_key(PARAMETERIZED_MODEL_PICKER_META_KEY));
+    }
+
+    #[test]
+    fn client_capabilities_advertise_subagent_transcripts() {
+        // Without this, Claude Code strips a subagent's text and thinking from
+        // both the live stream and history replay, so its thread would hold
+        // only tool calls and its prose would be lost entirely.
+        for agent_id in ["claude-acp", "codex-acp", "cursor"] {
+            let capabilities = client_capabilities_for_agent(&AgentId::new(agent_id));
+            let meta = capabilities.meta.expect("meta should be advertised");
+            assert_eq!(
+                meta.get(SUBAGENT_TRANSCRIPT_META_KEY),
+                Some(&serde_json::json!(true)),
+                "{agent_id} should be told we can show subagent transcripts"
+            );
+        }
     }
 
     #[test]
