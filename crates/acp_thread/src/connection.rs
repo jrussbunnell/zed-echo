@@ -109,6 +109,22 @@ pub trait AgentConnection {
         false
     }
 
+    /// A thread the connection already holds for `session_id`, for sessions
+    /// that exist only on this side and so need no `session/load`.
+    ///
+    /// Claude Code's subagents are why this exists: the agent runs them inside
+    /// the parent session and never assigns them one of their own, so the
+    /// connection assembles their thread from the updates as they arrive.
+    /// There is nothing to load, and requiring the load capability would hide
+    /// them behind a capability that has no bearing on them.
+    fn local_session_thread(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        None
+    }
+
     /// Load an existing session by ID.
     fn load_session(
         self: Rc<Self>,
@@ -757,6 +773,10 @@ mod test_support {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
+        /// Threads handed straight back from
+        /// [`AgentConnection::local_session_thread`], standing in for subagents
+        /// a real connection assembled from tagged updates.
+        local_threads: Arc<Mutex<HashMap<acp::SessionId, Entity<AcpThread>>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
@@ -780,11 +800,22 @@ mod test_support {
                 next_prompt_updates: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
+                local_threads: Arc::default(),
                 supports_load_session: false,
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
             }
+        }
+
+        /// Registers `thread` as a session that exists only on the client, the
+        /// way a derived subagent does.
+        pub fn add_local_session_thread(
+            &self,
+            session_id: acp::SessionId,
+            thread: Entity<AcpThread>,
+        ) {
+            self.local_threads.lock().insert(session_id, thread);
         }
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
@@ -927,6 +958,14 @@ mod test_support {
 
         fn supports_load_session(&self) -> bool {
             self.supports_load_session
+        }
+
+        fn local_session_thread(
+            &self,
+            session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Entity<AcpThread>> {
+            self.local_threads.lock().get(session_id).cloned()
         }
 
         fn supports_session_additional_directories(&self) -> bool {

@@ -2128,9 +2128,14 @@ impl ConversationView {
         let Some(connected) = self.as_connected() else {
             return;
         };
-        if connected.threads.contains_key(&subagent_id)
-            || !connected.connection.supports_load_session()
-        {
+        if connected.threads.contains_key(&subagent_id) {
+            return;
+        }
+        // A subagent the connection assembled locally is already a thread and
+        // needs no load — and must not be gated behind the load capability,
+        // which says nothing about it.
+        let local_thread = connected.connection.local_session_thread(&subagent_id, cx);
+        if local_thread.is_none() && !connected.connection.supports_load_session() {
             return;
         }
         let Some(parent_thread) = connected.threads.get(&parent_session_id) else {
@@ -2144,13 +2149,16 @@ impl ConversationView {
             .cloned()
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
 
-        let subagent_thread_task = connected.connection.clone().load_session(
-            subagent_id,
-            self.project.clone(),
-            work_dirs,
-            None,
-            cx,
-        );
+        let subagent_thread_task = match local_thread {
+            Some(thread) => Task::ready(Ok(thread)),
+            None => connected.connection.clone().load_session(
+                subagent_id,
+                self.project.clone(),
+                work_dirs,
+                None,
+                cx,
+            ),
+        };
 
         cx.spawn_in(window, async move |this, cx| {
             let subagent_thread = subagent_thread_task.await?;
@@ -12233,6 +12241,86 @@ pub(crate) mod tests {
             assert_eq!(summaries.len(), 1);
             assert_eq!(summaries[0].label.as_ref(), "Research alternatives");
             assert_eq!(summaries[0].status, SubagentStatus::Running);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_locally_assembled_subagent_opens_without_a_loadable_session(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        // A Claude Code subagent has no session on the agent side, so the
+        // connection hands its thread over directly. That must work even
+        // though this agent cannot load sessions at all — the load capability
+        // says nothing about a thread the client already holds.
+        let connection = StubAgentConnection::new();
+        assert!(
+            !connection.supports_load_session(),
+            "this test is only meaningful when the agent cannot load sessions"
+        );
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread);
+
+        // Announce it the way the connection does once it has routed the
+        // subagent's first update.
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.subagent_spawned(subagent_session_id.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let subagent_view = conversation_view
+            .read_with(cx, |view, _cx| view.thread_view(&subagent_session_id))
+            .expect("the subagent should be openable even without session loading");
+        assert_eq!(
+            subagent_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone()),
+            subagent_session_id,
+        );
+
+        // And navigating into it actually switches the panel to it.
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(subagent_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.active_thread()
+                    .map(|view| view.read(cx).thread.read(cx).session_id().clone()),
+                Some(subagent_session_id.clone()),
+            );
         });
     }
 

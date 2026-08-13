@@ -290,6 +290,66 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// Namespace the Claude Code ACP adapter puts its vendor extensions under.
+pub const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+
+/// Key under [`CLAUDE_CODE_META_KEY`] naming the tool call a session update was
+/// produced *inside*.
+///
+/// Claude Code runs a subagent as a `Task` tool call within the parent session
+/// rather than as a session of its own, and stamps every update the subagent
+/// produces — messages, thoughts, its own tool calls and their results — with
+/// the `Task` call's id. That stamp is the only thing distinguishing a
+/// subagent's work from the parent's on the wire.
+pub const PARENT_TOOL_USE_ID_META_KEY: &str = "parentToolUseId";
+
+/// The tool call a session update was produced inside, if the agent said.
+pub fn parent_tool_use_id_from_meta(meta: &Option<acp::Meta>) -> Option<acp::ToolCallId> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
+        .and_then(|claude_code| claude_code.get(PARENT_TOOL_USE_ID_META_KEY))
+        .and_then(|value| value.as_str())
+        .map(acp::ToolCallId::new)
+}
+
+/// The `_meta` of whichever [`acp::SessionUpdate`] this is.
+///
+/// Only the update kinds an agent can produce from inside a tool call are
+/// covered; the rest describe the session as a whole and are never attributed
+/// to a subagent.
+pub fn session_update_meta(update: &acp::SessionUpdate) -> &Option<acp::Meta> {
+    const NO_META: &Option<acp::Meta> = &None;
+    match update {
+        acp::SessionUpdate::UserMessageChunk(chunk)
+        | acp::SessionUpdate::AgentMessageChunk(chunk)
+        | acp::SessionUpdate::AgentThoughtChunk(chunk) => &chunk.meta,
+        acp::SessionUpdate::ToolCall(tool_call) => &tool_call.meta,
+        acp::SessionUpdate::ToolCallUpdate(update) => &update.meta,
+        acp::SessionUpdate::Plan(plan) => &plan.meta,
+        _ => NO_META,
+    }
+}
+
+/// The subagent a session update belongs to, if any.
+pub fn subagent_owner_of_update(update: &acp::SessionUpdate) -> Option<acp::ToolCallId> {
+    parent_tool_use_id_from_meta(session_update_meta(update))
+}
+
+/// The session id given to the thread that collects a Claude Code subagent's
+/// work.
+///
+/// Derived rather than agent-assigned, because the agent never assigns one:
+/// there is no session on the agent side to talk to. It is stable across the
+/// life of the parent session so a subagent keeps its identity across updates,
+/// and namespaced so it can never collide with a real session id the agent
+/// hands out.
+pub fn derived_subagent_session_id(
+    parent: &acp::SessionId,
+    tool_call_id: &acp::ToolCallId,
+) -> acp::SessionId {
+    acp::SessionId::new(format!("{}/subagent/{}", parent.0, tool_call_id.0))
+}
+
 #[derive(Debug)]
 pub struct UserMessage {
     pub protocol_id: Option<acp::MessageId>,
