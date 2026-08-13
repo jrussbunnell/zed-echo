@@ -5346,7 +5346,7 @@ impl ThreadView {
     /// Opens a subagent: navigates into its thread when it has been loaded,
     /// and otherwise scrolls this transcript to the tool call that spawned it,
     /// which is where its output lands.
-    fn open_subagent(
+    pub(crate) fn open_subagent(
         &mut self,
         summary: &SubagentSummary,
         window: &mut Window,

@@ -784,17 +784,32 @@ impl ConversationView {
             .filter(|previous_id| connected.active_id.as_ref() != Some(previous_id))
             .and_then(|previous_id| connected.threads.get(&previous_id))
             .cloned();
-        if let Some(outgoing) = outgoing {
-            outgoing.update(cx, |view, cx| view.read_aloud_deactivated(cx));
-            // The thread being arrived at may itself have been parked by an
-            // earlier navigation; coming back lifts that.
-            if let Some(incoming) = self.active_thread().cloned() {
-                incoming.update(cx, |view, cx| view.read_aloud_activated(cx));
+        let incoming = self.active_thread().cloned();
+
+        // Every way into a subagent runs inside a thread view's own event
+        // handler — the subagent tray, the subagent card's full-screen button —
+        // so that view is already leased by the time we get here. Both the read
+        // aloud handover and the focus move touch thread views, including the
+        // one being left behind, which is usually the leased one. Doing that
+        // now would panic on a double lease, so it waits for the lease to be
+        // released.
+        cx.defer_in(window, move |_this, window, cx| {
+            if let Some(outgoing) = outgoing {
+                outgoing.update(cx, |view, cx| view.read_aloud_deactivated(cx));
+                // The thread being arrived at may itself have been parked by an
+                // earlier navigation; coming back lifts that.
+                if let Some(incoming) = incoming.as_ref() {
+                    incoming.update(cx, |view, cx| view.read_aloud_activated(cx));
+                }
             }
-        }
-        if let Some(view) = self.active_thread() {
-            view.read(cx).activation_focus_handle(cx).focus(window, cx);
-        }
+            if let Some(incoming) = incoming {
+                incoming
+                    .read(cx)
+                    .activation_focus_handle(cx)
+                    .focus(window, cx);
+            }
+        });
+
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         cx.notify();
     }
@@ -12320,6 +12335,78 @@ pub(crate) mod tests {
                 view.active_thread()
                     .map(|view| view.read(cx).thread.read(cx).session_id().clone()),
                 Some(subagent_session_id.clone()),
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opening_a_subagent_from_the_tray_does_not_double_lease(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let parent_view = active_thread(&conversation_view, cx);
+        let (parent_thread, project) = parent_view.read_with(cx, |view, cx| {
+            (view.thread.clone(), view.thread.read(cx).project().clone())
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread);
+
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.subagent_spawned(subagent_session_id.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let summary = parent_view
+            .read_with(cx, |view, cx| view.subagent_summaries(cx))
+            .pop()
+            .expect("the parent should list its subagent");
+
+        // Clicking a tray row runs inside `cx.listener`, which leases the
+        // parent's `ThreadView` — and navigating away from it touches that
+        // same view. Going through `update` here reproduces that lease; calling
+        // `navigate_to_thread` on the conversation directly does not.
+        parent_view.update_in(cx, |view, window, cx| {
+            view.open_subagent(&summary, window, cx);
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.active_thread().map(|thread_view| thread_view
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .session_id()
+                    .clone()),
+                Some(subagent_session_id),
+                "opening a subagent from the tray should navigate into it"
             );
         });
     }
