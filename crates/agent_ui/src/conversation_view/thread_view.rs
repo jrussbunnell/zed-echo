@@ -13089,7 +13089,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        const MAX_PREVIEW_ENTRIES: usize = 8;
+        // Enough to scroll back through a subagent's recent work without
+        // rendering an arbitrarily long transcript inside the parent — the
+        // whole thing is one click away in the subagent's own thread.
+        const MAX_PREVIEW_ENTRIES: usize = 50;
 
         let subagent_view = thread_view.read(cx);
         let session_id = subagent_view.thread.read(cx).session_id().clone();
@@ -13137,7 +13140,13 @@ impl ThreadView {
             .or_default()
             .clone();
 
-        scroll_handle.scroll_to_bottom();
+        // Follow the subagent's output only while the user is already at the
+        // bottom. Scrolling back to read something must not be yanked away by
+        // the next chunk arriving, and a finished subagent should stay
+        // wherever it was left.
+        if is_scrolled_to_bottom(scroll_handle.offset().y, scroll_handle.max_offset().y) {
+            scroll_handle.scroll_to_bottom();
+        }
 
         let rendered_entries: Vec<AnyElement> = entries
             .get(entry_range)
@@ -13168,6 +13177,8 @@ impl ThreadView {
                         session_id, tool_call.id.0
                     ))
                     .track_scroll(&scroll_handle)
+                    .overflow_y_scroll()
+                    .flex_1()
                     .children(rendered_entries),
             )
             .h_56()
@@ -14764,6 +14775,16 @@ impl Render for ThreadView {
             .children(self.render_read_aloud_mini_player(cx))
             .child(self.render_message_editor(window, cx))
     }
+}
+
+/// Whether a scroll position is at (or within a hair of) the bottom.
+///
+/// GPUI scroll offsets run from `0` at the top down to `-max_offset` at the
+/// bottom, and `max_offset` is a positive magnitude — so the bottom is the
+/// *most negative* offset the content allows, which is easy to get backwards.
+pub(crate) fn is_scrolled_to_bottom(offset_y: Pixels, max_offset_y: Pixels) -> bool {
+    const SLACK: Pixels = px(8.);
+    offset_y <= SLACK - max_offset_y
 }
 
 pub(crate) fn open_link(

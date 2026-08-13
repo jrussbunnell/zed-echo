@@ -12619,6 +12619,28 @@ pub(crate) mod tests {
         });
     }
 
+    #[test]
+    fn subagent_preview_sticks_to_the_bottom_only_when_it_is_there() {
+        use crate::conversation_view::thread_view::is_scrolled_to_bottom;
+
+        // Nothing to scroll: trivially at the bottom, so a new subagent starts
+        // following its own output.
+        assert!(is_scrolled_to_bottom(px(0.), px(0.)));
+
+        // Scrolled all the way down. Offsets run negative, so the bottom is
+        // the most negative offset — getting this backwards is the whole
+        // reason this is a function.
+        assert!(is_scrolled_to_bottom(px(-200.), px(200.)));
+        assert!(
+            is_scrolled_to_bottom(px(-195.), px(200.)),
+            "a few pixels of slack should still count as the bottom"
+        );
+
+        // Scrolled up to read something: output must not yank the view back.
+        assert!(!is_scrolled_to_bottom(px(0.), px(200.)));
+        assert!(!is_scrolled_to_bottom(px(-100.), px(200.)));
+    }
+
     #[gpui::test]
     async fn test_subagent_summaries_ignore_ordinary_tool_calls(cx: &mut TestAppContext) {
         init_test(cx);
