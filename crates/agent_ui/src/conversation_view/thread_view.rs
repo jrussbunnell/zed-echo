@@ -606,6 +606,10 @@ pub struct ThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    /// Finished subagents the user has cleared from the tray. Only ever
+    /// affects the tray: the subagent's card stays in the transcript and its
+    /// thread stays open.
+    dismissed_subagents: HashSet<acp::SessionId>,
     /// Starts expanded, unlike the other activity-bar sections: a subagent is
     /// work happening out of sight, so the point of the tray is that you don't
     /// have to go looking for it.
@@ -1361,6 +1365,7 @@ impl ThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            dismissed_subagents: HashSet::default(),
             subagents_expanded: true,
             queue_expanded: true,
             editor_expanded: false,
@@ -4950,7 +4955,7 @@ impl ThreadView {
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
 
-        let subagents = self.subagent_summaries(cx);
+        let subagents = self.visible_subagent_summaries(cx);
 
         if changed_buffers.is_empty()
             && plan.is_empty()
@@ -5343,6 +5348,45 @@ impl ThreadView {
             .unwrap_or_default()
     }
 
+    /// Where the current turn starts in this thread's transcript.
+    fn current_turn_start(&self, cx: &App) -> usize {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .unwrap_or(0)
+    }
+
+    /// The subagents the tray shows: everything still working, plus finished
+    /// ones from the current turn that haven't been cleared.
+    ///
+    /// A finished subagent from an earlier turn is history — its card is still
+    /// in the transcript where it was spawned, and its thread is still open —
+    /// so leaving it in the tray only crowds out the work actually in flight.
+    /// Anything still running stays regardless of how old it is; losing sight
+    /// of live work is the one thing the tray must not do.
+    pub(crate) fn visible_subagent_summaries(&self, cx: &App) -> Vec<SubagentSummary> {
+        let turn_start = self.current_turn_start(cx);
+        self.subagent_summaries(cx)
+            .into_iter()
+            .filter(|summary| {
+                summary.status.is_active()
+                    || (summary.parent_entry_index >= turn_start
+                        && !self.dismissed_subagents.contains(&summary.session_id))
+            })
+            .collect()
+    }
+
+    /// Drops `subagents` from the tray. Their cards stay in the transcript and
+    /// their threads stay open; this only tidies the tray.
+    pub(crate) fn clear_finished_subagents(
+        &mut self,
+        subagents: impl IntoIterator<Item = acp::SessionId>,
+    ) {
+        self.dismissed_subagents.extend(subagents);
+    }
+
     /// Opens a subagent: navigates into its thread when it has been loaded,
     /// and otherwise scrolls this transcript to the tool call that spawned it,
     /// which is where its output lands.
@@ -5376,6 +5420,12 @@ impl ThreadView {
     ) -> AnyElement {
         let counts = SubagentCounts::from_summaries(subagents);
         let expanded = self.subagents_expanded;
+        let finished: Vec<acp::SessionId> = subagents
+            .iter()
+            .filter(|summary| !summary.status.is_active())
+            .map(|summary| summary.session_id.clone())
+            .collect();
+        let has_finished = !finished.is_empty();
 
         let summary_row = h_flex()
             .id("subagents_summary")
@@ -5410,9 +5460,21 @@ impl ThreadView {
             .child(
                 Label::new(counts.summary_label())
                     .size(LabelSize::Small)
-                    .color(counts.summary_color())
-                    .mr_1(),
+                    .color(counts.summary_color()),
             )
+            .when(has_finished, |this| {
+                this.child(
+                    IconButton::new("clear-subagents", IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .shape(ui::IconButtonShape::Square)
+                        .tooltip(Tooltip::text("Clear Finished Subagents"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_finished_subagents(finished.clone());
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+            })
             .on_click(cx.listener(|this, _, _, cx| {
                 this.subagents_expanded = !this.subagents_expanded;
                 cx.notify();

@@ -12500,6 +12500,126 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_tray_drops_finished_subagents_once_the_turn_moves_on(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+
+        cx.update(|_window, cx| {
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "first turn".into(), cx);
+            })
+        });
+        upsert_spawn_tool_call(
+            &thread,
+            "task-done",
+            "Finished work",
+            &acp::SessionId::new("subagent-done"),
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &thread,
+            "task-running",
+            "Ongoing work",
+            &acp::SessionId::new("subagent-running"),
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        cx.run_until_parked();
+
+        let visible = |cx: &mut gpui::VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.visible_subagent_summaries(cx)
+                    .into_iter()
+                    .map(|summary| summary.label.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            visible(cx),
+            vec!["Finished work".to_string(), "Ongoing work".to_string()],
+            "within the turn that spawned them, both should be listed"
+        );
+
+        // A new turn begins. The finished one is history; the one still
+        // working must not disappear.
+        cx.update(|_window, cx| {
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "second turn".into(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            visible(cx),
+            vec!["Ongoing work".to_string()],
+            "a finished subagent from a previous turn should drop out of the tray"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_clearing_the_tray_keeps_running_subagents(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+
+        cx.update(|_window, cx| {
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "go".into(), cx);
+            })
+        });
+        upsert_spawn_tool_call(
+            &thread,
+            "task-done",
+            "Finished work",
+            &acp::SessionId::new("subagent-done"),
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &thread,
+            "task-running",
+            "Ongoing work",
+            &acp::SessionId::new("subagent-running"),
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        cx.run_until_parked();
+
+        thread_view.update(cx, |view, cx| {
+            let finished: Vec<_> = view
+                .visible_subagent_summaries(cx)
+                .into_iter()
+                .filter(|summary| !summary.status.is_active())
+                .map(|summary| summary.session_id)
+                .collect();
+            assert_eq!(finished.len(), 1);
+            view.clear_finished_subagents(finished);
+        });
+
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.visible_subagent_summaries(cx)
+                    .into_iter()
+                    .map(|summary| summary.label.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["Ongoing work".to_string()],
+                "clearing should take the finished rows and leave the running one"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_subagent_summaries_ignore_ordinary_tool_calls(cx: &mut TestAppContext) {
         init_test(cx);
 
