@@ -26,6 +26,7 @@ use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::message_editor::SharedSessionCapabilities;
+use crate::subagents::{SubagentCounts, SubagentStatus, SubagentSummary};
 use crate::ui::{
     SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip, TerminalSandboxWarning,
     TerminalToolHeader,
@@ -605,6 +606,10 @@ pub struct ThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    /// Starts expanded, unlike the other activity-bar sections: a subagent is
+    /// work happening out of sight, so the point of the tray is that you don't
+    /// have to go looking for it.
+    pub subagents_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
@@ -1356,6 +1361,7 @@ impl ThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            subagents_expanded: true,
             queue_expanded: true,
             editor_expanded: false,
             should_be_following: false,
@@ -4943,12 +4949,14 @@ impl ThreadView {
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
-        let has_awaiting_permission = awaiting_permission.is_some();
+
+        let subagents = self.subagent_summaries(cx);
 
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
-            && !has_awaiting_permission
+            && subagents.is_empty()
+            && awaiting_permission.is_none()
         {
             return None;
         }
@@ -4963,6 +4971,71 @@ impl ThreadView {
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
+
+        // Collected rather than chained so the dividers fall between the
+        // sections that actually rendered. Each section owns its own
+        // summary-plus-expansion pair.
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if let Some(awaiting_permission) = awaiting_permission {
+            sections.push(awaiting_permission);
+        }
+        if !subagents.is_empty() {
+            sections.push(self.render_subagents_section(&subagents, cx));
+        }
+        if !plan.is_empty() {
+            sections.push(
+                v_flex()
+                    .child(self.render_plan_summary(plan, window, cx))
+                    .when(plan_expanded, |parent| {
+                        parent.child(self.render_plan_entries(plan, window, cx))
+                    })
+                    .into_any_element(),
+            );
+        }
+        if !changed_buffers.is_empty() && thread.parent_session_id().is_none() {
+            sections.push(
+                v_flex()
+                    .child(self.render_edits_summary(
+                        &changed_buffers,
+                        edits_expanded,
+                        pending_edits,
+                        cx,
+                    ))
+                    .when(edits_expanded, |parent| {
+                        parent.child(self.render_edited_files(
+                            action_log,
+                            telemetry.clone(),
+                            &changed_buffers,
+                            pending_edits,
+                            cx,
+                        ))
+                    })
+                    .into_any_element(),
+            );
+        }
+        if !queue_is_empty {
+            sections.push(
+                v_flex()
+                    .child(self.render_message_queue_summary(window, cx))
+                    .when(queue_expanded, |parent| {
+                        parent.child(self.render_message_queue_entries(window, cx))
+                    })
+                    .into_any_element(),
+            );
+        }
+        if sections.is_empty() {
+            return None;
+        }
+
+        let last_section = sections.len() - 1;
+        let sections = sections.into_iter().enumerate().map(|(index, section)| {
+            v_flex()
+                .child(section)
+                .when(index < last_section, |this| {
+                    this.child(Divider::horizontal().color(DividerColor::Border))
+                })
+                .into_any_element()
+        });
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         // Drop shadows have no opaque surface to blend into on a transparent
@@ -4992,50 +5065,7 @@ impl ThreadView {
                                 .blur_radius(px(2.)),
                         ])
                     })
-                    .when_some(awaiting_permission, |this, element| this.child(element))
-                    .when(
-                        has_awaiting_permission
-                            && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
-                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
-                    )
-                    .when(!plan.is_empty(), |this| {
-                        this.child(self.render_plan_summary(plan, window, cx))
-                            .when(plan_expanded, |parent| {
-                                parent.child(self.render_plan_entries(plan, window, cx))
-                            })
-                    })
-                    .when(!plan.is_empty() && !changed_buffers.is_empty(), |this| {
-                        this.child(Divider::horizontal().color(DividerColor::Border))
-                    })
-                    .when(
-                        !changed_buffers.is_empty() && thread.parent_session_id().is_none(),
-                        |this| {
-                            this.child(self.render_edits_summary(
-                                &changed_buffers,
-                                edits_expanded,
-                                pending_edits,
-                                cx,
-                            ))
-                            .when(edits_expanded, |parent| {
-                                parent.child(self.render_edited_files(
-                                    action_log,
-                                    telemetry.clone(),
-                                    &changed_buffers,
-                                    pending_edits,
-                                    cx,
-                                ))
-                            })
-                        },
-                    )
-                    .when(!queue_is_empty, |this| {
-                        this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
-                            this.child(Divider::horizontal().color(DividerColor::Border))
-                        })
-                        .child(self.render_message_queue_summary(window, cx))
-                        .when(queue_expanded, |parent| {
-                            parent.child(self.render_message_queue_entries(window, cx))
-                        })
-                    }),
+                    .children(sections),
             )
             .into_any()
             .into()
@@ -5298,6 +5328,188 @@ impl ThreadView {
             .iter()
             .filter_map(|session_id| tool_calls_by_session.get(session_id).cloned())
             .collect()
+    }
+
+    /// The subagents this thread spawned, newest last. Empty for every agent
+    /// that doesn't report subagent session info on its spawn tool calls.
+    pub(crate) fn subagent_summaries(&self, cx: &App) -> Vec<SubagentSummary> {
+        self.server_view
+            .upgrade()
+            .map(|server_view| {
+                server_view
+                    .read(cx)
+                    .subagent_summaries_for_parent(&self.thread, cx)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Opens a subagent: navigates into its thread when it has been loaded,
+    /// and otherwise scrolls this transcript to the tool call that spawned it,
+    /// which is where its output lands.
+    fn open_subagent(
+        &mut self,
+        summary: &SubagentSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if summary.is_loaded {
+            let session_id = summary.session_id.clone();
+            self.server_view
+                .update(cx, |server_view, cx| {
+                    server_view.navigate_to_thread(session_id, window, cx);
+                })
+                .ok();
+            return;
+        }
+
+        self.list_state.scroll_to(ListOffset {
+            item_ix: summary.parent_entry_index,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+    }
+
+    fn render_subagents_section(
+        &self,
+        subagents: &[SubagentSummary],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let counts = SubagentCounts::from_summaries(subagents);
+        let expanded = self.subagents_expanded;
+
+        let summary_row = h_flex()
+            .id("subagents_summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(Disclosure::new("subagents_disclosure", expanded))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::ListTree)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Subagents")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(counts.total.to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                Label::new(counts.summary_label())
+                    .size(LabelSize::Small)
+                    .color(counts.summary_color())
+                    .mr_1(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.subagents_expanded = !this.subagents_expanded;
+                cx.notify();
+            }));
+
+        let entries = expanded.then(|| {
+            let entry_bg = cx.theme().colors().editor_background;
+            let last_index = subagents.len().saturating_sub(1);
+
+            v_flex()
+                .id("subagent_list")
+                .max_h_40()
+                .overflow_y_scroll()
+                .children(subagents.iter().enumerate().map(|(index, summary)| {
+                    let group = SharedString::from(format!("subagent-row-{index}"));
+                    let status = summary.status;
+                    let summary = summary.clone();
+
+                    h_flex()
+                        .id(("subagent_row", index))
+                        .group(&group)
+                        .cursor_pointer()
+                        .w_full()
+                        .min_w_0()
+                        .py_1()
+                        .pr_2()
+                        .gap_2()
+                        .justify_between()
+                        .bg(entry_bg)
+                        // A colored rail rather than a tinted row: it reads as
+                        // status at a glance without fighting the label for
+                        // contrast, and stacks legibly when several run at once.
+                        .border_l_2()
+                        .border_color(status.color().color(cx))
+                        .when(index < last_index, |this| {
+                            this.border_b_1().border_color(cx.theme().colors().border)
+                        })
+                        .hover(|s| s.bg(cx.theme().colors().element_hover))
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1p5()
+                                .pl_1p5()
+                                .child(if status == SubagentStatus::Running {
+                                    Icon::new(status.icon())
+                                        .size(IconSize::Small)
+                                        .color(status.color())
+                                        .with_rotate_animation(2)
+                                        .into_any_element()
+                                } else {
+                                    Icon::new(status.icon())
+                                        .size(IconSize::Small)
+                                        .color(status.color())
+                                        .into_any_element()
+                                })
+                                .child(
+                                    Label::new(summary.label.clone())
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .child(
+                                    Label::new(status.label())
+                                        .size(LabelSize::XSmall)
+                                        .color(status.color()),
+                                )
+                                .child(
+                                    div().visible_on_hover(&group).child(
+                                        Icon::new(IconName::ForwardArrowUp)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                ),
+                        )
+                        .tooltip({
+                            let label = summary.label.clone();
+                            let action = if summary.is_loaded {
+                                "Open Subagent Thread"
+                            } else {
+                                "Go to Spawn Point"
+                            };
+                            move |_, cx| Tooltip::with_meta(label.clone(), None, action, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_subagent(&summary, window, cx);
+                        }))
+                }))
+        });
+
+        v_flex()
+            .child(summary_row)
+            .children(entries)
+            .into_any_element()
     }
 
     fn render_subagents_awaiting_permission(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -15293,7 +15505,10 @@ mod tests {
             .as_array()
             .expect("the capture is a list of updates")
         {
-            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            let id = update["toolCallId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let index = match calls.iter().position(|(seen, _)| *seen == id) {
                 Some(index) => index,
                 None => {
@@ -15302,7 +15517,14 @@ mod tests {
                 }
             };
             let merged = &mut calls[index].1;
-            for key in ["kind", "title", "rawInput", "rawOutput", "status", "locations"] {
+            for key in [
+                "kind",
+                "title",
+                "rawInput",
+                "rawOutput",
+                "status",
+                "locations",
+            ] {
                 if let Some(value) = update.get(key) {
                     merged[key] = value.clone();
                 }

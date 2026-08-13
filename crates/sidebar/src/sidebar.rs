@@ -18,8 +18,9 @@ use agent_ui::threads_archive_view::{
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
     ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
-    ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
+    NewThread, RenameSelectedThread, SubagentCounts, SubagentStatus, SubagentSummary, TerminalId,
+    ThreadId, ThreadImportModal, ThreadTitleRegenerationResult, channels_with_threads,
+    import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
@@ -359,6 +360,28 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// Subagents this thread has spawned, in spawn order. Only populated for
+    /// threads currently loaded in an agent panel: subagent sessions are never
+    /// written to [`ThreadMetadataStore`], so a thread that hasn't been opened
+    /// this session has no subagents to show until it is.
+    subagents: Vec<SubagentEntry>,
+}
+
+/// One subagent row nested under its parent thread in the sidebar.
+#[derive(Clone)]
+struct SubagentEntry {
+    summary: SubagentSummary,
+    /// Whether the panel is currently showing this subagent's thread.
+    ///
+    /// Tracked here rather than through [`ActiveEntry`], which is keyed on
+    /// [`ThreadId`]: a subagent has no thread id, so navigating into one leaves
+    /// the panel's active thread id pointing at the parent and the sidebar
+    /// would otherwise highlight the parent row instead.
+    is_active: bool,
+    /// The conversation that owns the subagent, used to navigate into it
+    /// without re-resolving the panel.
+    conversation_view: WeakEntity<agent_ui::ConversationView>,
+    workspace: Entity<Workspace>,
 }
 
 #[derive(Clone)]
@@ -401,6 +424,9 @@ enum ListEntry {
         has_threads: bool,
     },
     Thread(Arc<ThreadEntry>),
+    /// A subagent nested directly beneath the [`ListEntry::Thread`] that
+    /// spawned it. Only present while its parent is expanded.
+    Subagent(SubagentEntry),
     Terminal(TerminalEntry),
 }
 
@@ -425,7 +451,10 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            // A subagent isn't independently activatable: opening one means
+            // opening its parent thread and then navigating within it, which
+            // `Sidebar::open_subagent` does.
+            ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
 }
@@ -435,6 +464,7 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
+            ListEntry::Subagent(subagent) => Some(&subagent.summary.session_id),
             ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
@@ -449,6 +479,7 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(ws) => vec![ws.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::Subagent(subagent) => vec![subagent.workspace.clone()],
             ListEntry::Terminal(terminal) => match &terminal.workspace {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
@@ -495,6 +526,7 @@ enum EntryShape {
         is_collapsed: bool,
     },
     Thread(ThreadId),
+    Subagent(acp::SessionId),
     Terminal(TerminalId),
 }
 
@@ -746,6 +778,10 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    /// Threads whose subagent rows are currently shown. Deliberately not
+    /// persisted: a thread's subagents only exist while it is loaded, so a
+    /// remembered expansion would restore to nothing.
+    expanded_subagent_parents: HashSet<ThreadId>,
     renaming_thread_id: Option<ThreadId>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
@@ -897,6 +933,7 @@ impl Sidebar {
             selection: None,
             active_entry: None,
             hovered_thread_index: None,
+            expanded_subagent_parents: HashSet::default(),
             renaming_thread_id: None,
             regenerating_titles: HashSet::new(),
             suppress_next_rename_edit: false,
@@ -1552,6 +1589,12 @@ impl Sidebar {
                 .iter()
                 .flat_map(|ws| all_thread_infos_for_workspace(ws, cx));
 
+            let subagents_by_root_session: HashMap<acp::SessionId, Vec<SubagentEntry>> =
+                group_workspaces
+                    .iter()
+                    .flat_map(|ws| subagents_for_workspace(ws, cx))
+                    .collect();
+
             let mut threads: Vec<Arc<ThreadEntry>> = Vec::new();
             let mut has_running_threads = false;
             let mut waiting_thread_count: usize = 0;
@@ -1582,6 +1625,7 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            subagents: Vec::new(),
                         })
                     };
 
@@ -1723,7 +1767,10 @@ impl Sidebar {
                             let status = info.status;
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
-                            new_live_statuses.insert(session_id, (status, thread_id));
+                            new_live_statuses.insert(session_id.clone(), (status, thread_id));
+                        }
+                        if let Some(subagents) = subagents_by_root_session.get(&session_id) {
+                            Arc::make_mut(thread).subagents = subagents.clone();
                         }
                     }
 
@@ -1897,6 +1944,7 @@ impl Sidebar {
                     &mut entries,
                     matched_terminals,
                     matched_threads,
+                    &self.expanded_subagent_parents,
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
@@ -1947,6 +1995,7 @@ impl Sidebar {
                     &mut entries,
                     terminals,
                     threads,
+                    &self.expanded_subagent_parents,
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
@@ -1954,6 +2003,18 @@ impl Sidebar {
         }
 
         notified_threads.retain(|id| current_thread_ids.contains(id));
+        // Forget the expansion only for a thread we can see has no subagents
+        // left, so its toggle doesn't come back already open. Threads that are
+        // merely out of view — in a collapsed group, or filtered out by the
+        // search box — keep their state.
+        self.expanded_subagent_parents.retain(|thread_id| {
+            !entries.iter().any(|entry| match entry {
+                ListEntry::Thread(thread) => {
+                    thread.metadata.thread_id == *thread_id && thread.subagents.is_empty()
+                }
+                _ => false,
+            })
+        });
 
         self.thread_last_accessed
             .retain(|id, _| current_thread_ids.contains(id));
@@ -2066,6 +2127,9 @@ impl Sidebar {
                     .unwrap_or(false),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
+            ListEntry::Subagent(subagent) => {
+                EntryShape::Subagent(subagent.summary.session_id.clone())
+            }
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
         })
     }
@@ -2215,6 +2279,9 @@ impl Sidebar {
                 )
             }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
+            ListEntry::Subagent(subagent) => {
+                self.render_subagent(ix, subagent, subagent.is_active, is_selected, cx)
+            }
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
@@ -3553,6 +3620,10 @@ impl Sidebar {
                     }
                 }
             }
+            ListEntry::Subagent(subagent) => {
+                let subagent = subagent.clone();
+                self.open_subagent(&subagent, window, cx);
+            }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
@@ -4287,6 +4358,15 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
+            Some(ListEntry::Subagent(_)) => {
+                if let Some(parent_ix) = (0..ix)
+                    .rev()
+                    .find(|&i| matches!(self.contents.entries.get(i), Some(ListEntry::Thread(_))))
+                {
+                    self.selection = Some(parent_ix);
+                    cx.notify();
+                }
+            }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
@@ -4314,12 +4394,14 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Subagent(_) | ListEntry::Terminal(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
@@ -5708,6 +5790,7 @@ impl Sidebar {
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
         threads: Vec<Arc<ThreadEntry>>,
+        expanded_subagent_parents: &HashSet<agent_ui::ThreadId>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
     ) {
@@ -5718,7 +5801,9 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                // Subagents are inserted directly beneath their parent below,
+                // never sorted on their own.
+                ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
 
@@ -5729,13 +5814,18 @@ impl Sidebar {
             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
 
         for entry in row_entries {
+            let mut subagents = Vec::new();
             if let ListEntry::Thread(thread) = &entry {
                 if let Some(session_id) = &thread.metadata.session_id {
                     current_session_ids.insert(session_id.clone());
                 }
                 current_thread_ids.insert(thread.metadata.thread_id);
+                if expanded_subagent_parents.contains(&thread.metadata.thread_id) {
+                    subagents = thread.subagents.clone();
+                }
             }
             entries.push(entry);
+            entries.extend(subagents.into_iter().map(ListEntry::Subagent));
         }
     }
 
@@ -5776,6 +5866,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::Subagent(_) => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6160,6 +6251,8 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        let subagent_counts = subagent_counts(&thread.subagents);
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
@@ -6172,6 +6265,7 @@ impl Sidebar {
                 this.custom_icon_from_external_svg(svg)
             })
             .worktrees(worktrees)
+            .subagents(subagent_counts.total, subagent_counts.summary_color())
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
@@ -6216,6 +6310,8 @@ impl Sidebar {
                 )
             })
             .when(is_hovered && !is_renaming, |this| {
+                let subagent_toggle = self.render_subagent_toggle(ix, thread, cx);
+
                 let rename_button = IconButton::new(("rename-thread", ix), IconName::Pencil)
                     .icon_size(IconSize::Small)
                     .tooltip({
@@ -6304,6 +6400,7 @@ impl Sidebar {
                 this.action_slot(
                     h_flex()
                         .gap_0p5()
+                        .children(subagent_toggle)
                         .child(rename_button)
                         .when_some(contextual_action, |this, action| this.child(action)),
                 )
@@ -6352,6 +6449,18 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
+        // The hover toggle is mouse-only; the same action belongs in the menu
+        // so subagents are reachable from the keyboard.
+        let subagent_menu_label = (!thread.subagents.is_empty()).then(|| {
+            if self
+                .expanded_subagent_parents
+                .contains(&thread.metadata.thread_id)
+            {
+                format!("Hide {} Subagents", subagent_counts.total)
+            } else {
+                format!("Show {} Subagents", subagent_counts.total)
+            }
+        });
 
         right_click_menu(context_menu_id)
             .trigger(move |_, _, _| thread_item)
@@ -6367,7 +6476,25 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
+                    let subagent_menu_label = subagent_menu_label.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
+                        if let Some(label) = subagent_menu_label.clone() {
+                            menu = menu.entry(label, None, {
+                                let sidebar = sidebar.clone();
+                                move |_window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            if !sidebar.expanded_subagent_parents.remove(&thread_id)
+                                            {
+                                                sidebar.expanded_subagent_parents.insert(thread_id);
+                                            }
+                                            sidebar.update_entries(cx);
+                                        })
+                                        .ok();
+                                }
+                            });
+                        }
+
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
                             let rename_title = rename_title.clone();
@@ -6460,6 +6587,179 @@ impl Sidebar {
                 }
             })
             .into_any_element()
+    }
+
+    /// The show/hide-subagents button, shown left of the rename pencil for any
+    /// thread that has spawned subagents. `None` for every other thread, so the
+    /// hover controls stay unchanged in the common case.
+    fn render_subagent_toggle(
+        &self,
+        ix: usize,
+        thread: &ThreadEntry,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if thread.subagents.is_empty() {
+            return None;
+        }
+
+        let thread_id = thread.metadata.thread_id;
+        let expanded = self.expanded_subagent_parents.contains(&thread_id);
+        let counts = subagent_counts(&thread.subagents);
+        let tooltip = format!(
+            "{} Subagents ({})",
+            if expanded { "Hide" } else { "Show" },
+            counts.summary_label()
+        );
+
+        Some(
+            IconButton::new(("toggle-subagents", ix), IconName::ListTree)
+                .icon_size(IconSize::Small)
+                .icon_color(counts.summary_color())
+                .toggle_state(expanded)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if !this.expanded_subagent_parents.remove(&thread_id) {
+                        this.expanded_subagent_parents.insert(thread_id);
+                    }
+                    this.update_entries(cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// A subagent row, nested under the thread that spawned it.
+    ///
+    /// Deliberately not a [`ThreadItem`]: a subagent has no timestamp, no
+    /// worktree, no rename, and no archive, and rendering it at full thread
+    /// weight would make a parent with five subagents dominate the list. It
+    /// gets a single short line, indented under its parent, with a status-colored
+    /// rail on the left — the same rail the agent panel's subagent tray uses, so
+    /// the two views read as the same thing.
+    fn render_subagent(
+        &self,
+        ix: usize,
+        subagent: &SubagentEntry,
+        is_active: bool,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let status = subagent.summary.status;
+        let label = subagent.summary.label.clone();
+        let colors = cx.theme().colors();
+        let rail_color = status.color().color(cx);
+
+        let status_icon = if status == SubagentStatus::Running {
+            Icon::new(status.icon())
+                .size(IconSize::XSmall)
+                .color(status.color())
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else {
+            Icon::new(status.icon())
+                .size(IconSize::XSmall)
+                .color(status.color())
+                .into_any_element()
+        };
+
+        h_flex()
+            .id(("subagent-entry", ix))
+            .group("subagent-item")
+            .w_full()
+            .min_w_0()
+            .h(rems_from_px(22.))
+            .cursor_pointer()
+            // Indented to line up under the parent's title, past its agent icon.
+            .pl(rems_from_px(18.))
+            .pr_1p5()
+            .gap_1p5()
+            .justify_between()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .when(is_active, |this| this.bg(colors.element_active))
+            .when(is_selected, |this| this.border_color(colors.border_focused))
+            .hover(|style| style.bg(colors.element_hover))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(2.))
+                            .h(rems_from_px(14.))
+                            .rounded_full()
+                            .bg(rail_color),
+                    )
+                    .child(status_icon)
+                    .child(
+                        Label::new(label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                Label::new(status.label())
+                    .size(LabelSize::XSmall)
+                    .color(status.color())
+                    .flex_shrink_0(),
+            )
+            .tooltip(Tooltip::element(move |_, _| {
+                v_flex()
+                    .gap_0p5()
+                    .child(Label::new(label.clone()))
+                    .child(
+                        Label::new(format!("Subagent · {}", status.label()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }))
+            .on_click({
+                let subagent = subagent.clone();
+                cx.listener(move |this, _, window, cx| {
+                    this.open_subagent(&subagent, window, cx);
+                })
+            })
+            .into_any_element()
+    }
+
+    /// Focuses the agent panel on `subagent`'s parent conversation and then
+    /// navigates it to the subagent's own thread.
+    fn open_subagent(
+        &mut self,
+        subagent: &SubagentEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation_view) = subagent.conversation_view.upgrade() else {
+            return;
+        };
+
+        let workspace = subagent.workspace.clone();
+        if let Some(metadata) =
+            conversation_view
+                .read(cx)
+                .root_session_id()
+                .and_then(|session_id| {
+                    ThreadMetadataStore::global(cx)
+                        .read(cx)
+                        .entry_by_session(session_id)
+                        .cloned()
+                })
+        {
+            self.activate_thread(metadata, &workspace, false, window, cx);
+        } else {
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            });
+        }
+
+        let session_id = subagent.summary.session_id.clone();
+        conversation_view.update(cx, |conversation_view, cx| {
+            conversation_view.navigate_to_thread(session_id, window, cx);
+        });
     }
 
     fn render_terminal(
@@ -7131,7 +7431,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => {}
         }
     }
 
@@ -7960,6 +8260,58 @@ fn all_thread_infos_for_workspace(
         });
 
     Some(threads).into_iter().flatten()
+}
+
+fn subagent_counts(subagents: &[SubagentEntry]) -> SubagentCounts {
+    SubagentCounts::from_statuses(subagents.iter().map(|subagent| subagent.summary.status))
+}
+
+/// The subagents of every thread loaded in `workspace`'s agent panel, keyed by
+/// the root session that spawned them.
+///
+/// Subagent sessions are never persisted to [`ThreadMetadataStore`], so this
+/// live sweep is the only source: a thread that hasn't been opened in this
+/// session lists no subagents until it is.
+fn subagents_for_workspace(
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> Vec<(acp::SessionId, Vec<SubagentEntry>)> {
+    let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+        return Vec::new();
+    };
+
+    let agent_panel = agent_panel.read(cx);
+    let active_conversation_view = agent_panel.active_conversation_view().cloned();
+
+    agent_panel
+        .conversation_views()
+        .into_iter()
+        .filter_map(|conversation_view| {
+            let root_session_id = conversation_view.read(cx).root_session_id()?.clone();
+            let summaries = conversation_view.read(cx).root_subagent_summaries(cx);
+            if summaries.is_empty() {
+                return None;
+            }
+            // Only the panel's foreground conversation can be showing a
+            // subagent; a retained background conversation is not on screen
+            // whatever it has navigated to.
+            let active_session_id = active_conversation_view
+                .as_ref()
+                .filter(|active| active.entity_id() == conversation_view.entity_id())
+                .and_then(|active| active.read(cx).active_thread())
+                .map(|thread_view| thread_view.read(cx).session_id.clone());
+            let entries = summaries
+                .into_iter()
+                .map(|summary| SubagentEntry {
+                    is_active: active_session_id.as_ref() == Some(&summary.session_id),
+                    summary,
+                    conversation_view: conversation_view.downgrade(),
+                    workspace: workspace.clone(),
+                })
+                .collect();
+            Some((root_session_id, entries))
+        })
+        .collect()
 }
 
 pub fn dump_workspace_info(

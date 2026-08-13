@@ -181,6 +181,12 @@ fn assert_remote_project_integration_sidebar_state(
                     title
                 );
             }
+            ListEntry::Subagent(subagent) => {
+                panic!(
+                    "unexpected sidebar subagent while simulating remote project integration flicker: label=`{}`",
+                    subagent.summary.label
+                );
+            }
             ListEntry::Terminal(terminal) => {
                 panic!(
                     "unexpected sidebar terminal while simulating remote project integration flicker: title=`{}`",
@@ -591,6 +597,11 @@ fn visible_entries_as_strings(
                             };
                             format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
                         }
+                    }
+                    ListEntry::Subagent(subagent) => {
+                        let label = &subagent.summary.label;
+                        let status = subagent.summary.status.label();
+                        format!("    ↳ {label} [{status}]{selected}")
                     }
                     ListEntry::Terminal(terminal) => {
                         let title = terminal.metadata.display_title();
@@ -1094,6 +1105,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            subagents: Vec::new(),
         }))
     };
 
@@ -1186,6 +1198,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                subagents: Vec::new(),
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1213,6 +1226,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                subagents: Vec::new(),
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1240,6 +1254,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                subagents: Vec::new(),
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -1268,6 +1283,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                subagents: Vec::new(),
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -1296,6 +1312,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                subagents: Vec::new(),
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {
@@ -4061,6 +4078,230 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     assert_eq!(parent_status, AgentThreadStatus::WaitingForConfirmation);
 }
 
+/// Records a `spawn_agent`-shaped tool call on `parent_thread`, which is what
+/// makes a subagent visible to the sidebar.
+fn record_spawn_tool_call(
+    parent_thread: &Entity<AcpThread>,
+    tool_call_id: &str,
+    title: &str,
+    subagent_session_id: &acp::SessionId,
+    status: acp::ToolCallStatus,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let session_info = acp_thread::SubagentSessionInfo {
+        session_id: subagent_session_id.clone(),
+        message_start_index: 0,
+        message_end_index: None,
+    };
+    cx.update(|_, cx| {
+        parent_thread.update(cx, |thread, cx| {
+            thread
+                .upsert_tool_call(
+                    acp::ToolCall::new(acp::ToolCallId::new(tool_call_id), title)
+                        .status(status)
+                        .meta(acp::Meta::from_iter([(
+                            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                            serde_json::json!(&session_info),
+                        )])),
+                    cx,
+                )
+                .unwrap();
+        })
+    });
+    cx.run_until_parked();
+}
+
+fn subagent_rows(sidebar: &Sidebar) -> Vec<(SharedString, SubagentStatus)> {
+    sidebar
+        .contents
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ListEntry::Subagent(subagent) => {
+                Some((subagent.summary.label.clone(), subagent.summary.status))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+async fn test_sidebar_toggles_subagent_rows_under_their_parent(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+
+    let parent_session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&parent_session_id, &project, cx).await;
+
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    let subagent_session_id = acp::SessionId::new("subagent-session");
+    record_spawn_tool_call(
+        &parent_thread,
+        "spawn-1",
+        "Research alternatives",
+        &subagent_session_id,
+        acp::ToolCallStatus::InProgress,
+        cx,
+    );
+
+    let parent_thread_id = sidebar.read_with(cx, |sidebar, _cx| {
+        let thread = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&parent_session_id) =>
+                {
+                    Some(thread.clone())
+                }
+                _ => None,
+            })
+            .expect("expected the parent thread in the sidebar");
+        assert_eq!(
+            thread.subagents.len(),
+            1,
+            "the parent thread should know about its subagent"
+        );
+        thread.metadata.thread_id
+    });
+
+    assert!(
+        sidebar.read_with(cx, |sidebar, _cx| subagent_rows(sidebar).is_empty()),
+        "subagent rows should stay hidden until the parent is expanded"
+    );
+
+    // Hovering the parent is what reveals the show/hide button, so draw that
+    // state too: it is the only path that builds the toggle.
+    let parent_row_index = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&parent_session_id))
+            })
+            .expect("expected the parent thread in the sidebar")
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.hovered_thread_index = Some(parent_row_index);
+        sidebar.expanded_subagent_parents.insert(parent_thread_id);
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_eq!(
+            subagent_rows(sidebar),
+            vec![("Research alternatives".into(), SubagentStatus::Running)],
+        );
+
+        let parent_index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&parent_session_id))
+            })
+            .expect("expected the parent thread in the sidebar");
+        assert!(
+            matches!(
+                sidebar.contents.entries.get(parent_index + 1),
+                Some(ListEntry::Subagent(_))
+            ),
+            "the subagent row should sit directly beneath its parent"
+        );
+    });
+
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.expanded_subagent_parents.remove(&parent_thread_id);
+        sidebar.update_entries(cx);
+    });
+
+    assert!(
+        sidebar.read_with(cx, |sidebar, _cx| subagent_rows(sidebar).is_empty()),
+        "collapsing the parent should remove its subagent rows again"
+    );
+}
+
+#[gpui::test]
+async fn test_sidebar_subagent_rows_follow_the_spawn_tool_call_status(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+
+    let parent_session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&parent_session_id, &project, cx).await;
+
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    let subagent_session_id = acp::SessionId::new("subagent-session");
+    record_spawn_tool_call(
+        &parent_thread,
+        "spawn-1",
+        "Research alternatives",
+        &subagent_session_id,
+        acp::ToolCallStatus::InProgress,
+        cx,
+    );
+
+    let parent_thread_id = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&parent_session_id) =>
+                {
+                    Some(thread.metadata.thread_id)
+                }
+                _ => None,
+            })
+            .expect("expected the parent thread in the sidebar")
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.expanded_subagent_parents.insert(parent_thread_id);
+        sidebar.update_entries(cx);
+    });
+
+    // The subagent finishing is reported by the spawning tool call completing,
+    // which is what has to drive the row back out of "Running".
+    record_spawn_tool_call(
+        &parent_thread,
+        "spawn-1",
+        "Research alternatives",
+        &subagent_session_id,
+        acp::ToolCallStatus::Completed,
+        cx,
+    );
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_eq!(
+            subagent_rows(sidebar),
+            vec![("Research alternatives".into(), SubagentStatus::Completed)],
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_background_thread_completion_triggers_notification(cx: &mut TestAppContext) {
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
@@ -5073,7 +5314,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Subagent(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5159,7 +5402,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Subagent(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5198,7 +5443,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Subagent(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7240,6 +7487,12 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                     panic!(
                         "unexpected sidebar thread while opening linked worktree thread: title=`{}`, worktree=`{}`",
                         title, worktree_name
+                    );
+                }
+                ListEntry::Subagent(subagent) => {
+                    panic!(
+                        "unexpected sidebar subagent while opening linked worktree thread: label=`{}`",
+                        subagent.summary.label
                     );
                 }
                 ListEntry::Terminal(terminal) => {

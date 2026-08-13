@@ -45,6 +45,7 @@ use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use crate::message_editor::SessionCapabilities;
+use crate::subagents::SubagentSummary;
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
 use rope::Point;
@@ -330,6 +331,42 @@ impl Conversation {
         });
         self.subscriptions.push(subscription);
         self.threads.insert(session_id, thread);
+    }
+
+    /// Every subagent spawned by `parent_thread`, in spawn order.
+    ///
+    /// Only direct children are listed; a subagent that spawns its own
+    /// subagents lists those under itself.
+    ///
+    /// Takes the parent thread rather than a session id on purpose: a
+    /// [`ThreadView`] calls this from inside its own `render`, where its entity
+    /// is leased, so the parent handle has to come from the caller.
+    pub fn subagent_summaries_for_parent(
+        &self,
+        parent_thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> Vec<SubagentSummary> {
+        parent_thread
+            .read(cx)
+            .subagent_tool_calls()
+            .map(|(entry_index, tool_call, info)| {
+                let label = tool_call.label.read(cx).source().trim();
+                let label = if label.is_empty() {
+                    SharedString::from("Subagent")
+                } else {
+                    SharedString::from(label.to_string())
+                };
+                SubagentSummary::from_tool_call(
+                    entry_index,
+                    label,
+                    info.session_id.clone(),
+                    &tool_call.status,
+                    self.threads.get(&info.session_id),
+                    self.pending_tool_call_count_for_session(&info.session_id),
+                    cx,
+                )
+            })
+            .collect()
     }
 
     pub fn permission_options_for_tool_call<'a>(
@@ -665,6 +702,10 @@ impl ConversationView {
             .map(|view| view.read(cx).thread.clone())
     }
 
+    pub fn root_session_id(&self) -> Option<&acp::SessionId> {
+        self.root_session_id.as_ref()
+    }
+
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {
         self.root_session_id
             .as_ref()
@@ -674,6 +715,31 @@ impl ConversationView {
     pub fn thread_view(&self, session_id: &acp::SessionId) -> Option<Entity<ThreadView>> {
         let connected = self.as_connected()?;
         connected.threads.get(session_id).cloned()
+    }
+
+    /// Every subagent spawned by `parent_thread`. See
+    /// [`Conversation::subagent_summaries_for_parent`].
+    pub fn subagent_summaries_for_parent(
+        &self,
+        parent_thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> Vec<SubagentSummary> {
+        self.as_connected()
+            .map(|connected| {
+                connected
+                    .conversation
+                    .read(cx)
+                    .subagent_summaries_for_parent(parent_thread, cx)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Subagents of this conversation's root thread.
+    pub fn root_subagent_summaries(&self, cx: &App) -> Vec<SubagentSummary> {
+        let Some(root_thread) = self.root_thread(cx) else {
+            return Vec::new();
+        };
+        self.subagent_summaries_for_parent(&root_thread, cx)
     }
 
     pub fn as_connected(&self) -> Option<&ConnectedServerState> {
@@ -3686,6 +3752,7 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::subagents::{SubagentCounts, SubagentStatus};
     use acp_thread::StubAgentConnection;
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
@@ -11954,6 +12021,263 @@ pub(crate) mod tests {
         });
     }
 
+    fn upsert_spawn_tool_call(
+        parent_thread: &Entity<AcpThread>,
+        tool_call_id: &str,
+        title: &str,
+        subagent_session_id: &acp::SessionId,
+        status: acp::ToolCallStatus,
+        cx: &mut TestAppContext,
+    ) {
+        let session_info = acp_thread::SubagentSessionInfo {
+            session_id: subagent_session_id.clone(),
+            message_start_index: 0,
+            message_end_index: None,
+        };
+        cx.update(|cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_tool_call(
+                        acp::ToolCall::new(acp::ToolCallId::new(tool_call_id), title)
+                            .status(status)
+                            .meta(acp::Meta::from_iter([(
+                                acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                serde_json::json!(&session_info),
+                            )])),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_summaries_track_spawn_order_and_status(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        let waiting_session_id = acp::SessionId::new("subagent-waiting");
+        let running_session_id = acp::SessionId::new("subagent-running");
+        let queued_session_id = acp::SessionId::new("subagent-queued");
+        let done_session_id = acp::SessionId::new("subagent-done");
+        let failed_session_id = acp::SessionId::new("subagent-failed");
+
+        let (parent_thread, waiting_thread, running_thread, conversation) = cx.update(|cx| {
+            let parent_thread =
+                create_test_acp_thread(None, "parent", connection.clone(), project.clone(), cx);
+            let waiting_thread = create_test_acp_thread(
+                Some(acp::SessionId::new("parent")),
+                "subagent-waiting",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let running_thread = create_test_acp_thread(
+                Some(acp::SessionId::new("parent")),
+                "subagent-running",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let queued_thread = create_test_acp_thread(
+                Some(acp::SessionId::new("parent")),
+                "subagent-queued",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(parent_thread.clone(), cx);
+                conversation.register_thread(waiting_thread.clone(), cx);
+                conversation.register_thread(running_thread.clone(), cx);
+                conversation.register_thread(queued_thread.clone(), cx);
+                conversation
+            });
+            (parent_thread, waiting_thread, running_thread, conversation)
+        });
+
+        // The running subagent has already taken its prompt; the queued one
+        // has been created but has nothing in it yet.
+        cx.update(|cx| {
+            running_thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "Do the thing".into(), cx);
+            })
+        });
+
+        // Spawn order, not status order, is what the tray shows.
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-1",
+            "Audit error handling",
+            &done_session_id,
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-2",
+            "Migrate call sites",
+            &waiting_session_id,
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-3",
+            "Research alternatives",
+            &running_session_id,
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-4",
+            "Rewrite the parser",
+            &failed_session_id,
+            acp::ToolCallStatus::Failed,
+            cx,
+        );
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-5",
+            "Check the docs",
+            &queued_session_id,
+            acp::ToolCallStatus::Pending,
+            cx,
+        );
+
+        let _waiting_task =
+            request_test_tool_authorization(&waiting_thread, "subagent-tc", "allow-subagent", cx);
+
+        cx.read(|cx| {
+            let summaries = conversation
+                .read(cx)
+                .subagent_summaries_for_parent(&parent_thread, cx);
+
+            assert_eq!(
+                summaries
+                    .iter()
+                    .map(|summary| (summary.label.as_ref(), summary.status))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("Audit error handling", SubagentStatus::Completed),
+                    // Blocked on the user, even though its tool call is still
+                    // reported as in-progress.
+                    ("Migrate call sites", SubagentStatus::AwaitingApproval),
+                    ("Research alternatives", SubagentStatus::Running),
+                    // Terminal tool-call status wins over the unloaded thread.
+                    ("Rewrite the parser", SubagentStatus::Failed),
+                    // Spawned but with an empty transcript: not running yet.
+                    ("Check the docs", SubagentStatus::Pending),
+                ]
+            );
+
+            assert_eq!(summaries[1].pending_permission_count, 1);
+            assert!(
+                summaries[0].parent_entry_index < summaries[3].parent_entry_index,
+                "summaries should carry the spawn tool call's transcript position"
+            );
+            assert!(
+                !summaries[3].is_loaded,
+                "a subagent whose thread was never loaded is still listed"
+            );
+
+            let counts = SubagentCounts::from_summaries(&summaries);
+            assert_eq!(counts.total, 5);
+            assert_eq!(counts.running, 2);
+            assert_eq!(counts.awaiting_approval, 1);
+            assert_eq!(counts.failed, 1);
+            assert_eq!(counts.summary_label(), "1 Need Approval");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_view_surfaces_its_own_subagents(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        // Put the view on screen: the tray renders from inside
+        // `ThreadView::render`, where the thread view's own entity is leased,
+        // so only a real draw proves it can read back through its parent.
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let parent_thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+
+        assert!(
+            thread_view.read_with(cx, |view, cx| view.subagent_summaries(cx).is_empty()),
+            "a thread with no spawn tool calls has no subagents"
+        );
+
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "spawn-1",
+            "Research alternatives",
+            &acp::SessionId::new("subagent-session"),
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        // Draw the panel with the subagent present: the tray renders from
+        // inside `ThreadView::render`, where its own entity is leased.
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            let summaries = view.subagent_summaries(cx);
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].label.as_ref(), "Research alternatives");
+            assert_eq!(summaries[0].status, SubagentStatus::Running);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_summaries_ignore_ordinary_tool_calls(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        let (parent_thread, conversation) = cx.update(|cx| {
+            let parent_thread =
+                create_test_acp_thread(None, "parent", connection.clone(), project.clone(), cx);
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(parent_thread.clone(), cx);
+                conversation
+            });
+            (parent_thread, conversation)
+        });
+
+        cx.update(|cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_tool_call(
+                        acp::ToolCall::new(acp::ToolCallId::new("read-file"), "Read main.rs")
+                            .status(acp::ToolCallStatus::Completed),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+
+        cx.read(|cx| {
+            assert!(
+                conversation
+                    .read(cx)
+                    .subagent_summaries_for_parent(&parent_thread, cx)
+                    .is_empty(),
+                "only tool calls carrying subagent session info are subagents"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_conversation_subagent_scoped_pending_tool_call(cx: &mut TestAppContext) {
         init_test(cx);
@@ -13109,10 +13433,12 @@ pub(crate) mod tests {
         update(
             acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                 acp::ToolCallId::new("toolu_01LdeLBUQxPp2ir5aY8qkpwD"),
-                acp::ToolCallUpdateFields::new().title(command).raw_input(json!({
-                    "command": command,
-                    "description": "Test robots.txt with hostname override and Host header",
-                })),
+                acp::ToolCallUpdateFields::new()
+                    .title(command)
+                    .raw_input(json!({
+                        "command": command,
+                        "description": "Test robots.txt with hostname override and Host header",
+                    })),
             )),
             cx,
         );
@@ -13301,7 +13627,9 @@ pub(crate) mod tests {
             .expect("a new call is new activity");
         assert_eq!(span.tool_calls, 1, "and only the new call is in it");
         assert!(
-            span.activity.iter().any(|line| line.contains("built in 4s")),
+            span.activity
+                .iter()
+                .any(|line| line.contains("built in 4s")),
             "{:?}",
             span.activity
         );
@@ -13336,9 +13664,8 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
-        connection.set_next_prompt_updates(read_aloud_narration_updates(
-            &read_aloud_long_message(),
-        ));
+        connection
+            .set_next_prompt_updates(read_aloud_narration_updates(&read_aloud_long_message()));
         thread
             .update(cx, |thread, cx| thread.send_raw("Do a thing", cx))
             .await
@@ -13480,9 +13807,7 @@ pub(crate) mod tests {
     /// reported. Pressing *while the agent works* is the on-demand case, and
     /// "the tests failed" is the guarantee.
     #[gpui::test]
-    async fn test_read_aloud_catch_up_reports_a_call_that_finishes_later(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_read_aloud_catch_up_reports_a_call_that_finishes_later(cx: &mut TestAppContext) {
         init_test(cx);
 
         let connection = StubAgentConnection::new();
@@ -13588,9 +13913,7 @@ pub(crate) mod tests {
     /// likely interaction with a button that is silent for up to fifteen
     /// seconds.
     #[gpui::test]
-    async fn test_read_aloud_catch_up_survives_an_impatient_second_press(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_read_aloud_catch_up_survives_an_impatient_second_press(cx: &mut TestAppContext) {
         init_test(cx);
 
         let connection = StubAgentConnection::new();

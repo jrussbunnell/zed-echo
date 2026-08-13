@@ -1,9 +1,9 @@
 mod agent_configuration;
 pub mod agent_connection_store;
 mod agent_diff;
-mod agent_panel_styling;
 mod agent_model_selector;
 mod agent_panel;
+mod agent_panel_styling;
 mod agent_registry_ui;
 mod buffer_codegen;
 mod completion_provider;
@@ -25,6 +25,7 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+pub mod subagents;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -86,6 +87,7 @@ pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
+pub use subagents::{SubagentCounts, SubagentStatus, SubagentSummary};
 pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,

@@ -3307,6 +3307,26 @@ impl AcpThread {
             })
     }
 
+    /// Every subagent this thread spawned, in the order the spawning tool
+    /// calls appear in the transcript. A subagent shows up here as soon as its
+    /// spawning tool call carries session info, which is well before its own
+    /// [`AcpThread`] is loaded — so this, not the loaded-thread map, is the
+    /// authoritative list of a thread's subagents.
+    pub fn subagent_tool_calls(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ToolCall, &SubagentSessionInfo)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    let info = tool_call.subagent_session_info.as_ref()?;
+                    Some((index, tool_call, info))
+                }
+                _ => None,
+            })
+    }
+
     pub fn tool_call_for_subagent(&self, session_id: &acp::SessionId) -> Option<&ToolCall> {
         self.entries.iter().find_map(|entry| match entry {
             AgentThreadEntry::ToolCall(tool_call) => {

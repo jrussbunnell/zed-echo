@@ -58,6 +58,9 @@ pub struct ThreadItem {
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    /// Number of subagents this thread spawned, and the color standing in for
+    /// their combined state, rendered as a chip in the metadata row.
+    subagents: Option<(usize, Color)>,
     is_remote: bool,
     archived: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -93,6 +96,7 @@ impl ThreadItem {
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
+            subagents: None,
             is_remote: false,
             archived: false,
             on_click: None,
@@ -196,6 +200,11 @@ impl ThreadItem {
 
     pub fn worktrees(mut self, worktrees: Vec<ThreadItemWorktreeInfo>) -> Self {
         self.worktrees = worktrees;
+        self
+    }
+
+    pub fn subagents(mut self, count: usize, color: Color) -> Self {
+        self.subagents = (count > 0).then_some((count, color));
         self
     }
 
@@ -417,10 +426,13 @@ impl RenderOnce for ThreadItem {
             .collect();
 
         let has_worktree = !linked_worktrees.is_empty();
+        let subagents = self.subagents;
+        let has_subagents = subagents.is_some();
 
         let has_metadata = has_project_name
             || has_project_paths
             || has_worktree
+            || has_subagents
             || has_diff_stats
             || has_timestamp;
 
@@ -588,9 +600,29 @@ impl RenderOnce for ThreadItem {
                         )
                         .when(
                             (has_project_name || has_project_paths || has_worktree)
-                                && (has_diff_stats || has_timestamp),
+                                && (has_subagents || has_diff_stats || has_timestamp),
                             |this| this.child(dot_separator()),
                         )
+                        .when_some(subagents, |this, (count, color)| {
+                            this.child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .flex_shrink_0()
+                                    .child(
+                                        Icon::new(IconName::ListTree)
+                                            .size(IconSize::XSmall)
+                                            .color(color),
+                                    )
+                                    .child(
+                                        Label::new(count.to_string())
+                                            .size(LabelSize::Small)
+                                            .color(color),
+                                    ),
+                            )
+                        })
+                        .when(has_subagents && (has_diff_stats || has_timestamp), |this| {
+                            this.child(dot_separator())
+                        })
                         .when(has_diff_stats, |this| {
                             this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
                         })
@@ -949,6 +981,32 @@ impl Component for ThreadItem {
                             .added(15)
                             .removed(4)
                             .timestamp("8h"),
+                    )
+                    .into_any_element(),
+            ),
+            single_example(
+                "With Subagents",
+                container()
+                    .child(
+                        ThreadItem::new("ti-6a", "Split the migration across agents")
+                            .icon(IconName::ZedAgent)
+                            .status(AgentThreadStatus::Running)
+                            .subagents(3, Color::Accent)
+                            .added(64)
+                            .removed(12)
+                            .timestamp("4m"),
+                    )
+                    .into_any_element(),
+            ),
+            single_example(
+                "Subagent Needs Approval",
+                container()
+                    .child(
+                        ThreadItem::new("ti-6b", "Split the migration across agents")
+                            .icon(IconName::ZedAgent)
+                            .status(AgentThreadStatus::Running)
+                            .subagents(3, Color::Warning)
+                            .timestamp("4m"),
                     )
                     .into_any_element(),
             ),
