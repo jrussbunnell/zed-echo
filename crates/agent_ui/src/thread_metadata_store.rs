@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -19,8 +20,8 @@ use db::{
     sqlez_macros::sql,
 };
 use fs::Fs;
-use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
+use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
+use gpui::{AppContext as _, BackgroundExecutor, Entity, Global, Subscription, Task, TaskExt};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
@@ -87,6 +88,7 @@ pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection:
 
 pub fn init(cx: &mut App) {
     ThreadMetadataStore::init_global(cx);
+    SubagentTranscripts::init_global(cx);
     let migration_task = migrate_thread_metadata(cx);
     migrate_thread_remote_connections(cx, migration_task);
     migrate_thread_ids(cx);
@@ -544,6 +546,170 @@ impl TestMetadataDbName {
                 let test_name = thread.name().unwrap_or("unknown_test");
                 format!("THREAD_METADATA_DB_{}", test_name)
             })
+    }
+}
+
+/// Persists derived subagent transcripts, implementing the seam `acp_thread`
+/// defines so the connection layer can record updates without depending on this
+/// crate or on a database at all.
+///
+/// Every write goes through one sequential background task fed by a channel.
+/// That is what makes replay faithful: `append` is called from the foreground
+/// thread for each update and must not block, but spawning a task per update
+/// would let them land out of order and rebuild the transcript scrambled. The
+/// channel preserves arrival order; the drain task assigns ordinals from that.
+pub struct SubagentTranscripts {
+    writes: mpsc::UnboundedSender<TranscriptWrite>,
+    db: ThreadMetadataDb,
+    _writer: Task<()>,
+}
+
+enum TranscriptWrite {
+    Append {
+        session_id: acp::SessionId,
+        parent_session_id: acp::SessionId,
+        update_json: String,
+    },
+    DeleteForParent(acp::SessionId),
+}
+
+impl SubagentTranscripts {
+    pub fn new(db: ThreadMetadataDb, executor: BackgroundExecutor) -> Self {
+        let (writes, mut incoming) = mpsc::unbounded::<TranscriptWrite>();
+        let writer = executor.spawn({
+            let db = db.clone();
+            async move {
+                // Ordinals live here rather than in shared state: the drain is
+                // the only writer, so no lock and no cross-thread sharing.
+                let mut next_ordinal: std::collections::HashMap<acp::SessionId, i64> =
+                    Default::default();
+                while let Some(write) = incoming.next().await {
+                    match write {
+                        TranscriptWrite::Append {
+                            session_id,
+                            parent_session_id,
+                            update_json,
+                        } => {
+                            let ordinal = match next_ordinal.get(&session_id) {
+                                Some(ordinal) => *ordinal,
+                                None => {
+                                    // First update for this subagent in this
+                                    // process. A live stream is authoritative
+                                    // and starts from the subagent's beginning,
+                                    // so anything stored under this id from an
+                                    // earlier run is stale and would interleave.
+                                    db.delete_subagent_updates_for_session(
+                                        session_id.0.to_string(),
+                                    )
+                                    .await
+                                    .log_err();
+                                    0
+                                }
+                            };
+                            next_ordinal.insert(session_id.clone(), ordinal + 1);
+                            db.append_subagent_update(
+                                session_id.0.to_string(),
+                                parent_session_id.0.to_string(),
+                                ordinal,
+                                update_json,
+                            )
+                            .await
+                            .log_err();
+                        }
+                        TranscriptWrite::DeleteForParent(parent_session_id) => {
+                            next_ordinal.clear();
+                            db.delete_subagent_updates_for_parent(parent_session_id.0.to_string())
+                                .await
+                                .log_err();
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            writes,
+            db,
+            _writer: writer,
+        }
+    }
+}
+
+impl SubagentTranscripts {
+    /// Installs the store the connection layer records subagent updates
+    /// through. Shares the metadata database rather than opening its own: the
+    /// transcripts belong to the same threads and should be discarded with them.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn init_global(cx: &mut App) {
+        let db = ThreadMetadataDb::global(cx);
+        let store = Self::new(db.clone(), cx.background_executor().clone());
+        acp_thread::set_subagent_transcript_store(Rc::new(store), cx);
+        cx.background_spawn(async move {
+            db.delete_orphaned_subagent_updates().await.log_err();
+        })
+        .detach();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn init_global(cx: &mut App) {
+        let db_name = TestMetadataDbName::global(cx);
+        let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
+        let store = Self::new(ThreadMetadataDb(db), cx.background_executor().clone());
+        acp_thread::set_subagent_transcript_store(Rc::new(store), cx);
+    }
+}
+
+impl acp_thread::SubagentTranscriptStore for SubagentTranscripts {
+    fn append(
+        &self,
+        session_id: &acp::SessionId,
+        parent_session_id: &acp::SessionId,
+        update: &acp::SessionUpdate,
+    ) {
+        let update_json = match serde_json::to_string(update) {
+            Ok(update_json) => update_json,
+            Err(error) => {
+                log::error!("subagent transcript: could not serialize an update: {error}");
+                return;
+            }
+        };
+        self.writes
+            .unbounded_send(TranscriptWrite::Append {
+                session_id: session_id.clone(),
+                parent_session_id: parent_session_id.clone(),
+                update_json,
+            })
+            .log_err();
+    }
+
+    fn load(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<acp::SessionUpdate>>> {
+        let db = self.db.clone();
+        let session_id = session_id.0.to_string();
+        cx.background_spawn(async move {
+            let rows = db.subagent_updates(session_id).await?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| match serde_json::from_str(&row) {
+                    Ok(update) => Some(update),
+                    Err(error) => {
+                        // One unreadable row — an update shape from an older
+                        // build — drops that step rather than the whole thread.
+                        log::warn!("subagent transcript: skipping an unreadable update: {error}");
+                        None
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn delete_for_parent(&self, parent_session_id: &acp::SessionId) {
+        self.writes
+            .unbounded_send(TranscriptWrite::DeleteForParent(parent_session_id.clone()))
+            .log_err();
     }
 }
 
@@ -1365,7 +1531,7 @@ pub enum ThreadMetadataStoreEvent {
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
 
-struct ThreadMetadataDb(ThreadSafeConnection);
+pub struct ThreadMetadataDb(ThreadSafeConnection);
 
 impl Domain for ThreadMetadataDb {
     const NAME: &str = stringify!(ThreadMetadataDb);
@@ -1462,12 +1628,112 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        // A derived subagent's transcript, as the raw session-update stream
+        // that produced it. The agent keeps none of this, so it is the only
+        // copy: Claude Code's session file has the spawning tool call but no
+        // sidechain records and no `parent_tool_use_id` to replay from.
+        //
+        // `ordinal` preserves arrival order, which matters because the updates
+        // are replayed in sequence to rebuild the thread. `parent_session_id`
+        // is indexed so deleting a parent can take its subagents with it.
+        sql!(
+            CREATE TABLE IF NOT EXISTS subagent_transcript_updates(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                update_json TEXT NOT NULL
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS subagent_transcript_updates_by_session
+                ON subagent_transcript_updates(session_id, ordinal);
+
+            CREATE INDEX IF NOT EXISTS subagent_transcript_updates_by_parent
+                ON subagent_transcript_updates(parent_session_id);
+        ),
     ];
 }
 
 db::static_connection!(ThreadMetadataDb, []);
 
 impl ThreadMetadataDb {
+    /// Appends one update to a subagent's stored transcript.
+    pub async fn append_subagent_update(
+        &self,
+        session_id: String,
+        parent_session_id: String,
+        ordinal: i64,
+        update_json: String,
+    ) -> anyhow::Result<()> {
+        self.write(move |connection| {
+            let mut statement = connection.exec_bound::<(String, String, i64, String)>(
+                "INSERT INTO subagent_transcript_updates \
+                 (session_id, parent_session_id, ordinal, update_json) \
+                 VALUES (?, ?, ?, ?)",
+            )?;
+            statement((session_id, parent_session_id, ordinal, update_json))
+        })
+        .await
+    }
+
+    /// A subagent's stored updates, in arrival order.
+    pub async fn subagent_updates(&self, session_id: String) -> anyhow::Result<Vec<String>> {
+        self.write(move |connection| {
+            let mut statement = connection.select_bound::<String, String>(
+                "SELECT update_json FROM subagent_transcript_updates \
+                 WHERE session_id = ? ORDER BY ordinal ASC",
+            )?;
+            statement(session_id)
+        })
+        .await
+    }
+
+    /// Drops one subagent's stored transcript.
+    pub async fn delete_subagent_updates_for_session(
+        &self,
+        session_id: String,
+    ) -> anyhow::Result<()> {
+        self.write(move |connection| {
+            let mut statement = connection.exec_bound::<String>(
+                "DELETE FROM subagent_transcript_updates WHERE session_id = ?",
+            )?;
+            statement(session_id)
+        })
+        .await
+    }
+
+    /// Drops transcripts whose parent thread no longer exists.
+    ///
+    /// Swept rather than hooked into each delete: threads are removed through
+    /// several paths (the sidebar, archiving cleanup, the migrations above),
+    /// and one sweep is both smaller and impossible to forget to call from a
+    /// new one. Transcripts are worthless without their parent anyway.
+    pub async fn delete_orphaned_subagent_updates(&self) -> anyhow::Result<()> {
+        self.write(move |connection| {
+            connection.exec(
+                "DELETE FROM subagent_transcript_updates \
+                 WHERE parent_session_id NOT IN ( \
+                     SELECT session_id FROM sidebar_threads WHERE session_id IS NOT NULL \
+                 )",
+            )?()
+        })
+        .await
+    }
+
+    /// Drops every subagent transcript belonging to a parent thread.
+    pub async fn delete_subagent_updates_for_parent(
+        &self,
+        parent_session_id: String,
+    ) -> anyhow::Result<()> {
+        self.write(move |connection| {
+            let mut statement = connection.exec_bound::<String>(
+                "DELETE FROM subagent_transcript_updates WHERE parent_session_id = ?",
+            )?;
+            statement(parent_session_id)
+        })
+        .await
+    }
+
     #[allow(dead_code)]
     pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
         self.select::<ThreadId>(
@@ -3670,6 +3936,149 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/new/worktree-a")));
         assert!(paths.contains(&PathBuf::from("/other/path")));
         assert!(!paths.contains(&PathBuf::from("/should/not/appear")));
+    }
+
+    /// The store exists because Claude Code persists none of this: its session
+    /// file keeps the spawning `Agent` tool call but no sidechain records and no
+    /// `parent_tool_use_id`, so a subagent's transcript is unrecoverable from
+    /// the agent after a restart. This is the only copy.
+    #[gpui::test]
+    async fn subagent_transcripts_round_trip_through_the_database(cx: &mut TestAppContext) {
+        use acp_thread::SubagentTranscriptStore as _;
+
+        init_test(cx);
+        let store = cx.update(|cx| {
+            let db_name = TestMetadataDbName::global(cx);
+            let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
+            SubagentTranscripts::new(ThreadMetadataDb(db), cx.background_executor().clone())
+        });
+
+        let session_id = acp::SessionId::new("parent/subagent/tool-1");
+        let parent_session_id = acp::SessionId::new("parent");
+        let texts = ["first", "second", "third"];
+        for text in texts {
+            store.append(
+                &session_id,
+                &parent_session_id,
+                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::from(text.to_string()),
+                )),
+            );
+        }
+        cx.run_until_parked();
+
+        let loaded = cx
+            .update(|cx| store.load(&session_id, cx))
+            .await
+            .expect("the transcript loads");
+        assert_eq!(
+            loaded.len(),
+            texts.len(),
+            "every appended update must come back"
+        );
+
+        // Order is the point: the updates are replayed in sequence to rebuild
+        // the thread, so a scrambled transcript is a scrambled conversation.
+        let recovered: Vec<String> = loaded
+            .iter()
+            .filter_map(|update| match update {
+                acp::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recovered, texts.to_vec(), "arrival order must be preserved");
+    }
+
+    /// A subagent id is stable across runs, so a live stream re-recording one
+    /// must replace what an earlier run stored rather than interleave with it.
+    #[gpui::test]
+    async fn re_recording_a_subagent_replaces_the_previous_transcript(cx: &mut TestAppContext) {
+        use acp_thread::SubagentTranscriptStore as _;
+
+        init_test(cx);
+        let db_name = cx.update(|cx| TestMetadataDbName::global(cx));
+        let session_id = acp::SessionId::new("parent/subagent/tool-1");
+        let parent_session_id = acp::SessionId::new("parent");
+
+        let append = |cx: &mut TestAppContext, text: &'static str| {
+            let db_name = db_name.clone();
+            cx.update(|cx| {
+                let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
+                let store = SubagentTranscripts::new(
+                    ThreadMetadataDb(db),
+                    cx.background_executor().clone(),
+                );
+                store.append(
+                    &acp::SessionId::new("parent/subagent/tool-1"),
+                    &acp::SessionId::new("parent"),
+                    &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::from(text.to_string()),
+                    )),
+                );
+                store
+            })
+        };
+
+        let first_run = append(cx, "from the first run");
+        cx.run_until_parked();
+        drop(first_run);
+
+        // A second process recording the same subagent starts its own sequence.
+        let second_run = append(cx, "from the second run");
+        cx.run_until_parked();
+
+        let loaded = cx
+            .update(|cx| second_run.load(&session_id, cx))
+            .await
+            .expect("the transcript loads");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the stale transcript must be replaced, not appended to"
+        );
+        let _ = &parent_session_id;
+    }
+
+    #[gpui::test]
+    async fn orphaned_transcripts_are_swept(cx: &mut TestAppContext) {
+        use acp_thread::SubagentTranscriptStore as _;
+
+        init_test(cx);
+        let db = cx.update(|cx| {
+            let db_name = TestMetadataDbName::global(cx);
+            ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+                &db_name,
+            )))
+        });
+        let store =
+            cx.update(|cx| SubagentTranscripts::new(db.clone(), cx.background_executor().clone()));
+
+        let session_id = acp::SessionId::new("ghost/subagent/tool-1");
+        store.append(
+            &session_id,
+            // No `sidebar_threads` row exists for this parent.
+            &acp::SessionId::new("ghost"),
+            &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::from("orphan".to_string()),
+            )),
+        );
+        cx.run_until_parked();
+
+        db.delete_orphaned_subagent_updates()
+            .await
+            .expect("the sweep runs");
+
+        let loaded = cx
+            .update(|cx| store.load(&session_id, cx))
+            .await
+            .expect("the load succeeds");
+        assert!(
+            loaded.is_empty(),
+            "a transcript whose parent thread is gone must not survive"
+        );
     }
 
     #[gpui::test]

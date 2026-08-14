@@ -2139,6 +2139,62 @@ impl ConversationView {
         }));
     }
 
+    /// Rebuilds a subagent's thread from the transcript recorded while it ran,
+    /// by replaying its updates through the same handler that built it live.
+    ///
+    /// Fails when nothing was recorded, which is the honest outcome: a subagent
+    /// from before this store existed has no transcript anywhere, and inventing
+    /// an empty thread for it would render as a subagent that did nothing.
+    fn rebuild_subagent_from_transcript(
+        &self,
+        subagent_id: acp::SessionId,
+        parent_session_id: acp::SessionId,
+        connection: Rc<dyn AgentConnection>,
+        work_dirs: PathList,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let Some(store) = acp_thread::subagent_transcript_store(cx) else {
+            return Task::ready(Err(anyhow!("no subagent transcript store is installed")));
+        };
+        let project = self.project.clone();
+        let updates = store.load(&subagent_id, cx);
+
+        cx.spawn(async move |_this, cx| {
+            let updates = updates.await?;
+            anyhow::ensure!(
+                !updates.is_empty(),
+                "no stored transcript for subagent {subagent_id}"
+            );
+
+            let thread = cx.update(|cx| {
+                let action_log = cx.new(|_| ActionLog::new(project.clone()));
+                cx.new(|cx| {
+                    AcpThread::new(
+                        Some(parent_session_id),
+                        None,
+                        Some(work_dirs),
+                        connection,
+                        project,
+                        action_log,
+                        subagent_id,
+                        watch::Receiver::constant(acp::PromptCapabilities::new()),
+                        cx,
+                    )
+                })
+            });
+
+            thread.update(cx, |thread, cx| {
+                for update in updates {
+                    // One malformed step must not lose the rest of the
+                    // transcript, so a failed update is logged and skipped.
+                    thread.handle_session_update(update, cx).log_err();
+                }
+            });
+
+            Ok(thread)
+        })
+    }
+
     fn load_subagent_session(
         &mut self,
         subagent_id: acp::SessionId,
@@ -2156,9 +2212,6 @@ impl ConversationView {
         // needs no load — and must not be gated behind the load capability,
         // which says nothing about it.
         let local_thread = connected.connection.local_session_thread(&subagent_id, cx);
-        if local_thread.is_none() && !connected.connection.supports_load_session() {
-            return;
-        }
         let Some(parent_thread) = connected.threads.get(&parent_session_id) else {
             return;
         };
@@ -2172,11 +2225,16 @@ impl ConversationView {
 
         let subagent_thread_task = match local_thread {
             Some(thread) => Task::ready(Ok(thread)),
-            None => connected.connection.clone().load_session(
+            // Not `load_session`: a derived subagent's id names no session the
+            // agent has ever heard of, and Claude Code does not persist the
+            // subagent's messages under the parent either — its session file
+            // keeps the spawning tool call and nothing to replay from. The only
+            // copy is the one recorded while the subagent ran.
+            None => self.rebuild_subagent_from_transcript(
                 subagent_id,
-                self.project.clone(),
+                parent_session_id.clone(),
+                connected.connection.clone(),
                 work_dirs,
-                None,
                 cx,
             ),
         };

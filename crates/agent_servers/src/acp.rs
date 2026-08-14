@@ -5483,6 +5483,24 @@ fn route_to_subagent(
             .insert(tool_call_id.clone(), owner_session_id.clone());
     }
 
+    // Recorded here, where the update is known to belong to a subagent and
+    // before it is applied. The agent keeps none of this — Claude Code's
+    // session file has no sidechain records and no `parent_tool_use_id` — so
+    // without this the thread cannot be rebuilt after a restart.
+    let parent_session_id = ctx
+        .derived_subagents
+        .borrow()
+        .sessions
+        .get(&owner_session_id)
+        .map(|session| session.parent_session_id.clone());
+    if let Some(parent_session_id) = parent_session_id {
+        cx.update(|cx| {
+            if let Some(store) = acp_thread::subagent_transcript_store(cx) {
+                store.append(&owner_session_id, &parent_session_id, update);
+            }
+        });
+    }
+
     ctx.derived_subagents
         .borrow()
         .thread(&owner_session_id)

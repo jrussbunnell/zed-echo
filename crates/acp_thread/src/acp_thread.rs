@@ -12,7 +12,7 @@ pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    AppContext, AsyncApp, Context, Entity, EventEmitter, Global, SharedString, Subscription, Task,
     WeakEntity,
 };
 use itertools::Itertools;
@@ -333,6 +333,64 @@ pub fn session_update_meta(update: &acp::SessionUpdate) -> &Option<acp::Meta> {
 /// The subagent a session update belongs to, if any.
 pub fn subagent_owner_of_update(update: &acp::SessionUpdate) -> Option<acp::ToolCallId> {
     parent_tool_use_id_from_meta(session_update_meta(update))
+}
+
+/// Durable storage for a derived subagent's transcript.
+///
+/// Claude Code does not persist a subagent's messages: its session file keeps
+/// the spawning `Agent` tool call and that call's final result, but no
+/// `parent_tool_use_id` and no sidechain records. So on reload there is nothing
+/// to replay and the subagent's thread cannot be rebuilt from the agent — it
+/// has to have been kept here.
+///
+/// What is stored is the raw `SessionUpdate` stream rather than the
+/// materialized transcript: `AgentThreadEntry` holds GPUI entities, oneshot
+/// responders, diffs, and terminals, none of which serialize, whereas the
+/// updates are protocol types that already round-trip. Replaying them through
+/// [`AcpThread::handle_session_update`] rebuilds the thread along the exact
+/// path that built it live.
+///
+/// Implemented where the database lives (`agent_ui`) and registered as a global
+/// so the connection layer can reach it without depending on that crate.
+pub trait SubagentTranscriptStore: 'static {
+    /// Records one update already routed to `session_id`. Called on the
+    /// foreground thread for every subagent update, so it must not block;
+    /// implementations are expected to buffer and write in the background.
+    fn append(
+        &self,
+        session_id: &acp::SessionId,
+        parent_session_id: &acp::SessionId,
+        update: &acp::SessionUpdate,
+    );
+
+    /// The updates recorded for `session_id`, in arrival order.
+    fn load(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp::SessionUpdate>>>;
+
+    /// Drops everything recorded for a parent session and its subagents, for
+    /// when that thread is deleted.
+    fn delete_for_parent(&self, parent_session_id: &acp::SessionId);
+}
+
+struct GlobalSubagentTranscriptStore(Rc<dyn SubagentTranscriptStore>);
+
+impl Global for GlobalSubagentTranscriptStore {}
+
+/// Installs the process-wide transcript store. Called once during startup by
+/// the crate that owns the database.
+pub fn set_subagent_transcript_store(store: Rc<dyn SubagentTranscriptStore>, cx: &mut App) {
+    cx.set_global(GlobalSubagentTranscriptStore(store));
+}
+
+/// The transcript store, if one has been installed. `None` in tests and in any
+/// headless context that never set one up, where subagents simply do not
+/// survive a restart.
+pub fn subagent_transcript_store(cx: &App) -> Option<Rc<dyn SubagentTranscriptStore>> {
+    cx.try_global::<GlobalSubagentTranscriptStore>()
+        .map(|global| global.0.clone())
 }
 
 /// The session id given to the thread that collects a Claude Code subagent's
