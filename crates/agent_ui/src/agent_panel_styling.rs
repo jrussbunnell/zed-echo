@@ -143,10 +143,9 @@ fn resolve_font_size(size: f32, group: &'static str) -> Option<Pixels> {
         );
         return None;
     }
-    Some(px(size.clamp(
-        *FONT_SIZE_RANGE.start(),
-        *FONT_SIZE_RANGE.end(),
-    )))
+    Some(px(
+        size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end())
+    ))
 }
 
 fn resolve_color(color: Option<&str>, group: &'static str, field: &'static str) -> Option<Hsla> {
@@ -183,7 +182,10 @@ mod tests {
         assert_eq!(settings, AgentPanelStylingSettings::default());
 
         let empty: AgentPanelStylingContent = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings_with(Some(empty)), AgentPanelStylingSettings::default());
+        assert_eq!(
+            settings_with(Some(empty)),
+            AgentPanelStylingSettings::default()
+        );
     }
 
     #[test]
@@ -291,14 +293,23 @@ mod tests {
         };
         overrides.apply_to_markdown_style(&mut style);
 
-        assert_eq!(style.base_text_style.font_family, SharedString::from("Iosevka"));
+        assert_eq!(
+            style.base_text_style.font_family,
+            SharedString::from("Iosevka")
+        );
         assert_eq!(style.base_text_style.font_size, px(15.).into());
         assert_eq!(style.base_text_style.color, rgb(0xAABBCC).into());
-        assert_eq!(style.container_style.background, untouched.container_style.background);
+        assert_eq!(
+            style.container_style.background,
+            untouched.container_style.background
+        );
         assert_eq!(style.code_block, untouched.code_block);
 
         ContentStyleOverrides::default().apply_to_markdown_style(&mut style);
-        assert_eq!(style.base_text_style.font_family, SharedString::from("Iosevka"));
+        assert_eq!(
+            style.base_text_style.font_family,
+            SharedString::from("Iosevka")
+        );
     }
 
     #[test]
