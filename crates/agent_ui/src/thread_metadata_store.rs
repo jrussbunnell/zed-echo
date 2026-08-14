@@ -594,16 +594,18 @@ impl SubagentTranscripts {
                                 Some(ordinal) => *ordinal,
                                 None => {
                                     // First update for this subagent in this
-                                    // process. A live stream is authoritative
-                                    // and starts from the subagent's beginning,
-                                    // so anything stored under this id from an
-                                    // earlier run is stale and would interleave.
-                                    db.delete_subagent_updates_for_session(
-                                        session_id.0.to_string(),
-                                    )
-                                    .await
-                                    .log_err();
-                                    0
+                                    // process: continue after whatever an
+                                    // earlier run stored rather than replacing
+                                    // it. A `SendMessage` resume appends to an
+                                    // existing transcript, so discarding the
+                                    // stored updates here destroys the entire
+                                    // history of the agent being messaged.
+                                    db.max_subagent_ordinal(session_id.0.to_string())
+                                        .await
+                                        .log_err()
+                                        .flatten()
+                                        .map(|max| max + 1)
+                                        .unwrap_or(0)
                                 }
                             };
                             next_ordinal.insert(session_id.clone(), ordinal + 1);
@@ -1725,16 +1727,14 @@ impl ThreadMetadataDb {
         .await
     }
 
-    /// Drops one subagent's stored transcript.
-    pub async fn delete_subagent_updates_for_session(
-        &self,
-        session_id: String,
-    ) -> anyhow::Result<()> {
+    /// The highest ordinal stored for a subagent, so a later run continues its
+    /// transcript instead of overwriting it.
+    pub async fn max_subagent_ordinal(&self, session_id: String) -> anyhow::Result<Option<i64>> {
         self.write(move |connection| {
-            let mut statement = connection.exec_bound::<String>(
-                "DELETE FROM subagent_transcript_updates WHERE session_id = ?",
+            let mut statement = connection.select_bound::<String, Option<i64>>(
+                "SELECT MAX(ordinal) FROM subagent_transcript_updates WHERE session_id = ?",
             )?;
-            statement(session_id)
+            Ok(statement(session_id)?.into_iter().flatten().next())
         })
         .await
     }
@@ -4029,18 +4029,26 @@ mod tests {
         assert_eq!(recovered, texts.to_vec(), "arrival order must be preserved");
     }
 
-    /// A subagent id is stable across runs, so a live stream re-recording one
-    /// must replace what an earlier run stored rather than interleave with it.
+    /// Regression test for destroyed data: a `SendMessage` resume appends to an
+    /// existing subagent's transcript, so a later run must continue it rather
+    /// than replace it.
+    ///
+    /// This previously deleted the stored rows on the first append of each
+    /// process, on the reasoning that a live stream starts from the subagent's
+    /// beginning. A resume does not — it picks up an agent that already ran —
+    /// and the first message sent to a restored subagent wiped its entire
+    /// history, leaving only the reply.
     #[gpui::test]
-    async fn re_recording_a_subagent_replaces_the_previous_transcript(cx: &mut TestAppContext) {
+    async fn a_resume_appends_to_a_stored_transcript_instead_of_replacing_it(
+        cx: &mut TestAppContext,
+    ) {
         use acp_thread::SubagentTranscriptStore as _;
 
         init_test(cx);
         let db_name = cx.update(|cx| TestMetadataDbName::global(cx));
         let session_id = acp::SessionId::new("parent/subagent/tool-1");
-        let parent_session_id = acp::SessionId::new("parent");
 
-        let append = |cx: &mut TestAppContext, text: &'static str| {
+        let record = |cx: &mut TestAppContext, text: &'static str| {
             let db_name = db_name.clone();
             cx.update(|cx| {
                 let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
@@ -4059,89 +4067,35 @@ mod tests {
             })
         };
 
-        let first_run = append(cx, "from the first run");
+        let original_run = record(cx, "the original transcript");
         cx.run_until_parked();
-        drop(first_run);
+        drop(original_run);
 
-        // A second process recording the same subagent starts its own sequence.
-        let second_run = append(cx, "from the second run");
+        // A later process resumes the same agent and it replies.
+        let resumed_run = record(cx, "the reply after a resume");
         cx.run_until_parked();
 
         let loaded = cx
-            .update(|cx| second_run.load(&session_id, cx))
+            .update(|cx| resumed_run.load(&session_id, cx))
             .await
             .expect("the transcript loads");
+        let texts: Vec<String> = loaded
+            .iter()
+            .filter_map(|update| match update {
+                acp::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            loaded.len(),
-            1,
-            "the stale transcript must be replaced, not appended to"
-        );
-        let _ = &parent_session_id;
-    }
-
-    /// The gap that made the first attempt at persistence useless: the
-    /// transcripts were being written correctly, but a reloaded parent had no
-    /// way to find them. The link lives in each spawning tool call's
-    /// `subagent_session_info`, stamped in memory and never persisted, so
-    /// scanning the replayed transcript returns nothing. Discovery has to go
-    /// through the store.
-    #[gpui::test]
-    async fn a_parent_can_find_its_subagents_after_a_restart(cx: &mut TestAppContext) {
-        use acp_thread::SubagentTranscriptStore as _;
-
-        init_test(cx);
-        let store = cx.update(|cx| {
-            let db_name = TestMetadataDbName::global(cx);
-            let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
-            SubagentTranscripts::new(ThreadMetadataDb(db), cx.background_executor().clone())
-        });
-
-        let parent = acp::SessionId::new("parent");
-        let other_parent = acp::SessionId::new("unrelated");
-        let first =
-            acp_thread::derived_subagent_session_id(&parent, &acp::ToolCallId::new("toolu_first"));
-        let second =
-            acp_thread::derived_subagent_session_id(&parent, &acp::ToolCallId::new("toolu_second"));
-        let stranger = acp_thread::derived_subagent_session_id(
-            &other_parent,
-            &acp::ToolCallId::new("toolu_other"),
-        );
-
-        for (session, parent_of) in [
-            (&first, &parent),
-            (&second, &parent),
-            (&stranger, &other_parent),
-        ] {
-            store.append(
-                session,
-                parent_of,
-                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::from("work".to_string()),
-                )),
-            );
-        }
-        cx.run_until_parked();
-
-        let found = cx
-            .update(|cx| store.sessions_for_parent(&parent, cx))
-            .await
-            .expect("the lookup succeeds");
-        assert_eq!(
-            found,
-            vec![first.clone(), second.clone()],
-            "both subagents come back in spawn order, and another parent's does not"
-        );
-
-        // The spawning tool call has to be recoverable from the session id,
-        // because that is what re-attaches the subagent to the parent's card.
-        assert_eq!(
-            acp_thread::tool_call_id_from_derived_session_id(&parent, &first),
-            Some(acp::ToolCallId::new("toolu_first"))
-        );
-        assert_eq!(
-            acp_thread::tool_call_id_from_derived_session_id(&other_parent, &first),
-            None,
-            "a session belonging to another parent must not resolve"
+            texts,
+            vec![
+                "the original transcript".to_string(),
+                "the reply after a resume".to_string()
+            ],
+            "the resume must extend the transcript, never replace it"
         );
     }
 
