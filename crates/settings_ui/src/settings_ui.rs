@@ -1007,6 +1007,9 @@ pub struct SettingsWindow {
     /// Whether "Reset All" in Theme Studio has been clicked once and is
     /// awaiting confirmation.
     pub(crate) theme_studio_reset_all_confirming: bool,
+    /// Outcome of the last "Export Theme", shown inline under the header.
+    /// `Ok` holds the written path, `Err` the reason it failed.
+    pub(crate) theme_studio_export_status: Option<Result<SharedString, SharedString>>,
 }
 
 struct SearchDocument {
@@ -2046,6 +2049,7 @@ impl SettingsWindow {
             theme_studio_editing_row: None,
             theme_studio_color_error: None,
             theme_studio_reset_all_confirming: false,
+            theme_studio_export_status: None,
         };
 
         this.fetch_files(window, cx);
@@ -5367,6 +5371,7 @@ pub mod test {
                 theme_studio_editing_row: None,
                 theme_studio_color_error: None,
                 theme_studio_reset_all_confirming: false,
+                theme_studio_export_status: None,
             }
         }
     }
@@ -5511,6 +5516,7 @@ pub mod test {
             theme_studio_editing_row: None,
             theme_studio_color_error: None,
             theme_studio_reset_all_confirming: false,
+            theme_studio_export_status: None,
         };
 
         settings_window.build_filter_table();

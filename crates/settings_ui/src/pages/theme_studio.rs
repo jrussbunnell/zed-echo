@@ -8,14 +8,15 @@
 
 use std::rc::Rc;
 
+use anyhow::Context as _;
 use gpui::{Hsla, ReadGlobal as _, Rgba, ScrollHandle, prelude::*};
 use settings::{
     FontStyleContent, FontWeightContent, HighlightStyleContent, Settings as _, ThemeColor,
-    ThemeStyleContent, WindowBlurMaterialContent,
+    ThemeStyleContent, UiDensity, WindowBlurMaterialContent,
 };
 use std::collections::HashSet;
-use theme::ActiveTheme as _;
-use theme_settings::ThemeSettings;
+use theme::{ActiveTheme as _, Appearance, AppearanceContent};
+use theme_settings::{ThemeContent, ThemeFamilyContent, ThemeSettings};
 use ui::{
     ContextMenu, Divider, DropdownMenu, DropdownStyle, IconPosition, PopoverMenu, Tooltip,
     prelude::*,
@@ -493,6 +494,93 @@ fn update_theme_override(
     .log_err();
 }
 
+/// Builds the theme family written by "Export Theme".
+///
+/// The style is the user's overrides verbatim, not a snapshot of the active
+/// theme. Zed's loader refines a theme from its built-in light/dark base, so a
+/// sparse style is valid and loads — but it means the export reproduces the
+/// customizations, not the theme they were layered on. The registry only keeps
+/// refined `Theme`s, never the content they came from, so a full snapshot would
+/// need an inverse mapping over every color field that does not exist today.
+fn exported_theme_family(
+    theme_name: &str,
+    appearance: Appearance,
+    overrides: ThemeStyleContent,
+) -> ThemeFamilyContent {
+    let exported_name = format!("{theme_name} (Customized)");
+    ThemeFamilyContent {
+        name: exported_name.clone(),
+        author: "Zed Echo Theme Studio".to_string(),
+        themes: vec![ThemeContent {
+            name: exported_name,
+            appearance: match appearance {
+                Appearance::Light => AppearanceContent::Light,
+                Appearance::Dark => AppearanceContent::Dark,
+            },
+            style: overrides,
+        }],
+    }
+}
+
+/// Slugifies a theme name into a filename stem, so an export never escapes the
+/// themes directory or produces a name the filesystem rejects.
+fn theme_file_stem(theme_name: &str) -> String {
+    let mut stem = String::with_capacity(theme_name.len());
+    for character in theme_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            stem.push(character.to_ascii_lowercase());
+        } else if !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_matches('-').to_string();
+    if stem.is_empty() {
+        "theme".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Writes the active theme's customizations to the themes directory, where Zed
+/// picks them up as a selectable theme.
+fn export_theme(
+    theme_name: String,
+    appearance: Appearance,
+    overrides: ThemeStyleContent,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let family = exported_theme_family(&theme_name, appearance, overrides);
+    let path = paths::themes_dir().join(format!("{}.json", theme_file_stem(&family.name)));
+    let fs = <dyn fs::Fs>::global(cx);
+
+    cx.spawn(async move |this, cx| {
+        let result = async {
+            let contents =
+                serde_json::to_string_pretty(&family).context("serializing the theme")?;
+            if let Some(parent) = path.parent() {
+                fs.create_dir(parent)
+                    .await
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            fs.atomic_write(path.clone(), contents)
+                .await
+                .with_context(|| format!("writing {}", path.display()))?;
+            anyhow::Ok(path)
+        }
+        .await;
+
+        this.update(cx, |this, cx| {
+            this.theme_studio_export_status = Some(match result {
+                Ok(path) => Ok(format!("Exported to {}", path.display()).into()),
+                Err(error) => Err(format!("Export failed: {error:#}").into()),
+            });
+            cx.notify();
+        })
+        .log_err();
+    })
+    .detach();
+}
+
 fn clear_theme_overrides(theme_name: String, window: &mut Window, cx: &mut App) {
     update_settings_file(
         SettingsUiFile::User,
@@ -584,6 +672,7 @@ fn render_header(
     let count = override_count(overrides);
     let confirming = settings_window.theme_studio_reset_all_confirming;
     let theme_name_for_reset = theme_name.to_string();
+    let theme_name_for_export = theme_name.to_string();
     let summary = if count == 0 {
         format!("No customizations for \"{theme_name}\" yet.")
     } else if count == 1 {
@@ -607,30 +696,80 @@ fn render_header(
                     ),
                 )
                 .child(
-                    Button::new(
-                        "theme-studio-reset-all",
-                        if confirming {
-                            "Click Again to Confirm"
-                        } else {
-                            "Reset All"
-                        },
-                    )
-                    .style(ButtonStyle::Outlined)
-                    .size(ButtonSize::Medium)
-                    .disabled(count == 0)
-                    .tooltip(Tooltip::text(
-                        "Remove every customization for the active theme",
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.theme_studio_reset_all_confirming {
-                            this.theme_studio_reset_all_confirming = false;
-                            clear_theme_overrides(theme_name_for_reset.clone(), window, cx);
-                        } else {
-                            this.theme_studio_reset_all_confirming = true;
-                        }
-                        cx.notify();
-                    })),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("theme-studio-export", "Export Theme")
+                                .style(ButtonStyle::Outlined)
+                                .size(ButtonSize::Medium)
+                                .disabled(count == 0)
+                                .tooltip(Tooltip::text(
+                                    "Write these customizations to the themes folder as a \
+                                     selectable theme",
+                                ))
+                                .on_click(cx.listener(move |_this, _, _window, cx| {
+                                    let Some(overrides) = ThemeSettings::get_global(cx)
+                                        .theme_overrides
+                                        .get(&theme_name_for_export)
+                                        .cloned()
+                                    else {
+                                        return;
+                                    };
+                                    let appearance = cx.theme().appearance();
+                                    export_theme(
+                                        theme_name_for_export.clone(),
+                                        appearance,
+                                        overrides,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(
+                                "theme-studio-reset-all",
+                                if confirming {
+                                    "Click Again to Confirm"
+                                } else {
+                                    "Reset All"
+                                },
+                            )
+                            .style(ButtonStyle::Outlined)
+                            .size(ButtonSize::Medium)
+                            .disabled(count == 0)
+                            .tooltip(Tooltip::text(
+                                "Remove every customization for the active theme",
+                            ))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    if this.theme_studio_reset_all_confirming {
+                                        this.theme_studio_reset_all_confirming = false;
+                                        clear_theme_overrides(
+                                            theme_name_for_reset.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        this.theme_studio_reset_all_confirming = true;
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
                 ),
+        )
+        .children(
+            settings_window
+                .theme_studio_export_status
+                .as_ref()
+                .map(|status| {
+                    let (message, color) = match status {
+                        Ok(message) => (message, Color::Muted),
+                        Err(message) => (message, Color::Error),
+                    };
+                    Label::new(message.clone())
+                        .size(LabelSize::XSmall)
+                        .color(color)
+                }),
         )
         .child(Divider::horizontal())
 }
@@ -664,6 +803,37 @@ pub(crate) fn window_blur_material_label(value: WindowBlurMaterialContent) -> &'
         .iter()
         .find(|(candidate, _)| *candidate == value)
         .map_or("Default (HUD window)", |(_, label)| *label)
+}
+
+/// The `unstable.ui_density` values offered by the picker, in menu order.
+///
+/// Pinned to the enum's serde spellings by
+/// `ui_densities_match_the_settings_enum_spellings`, the same way the blur
+/// materials are.
+pub(crate) const UI_DENSITIES: [(UiDensity, &str); 3] = [
+    (UiDensity::Compact, "Compact"),
+    (UiDensity::Default, "Default"),
+    (UiDensity::Comfortable, "Comfortable"),
+];
+
+pub(crate) fn ui_density_label(value: UiDensity) -> &'static str {
+    UI_DENSITIES
+        .iter()
+        .find(|(candidate, _)| *candidate == value)
+        .map_or("Default", |(_, label)| *label)
+}
+
+fn write_ui_density(value: Option<UiDensity>, window: &mut Window, cx: &mut App) {
+    update_settings_file(
+        SettingsUiFile::User,
+        Some("unstable.ui_density"),
+        window,
+        cx,
+        move |settings_content, _| {
+            settings_content.theme.ui_density = value;
+        },
+    )
+    .log_err();
 }
 
 fn write_window_blur_material(
@@ -718,9 +888,84 @@ fn render_window_appearance_section(
         },
     );
 
+    let density_layers = setting_layers(
+        |settings_content| settings_content.theme.ui_density.as_ref(),
+        cx,
+    );
+    let density_is_set = density_layers.user.is_some();
+    let current_density = density_layers.resolved.unwrap_or_default();
+    let current_density_label = ui_density_label(current_density);
+
+    let density_menu = window.use_keyed_state(
+        SharedString::from(format!("ui-density-menu-{current_density_label}")),
+        cx,
+        |window, cx| {
+            ContextMenu::new(window, cx, move |mut menu, _, _| {
+                for (value, label) in UI_DENSITIES {
+                    menu = menu.toggleable_entry(
+                        label,
+                        value == current_density,
+                        IconPosition::End,
+                        None,
+                        move |window, cx| write_ui_density(Some(value), window, cx),
+                    );
+                }
+                menu
+            })
+        },
+    );
+
     v_flex()
         .gap_1()
         .child(SettingsSectionHeader::new("Window Appearance").no_padding(true))
+        .child(
+            h_flex()
+                .w_full()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(Label::new("UI Density").size(LabelSize::Small))
+                        .child(
+                            Label::new(
+                                "Unstable. Tightens or loosens spacing across the UI; \
+                                 expect some elements to be misaligned.",
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            DropdownMenu::new(
+                                "ui-density-dropdown",
+                                current_density_label,
+                                density_menu,
+                            )
+                            .aria_label("UI Density")
+                            .aria_description("How tightly the UI spaces its elements")
+                            .style(DropdownStyle::Outlined)
+                            .trigger_size(ButtonSize::Medium)
+                            .tab_index(0),
+                        )
+                        .when(density_is_set, |this| {
+                            this.child(
+                                IconButton::new("reset-ui-density", IconName::RotateCcw)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .aria_label("Reset to default density")
+                                    .tooltip(Tooltip::text("Reset to default density"))
+                                    .on_click(|_, window, cx| write_ui_density(None, window, cx)),
+                            )
+                        }),
+                ),
+        )
         .child(
             h_flex()
                 .w_full()
@@ -2355,6 +2600,83 @@ mod tests {
                     .expect("the spelling deserializes");
             assert_eq!(parsed, *value, "{spelling} should read back as itself");
         }
+    }
+
+    /// An export that Zed's own loader rejects is worse than no export, so the
+    /// written bytes are round-tripped through the real deserializer.
+    #[test]
+    fn exported_theme_round_trips_through_zeds_theme_loader() {
+        let mut overrides = ThemeStyleContent::default();
+        overrides.colors.background = Some("#101010".to_string().into());
+
+        let family = exported_theme_family("Ayu Mirage", Appearance::Dark, overrides);
+        let json = serde_json::to_string_pretty(&family).expect("the family serializes");
+
+        let loaded = theme_settings::deserialize_user_theme(json.as_bytes())
+            .expect("Zed's loader accepts what we wrote");
+        assert_eq!(loaded.name, "Ayu Mirage (Customized)");
+        let theme = loaded.themes.first().expect("one theme was written");
+        assert_eq!(theme.appearance, AppearanceContent::Dark);
+        assert_eq!(
+            theme
+                .style
+                .colors
+                .background
+                .as_ref()
+                .map(|c| c.to_string()),
+            Some("#101010".to_string())
+        );
+
+        // Sparse styles are the point: refining must fill everything else from
+        // the built-in base rather than leaving the theme unusable.
+        let refined = theme_settings::refine_theme_family(loaded);
+        assert_eq!(refined.themes.len(), 1);
+    }
+
+    #[test]
+    fn theme_file_stems_stay_inside_the_themes_directory() {
+        assert_eq!(
+            theme_file_stem("Ayu Mirage (Customized)"),
+            "ayu-mirage-customized"
+        );
+        assert_eq!(theme_file_stem("../../etc/passwd"), "etc-passwd");
+        assert_eq!(theme_file_stem("///"), "theme");
+        assert!(
+            !theme_file_stem("a/../../b").contains('/'),
+            "a stem must never contain a path separator"
+        );
+    }
+
+    /// Same reasoning as the blur materials: the density picker writes these
+    /// strings straight into settings.json, so drift from the enum's serde
+    /// spellings would make the control silently do nothing.
+    #[test]
+    fn ui_densities_match_the_settings_enum_spellings() {
+        const SPELLINGS: [&str; 3] = ["compact", "default", "comfortable"];
+
+        let serialized: Vec<String> = UI_DENSITIES
+            .iter()
+            .map(|(value, _)| {
+                serde_json::to_value(value)
+                    .expect("the density serializes")
+                    .as_str()
+                    .expect("the density serializes to a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(serialized, SPELLINGS);
+
+        for (spelling, (value, _)) in SPELLINGS.iter().zip(UI_DENSITIES.iter()) {
+            let parsed: UiDensity = serde_json::from_value(serde_json::json!(spelling))
+                .expect("the spelling deserializes");
+            assert_eq!(parsed, *value, "{spelling} should read back as itself");
+        }
+
+        assert_eq!(
+            ui_density_label(UiDensity::default()),
+            "Default",
+            "the fallback label must name the actual default"
+        );
     }
 
     #[test]
