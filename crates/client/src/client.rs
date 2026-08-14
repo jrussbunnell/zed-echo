@@ -352,6 +352,21 @@ impl Credentials {
     }
 }
 
+/// The keychain key to store credentials under when `credentials_url` is not
+/// set explicitly.
+///
+/// Zed Echo is installed alongside stock Zed and signs in to the same server,
+/// so returning `server_url` for both would give them one shared keychain
+/// entry — signing out of one silently signs out of the other. Only this fork's
+/// channel gets a distinct key; the shipping channels keep the upstream value
+/// so no existing install is logged out by an upgrade.
+fn default_credentials_url(server_url: &str, channel: Option<ReleaseChannel>) -> String {
+    match channel {
+        Some(channel @ ReleaseChannel::Dev) => format!("{server_url}#{}", channel.app_id()),
+        _ => server_url.to_string(),
+    }
+}
+
 pub struct ClientCredentialsProvider {
     provider: Arc<dyn CredentialsProvider>,
 }
@@ -368,9 +383,23 @@ impl ClientCredentialsProvider {
     }
 
     /// Returns the key used for credential storage in the system keychain.
+    ///
+    /// Zed Echo is installed alongside stock Zed and signs in to the same
+    /// server, so defaulting this to `server_url` would give both apps the same
+    /// keychain entry — signing out of one silently signs out of the other.
+    /// Only this fork's channel gets a distinct default; the shipping channels
+    /// keep the upstream behavior so no existing install is logged out by an
+    /// upgrade. An explicit `credentials_url` setting still wins everywhere.
     fn credentials_url(&self, cx: &AsyncApp) -> Result<String> {
         let from_settings = cx.update(|cx| ClientSettings::get_global(cx).credentials_url.clone());
-        Ok(from_settings.unwrap_or(self.server_url(cx)?))
+        if let Some(from_settings) = from_settings {
+            return Ok(from_settings);
+        }
+        let server_url = self.server_url(cx)?;
+        // `try_global`, not `global`: the channel is unset in tests and in any
+        // headless context, and a keychain key is not worth a panic.
+        let channel = cx.update(|cx| ReleaseChannel::try_global(cx));
+        Ok(default_credentials_url(&server_url, channel))
     }
 
     /// Reads the credentials from the provider.
@@ -2011,6 +2040,40 @@ mod tests {
     use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
+
+    /// Zed Echo and stock Zed are installed side by side and sign in to the
+    /// same server. Sharing a keychain key means signing out of one signs out
+    /// of the other, so the fork's channel must not collide with Stable — and
+    /// Stable must keep the exact upstream value, or every existing install is
+    /// logged out by an upgrade.
+    #[test]
+    fn dev_builds_do_not_share_a_keychain_entry_with_stable() {
+        let server_url = "https://zed.dev";
+
+        let stable = default_credentials_url(server_url, Some(ReleaseChannel::Stable));
+        assert_eq!(
+            stable, server_url,
+            "shipping channels must keep the upstream key"
+        );
+        for channel in [ReleaseChannel::Preview, ReleaseChannel::Nightly] {
+            assert_eq!(
+                default_credentials_url(server_url, Some(channel)),
+                server_url
+            );
+        }
+        assert_eq!(
+            default_credentials_url(server_url, None),
+            server_url,
+            "an unset channel must not invent a new key"
+        );
+
+        let dev = default_credentials_url(server_url, Some(ReleaseChannel::Dev));
+        assert_ne!(dev, stable, "Zed Echo must not clobber stock Zed's entry");
+        assert!(
+            dev.starts_with(server_url),
+            "the key should still name the server it belongs to, got {dev}"
+        );
+    }
 
     #[test]
     fn test_proxy_settings_trims_and_ignores_empty_proxy() {
