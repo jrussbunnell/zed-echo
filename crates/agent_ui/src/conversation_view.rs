@@ -640,6 +640,14 @@ pub struct ConversationView {
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
+    /// Subagents whose thread is being built right now.
+    ///
+    /// Loading is asynchronous and the thread is only registered once it
+    /// finishes, so `threads` alone cannot tell a caller that a load is already
+    /// under way. Restoring a parent reaches `load_subagent_session` twice —
+    /// directly, and again through the `SubagentSpawned` it emits — and without
+    /// this both would build a thread for the same subagent.
+    loading_subagents: HashSet<acp::SessionId>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
@@ -985,6 +993,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
+            loading_subagents: HashSet::default(),
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
@@ -2270,9 +2279,12 @@ impl ConversationView {
         let Some(connected) = self.as_connected() else {
             return;
         };
-        if connected.threads.contains_key(&subagent_id) {
+        if connected.threads.contains_key(&subagent_id)
+            || self.loading_subagents.contains(&subagent_id)
+        {
             return;
         }
+        let loading_id = subagent_id.clone();
         // A subagent the connection assembled locally is already a thread and
         // needs no load — and must not be gated behind the load capability,
         // which says nothing about it.
@@ -2304,8 +2316,16 @@ impl ConversationView {
             ),
         };
 
+        self.loading_subagents.insert(loading_id.clone());
         cx.spawn_in(window, async move |this, cx| {
-            let subagent_thread = subagent_thread_task.await?;
+            let subagent_thread = subagent_thread_task.await;
+            // Cleared whether or not the load worked, so a failure does not
+            // wedge this subagent as permanently "loading".
+            this.update(cx, |this, _cx| {
+                this.loading_subagents.remove(&loading_id);
+            })
+            .log_err();
+            let subagent_thread = subagent_thread?;
             this.update_in(cx, |this, window, cx| {
                 let Some(conversation) = this
                     .as_connected()
@@ -12466,6 +12486,85 @@ pub(crate) mod tests {
                 Some(subagent_session_id.clone()),
             );
         });
+    }
+
+    /// Restoring a parent reaches `load_subagent_session` twice for each
+    /// subagent — directly, and again through the `SubagentSpawned` that
+    /// re-stamping emits. Loading is asynchronous and the thread is registered
+    /// only at the end, so without an in-flight guard both calls build a thread
+    /// and the subagent appears twice.
+    #[gpui::test]
+    async fn a_subagent_is_not_loaded_twice_at_once(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread);
+
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+
+        // Both entry points fire before either can finish registering.
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.load_subagent_session(
+                subagent_session_id.clone(),
+                parent_session_id.clone(),
+                window,
+                cx,
+            );
+            view.load_subagent_session(
+                subagent_session_id.clone(),
+                parent_session_id.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let subagent_count = conversation_view.read_with(cx, |view, cx| {
+            view.active_thread()
+                .map(|active| {
+                    active
+                        .read(cx)
+                        .thread
+                        .read(cx)
+                        .subagent_tool_calls()
+                        .count()
+                })
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            subagent_count, 1,
+            "a subagent must not be built twice when both load paths fire"
+        );
     }
 
     /// Regression test: a restored subagent's thread is built by the client, so
