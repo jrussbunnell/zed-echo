@@ -1,0 +1,71 @@
+# Zed Echo's own test run.
+#
+# Every upstream workflow gates its jobs on
+# `github.repository_owner == 'zed-industries'`, so on this fork they are
+# scheduled and immediately skipped — the fork's tests have never actually run
+# in CI. This file is fork-owned and intentionally separate: it is a new path
+# upstream does not have, so it never conflicts during a rebase. Do not un-gate
+# the upstream workflows to fix this.
+#
+# Scope is the crates this fork actually modifies, not the whole workspace: a
+# full workspace run on macOS is slow and expensive, and the point here is to
+# catch regressions in fork-owned code.
+name: echo_tests
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+on:
+  pull_request:
+    branches:
+      - '**'
+  push:
+    branches:
+      - main
+      - read-aloud
+
+permissions:
+  contents: read
+
+concurrency:
+  group: echo_tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Not gated on repository_owner: that gate is exactly what this file exists
+    # to work around.
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed per workflow so this does not fight the upstream jobs' cache.
+          prefix-key: echo-tests
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests for fork-modified crates
+        run: |
+          cargo test --no-fail-fast \
+            -p acp_thread \
+            -p agent_servers \
+            -p agent_ui \
+            -p read_aloud \
+            -p settings_ui \
+            -p sidebar
+
+      - name: Clippy
+        run: ./script/clippy
