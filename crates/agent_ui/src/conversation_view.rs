@@ -1453,8 +1453,9 @@ impl ConversationView {
             })
             .collect::<Vec<_>>();
 
+        let parent_session_id = thread.read(cx).session_id().clone();
         if !subagent_sessions.is_empty() {
-            let parent_session_id = thread.read(cx).session_id().clone();
+            let parent_session_id = parent_session_id.clone();
             cx.spawn_in(window, async move |this, cx| {
                 this.update_in(cx, |this, window, cx| {
                     for subagent_id in subagent_sessions {
@@ -1466,6 +1467,50 @@ impl ConversationView {
                         );
                     }
                 })
+            })
+            .detach();
+        }
+
+        // A reloaded parent cannot find its subagents by scanning above: the
+        // link lives in each spawning tool call's `subagent_session_info`,
+        // which is stamped in memory while the subagent runs and never
+        // persisted, so the replayed transcript has the tool calls and no trace
+        // of what they spawned. The stored transcripts are the only record, so
+        // ask them instead and re-attach.
+        if thread.read(cx).parent_session_id().is_none()
+            && let Some(store) = acp_thread::subagent_transcript_store(cx)
+        {
+            let stored = store.sessions_for_parent(&parent_session_id, cx);
+            let thread = thread.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let stored = stored.await.log_err().unwrap_or_default();
+                if stored.is_empty() {
+                    return;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    for subagent_id in stored {
+                        // Already live (the thread never went away): nothing to
+                        // restore, and re-stamping would respawn its card.
+                        if this
+                            .as_connected()
+                            .is_some_and(|connected| connected.threads.contains_key(&subagent_id))
+                        {
+                            continue;
+                        }
+                        let attached = thread.update(cx, |thread, cx| {
+                            thread.restore_subagent(subagent_id.clone(), cx)
+                        });
+                        if attached {
+                            this.load_subagent_session(
+                                subagent_id,
+                                parent_session_id.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                })
+                .log_err();
             })
             .detach();
         }

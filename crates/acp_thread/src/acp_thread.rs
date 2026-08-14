@@ -370,6 +370,20 @@ pub trait SubagentTranscriptStore: 'static {
         cx: &mut App,
     ) -> Task<Result<Vec<acp::SessionUpdate>>>;
 
+    /// Every subagent recorded under `parent_session_id`, in spawn order.
+    ///
+    /// This is how a reloaded parent finds its subagents at all. The link from
+    /// a spawning tool call to its subagent lives in that call's
+    /// `subagent_session_info`, which is stamped in memory while the subagent
+    /// runs and is never sent to the agent or persisted — so after a restart
+    /// the parent's replayed tool calls carry no trace of it and scanning them
+    /// finds nothing.
+    fn sessions_for_parent(
+        &self,
+        parent_session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp::SessionId>>>;
+
     /// Drops everything recorded for a parent session and its subagents, for
     /// when that thread is deleted.
     fn delete_for_parent(&self, parent_session_id: &acp::SessionId);
@@ -401,6 +415,21 @@ pub fn subagent_transcript_store(cx: &App) -> Option<Rc<dyn SubagentTranscriptSt
 /// life of the parent session so a subagent keeps its identity across updates,
 /// and namespaced so it can never collide with a real session id the agent
 /// hands out.
+/// The spawning tool call encoded in a derived subagent's session id, the
+/// inverse of [`derived_subagent_session_id`].
+///
+/// Used when restoring a parent thread: the stored transcripts name subagent
+/// sessions, and the parent's tool calls have to be matched back to them to
+/// re-stamp the link that only ever existed in memory.
+pub fn tool_call_id_from_derived_session_id(
+    parent: &acp::SessionId,
+    session_id: &acp::SessionId,
+) -> Option<acp::ToolCallId> {
+    let prefix = format!("{}/subagent/", parent.0);
+    let tool_call_id = session_id.0.strip_prefix(&prefix)?;
+    (!tool_call_id.is_empty()).then(|| acp::ToolCallId::new(tool_call_id))
+}
+
 pub fn derived_subagent_session_id(
     parent: &acp::SessionId,
     tool_call_id: &acp::ToolCallId,
@@ -3216,6 +3245,44 @@ impl AcpThread {
 
     pub fn subagent_spawned(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+    }
+
+    /// Re-attaches a subagent to the spawning tool call it came from, after a
+    /// restart has replayed that call without the link.
+    ///
+    /// `subagent_session_info` is stamped while the subagent runs and is never
+    /// sent to the agent, so a reloaded transcript has the tool call but no
+    /// indication it spawned anything — the card renders as an ordinary tool
+    /// call and the subagent tray and sidebar rows come up empty. Restoring the
+    /// stamp is what puts them back.
+    ///
+    /// Returns whether the tool call was found; a subagent whose spawning call
+    /// is missing from the replayed transcript has nothing to attach to.
+    pub fn restore_subagent(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(tool_call_id) =
+            tool_call_id_from_derived_session_id(&self.session_id, &session_id)
+        else {
+            return false;
+        };
+        if self.tool_call(&tool_call_id).is_none() {
+            return false;
+        }
+        let session_info = SubagentSessionInfo {
+            session_id: session_id.clone(),
+            message_start_index: 0,
+            message_end_index: None,
+        };
+        let meta = acp::Meta::from_iter([(
+            SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::json!(&session_info),
+        )]);
+        self.update_tool_call(
+            acp::ToolCallUpdate::new(tool_call_id, acp::ToolCallUpdateFields::new()).meta(meta),
+            cx,
+        )
+        .log_err();
+        self.subagent_spawned(session_id, cx);
+        true
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {

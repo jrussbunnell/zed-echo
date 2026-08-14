@@ -706,6 +706,23 @@ impl acp_thread::SubagentTranscriptStore for SubagentTranscripts {
         })
     }
 
+    fn sessions_for_parent(
+        &self,
+        parent_session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<acp::SessionId>>> {
+        let db = self.db.clone();
+        let parent_session_id = parent_session_id.0.to_string();
+        cx.background_spawn(async move {
+            Ok(db
+                .subagent_sessions_for_parent(parent_session_id)
+                .await?
+                .into_iter()
+                .map(acp::SessionId::new)
+                .collect())
+        })
+    }
+
     fn delete_for_parent(&self, parent_session_id: &acp::SessionId) {
         self.writes
             .unbounded_send(TranscriptWrite::DeleteForParent(parent_session_id.clone()))
@@ -1684,6 +1701,26 @@ impl ThreadMetadataDb {
                  WHERE session_id = ? ORDER BY ordinal ASC",
             )?;
             statement(session_id)
+        })
+        .await
+    }
+
+    /// Every subagent recorded under a parent, in spawn order.
+    ///
+    /// Ordered by the first row each session wrote, which is the order the
+    /// subagents were spawned in — the same order the parent's transcript
+    /// shows their cards.
+    pub async fn subagent_sessions_for_parent(
+        &self,
+        parent_session_id: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.write(move |connection| {
+            let mut statement = connection.select_bound::<String, String>(
+                "SELECT session_id FROM subagent_transcript_updates \
+                 WHERE parent_session_id = ? \
+                 GROUP BY session_id ORDER BY MIN(id) ASC",
+            )?;
+            statement(parent_session_id)
         })
         .await
     }
@@ -4040,6 +4077,72 @@ mod tests {
             "the stale transcript must be replaced, not appended to"
         );
         let _ = &parent_session_id;
+    }
+
+    /// The gap that made the first attempt at persistence useless: the
+    /// transcripts were being written correctly, but a reloaded parent had no
+    /// way to find them. The link lives in each spawning tool call's
+    /// `subagent_session_info`, stamped in memory and never persisted, so
+    /// scanning the replayed transcript returns nothing. Discovery has to go
+    /// through the store.
+    #[gpui::test]
+    async fn a_parent_can_find_its_subagents_after_a_restart(cx: &mut TestAppContext) {
+        use acp_thread::SubagentTranscriptStore as _;
+
+        init_test(cx);
+        let store = cx.update(|cx| {
+            let db_name = TestMetadataDbName::global(cx);
+            let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
+            SubagentTranscripts::new(ThreadMetadataDb(db), cx.background_executor().clone())
+        });
+
+        let parent = acp::SessionId::new("parent");
+        let other_parent = acp::SessionId::new("unrelated");
+        let first =
+            acp_thread::derived_subagent_session_id(&parent, &acp::ToolCallId::new("toolu_first"));
+        let second =
+            acp_thread::derived_subagent_session_id(&parent, &acp::ToolCallId::new("toolu_second"));
+        let stranger = acp_thread::derived_subagent_session_id(
+            &other_parent,
+            &acp::ToolCallId::new("toolu_other"),
+        );
+
+        for (session, parent_of) in [
+            (&first, &parent),
+            (&second, &parent),
+            (&stranger, &other_parent),
+        ] {
+            store.append(
+                session,
+                parent_of,
+                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::from("work".to_string()),
+                )),
+            );
+        }
+        cx.run_until_parked();
+
+        let found = cx
+            .update(|cx| store.sessions_for_parent(&parent, cx))
+            .await
+            .expect("the lookup succeeds");
+        assert_eq!(
+            found,
+            vec![first.clone(), second.clone()],
+            "both subagents come back in spawn order, and another parent's does not"
+        );
+
+        // The spawning tool call has to be recoverable from the session id,
+        // because that is what re-attaches the subagent to the parent's card.
+        assert_eq!(
+            acp_thread::tool_call_id_from_derived_session_id(&parent, &first),
+            Some(acp::ToolCallId::new("toolu_first"))
+        );
+        assert_eq!(
+            acp_thread::tool_call_id_from_derived_session_id(&other_parent, &first),
+            None,
+            "a session belonging to another parent must not resolve"
+        );
     }
 
     #[gpui::test]
