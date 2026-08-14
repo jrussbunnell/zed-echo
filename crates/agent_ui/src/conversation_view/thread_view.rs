@@ -6338,31 +6338,54 @@ impl ThreadView {
             )
     }
 
-    fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
-        let Some(parent_session_id) = self.parent_session_id.as_ref() else {
-            return false;
-        };
-
+    /// Applies `f` to the tool call that spawned this subagent, in the parent's
+    /// transcript.
+    ///
+    /// That tool call is the only authoritative signal for what a subagent is
+    /// doing. The subagent's own [`AcpThread::status`] is useless here: a
+    /// derived subagent never owns a turn, so it reads `Idle` from the moment
+    /// it is created and would render as finished before it had started.
+    fn with_subagent_tool_call<R>(
+        &self,
+        cx: &App,
+        f: impl FnOnce(&acp_thread::ToolCall) -> R,
+    ) -> Option<R> {
+        let parent_session_id = self.parent_session_id.as_ref()?;
         let my_session_id = self.thread.read(cx).session_id().clone();
 
-        self.server_view
-            .upgrade()
-            .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
-            .is_some_and(|parent_view| {
-                parent_view
-                    .read(cx)
-                    .thread
-                    .read(cx)
-                    .tool_call_for_subagent(&my_session_id)
-                    .is_some_and(|tc| {
-                        matches!(
-                            tc.status,
-                            ToolCallStatus::Canceled
-                                | ToolCallStatus::Failed
-                                | ToolCallStatus::Rejected
-                        )
-                    })
-            })
+        let parent_view = self
+            .server_view
+            .upgrade()?
+            .read(cx)
+            .thread_view(parent_session_id)?;
+        let parent_view = parent_view.read(cx);
+        let tool_call = parent_view
+            .thread
+            .read(cx)
+            .tool_call_for_subagent(&my_session_id)?;
+        Some(f(tool_call))
+    }
+
+    fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
+        self.with_subagent_tool_call(cx, |tool_call| {
+            matches!(
+                tool_call.status,
+                ToolCallStatus::Canceled | ToolCallStatus::Failed | ToolCallStatus::Rejected
+            )
+        })
+        .unwrap_or(false)
+    }
+
+    fn is_subagent_running(&self, cx: &App) -> bool {
+        self.with_subagent_tool_call(cx, |tool_call| {
+            matches!(
+                tool_call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+            )
+        })
+        .unwrap_or(false)
     }
 
     pub(crate) fn render_subagent_titlebar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
@@ -6373,7 +6396,7 @@ impl ThreadView {
 
         let server_view = self.server_view.clone();
         let thread = self.thread.clone();
-        let is_done = thread.read(cx).status() == ThreadStatus::Idle;
+        let is_done = !self.is_subagent_running(cx);
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;

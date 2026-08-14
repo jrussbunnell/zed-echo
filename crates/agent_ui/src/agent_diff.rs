@@ -1323,6 +1323,20 @@ impl AgentDiff {
         });
     }
 
+    /// The thread whose edits this workspace's review actions currently act on.
+    #[cfg(test)]
+    pub fn active_thread(
+        workspace: &WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> Option<Entity<AcpThread>> {
+        Self::global(cx)
+            .read(cx)
+            .workspace_threads
+            .get(workspace)?
+            .thread
+            .upgrade()
+    }
+
     fn register_active_thread_impl(
         &mut self,
         workspace: &WeakEntity<Workspace>,

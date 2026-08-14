@@ -3990,15 +3990,24 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.cancel_outstanding_elicitations(cx);
 
-        let Some(turn) = self.running_turn.take() else {
+        // A derived subagent thread never owns a turn: its entries arrive as
+        // notifications routed from the parent's turn. Gating on `running_turn`
+        // would make cancelling one a silent no-op, so only threads that drive
+        // their own turns get the idle early-return. The connection maps a
+        // subagent's session id back to the turn it is running inside.
+        let turn = self.running_turn.take();
+        if turn.is_none() && self.parent_session_id.is_none() {
             return Task::ready(());
-        };
+        }
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.connection.cancel(&self.session_id, cx);
         cx.emit(AcpThreadEvent::StatusChanged);
 
         // Wait for the send task to complete
-        cx.background_spawn(turn.send_task)
+        match turn {
+            Some(turn) => cx.background_spawn(turn.send_task),
+            None => Task::ready(()),
+        }
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
@@ -8833,6 +8842,7 @@ mod tests {
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
+        cancel_calls: Rc<RefCell<Vec<acp::SessionId>>>,
         on_user_message: Option<
             Rc<
                 dyn Fn(
@@ -8853,6 +8863,7 @@ mod tests {
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
+                cancel_calls: Default::default(),
             }
         }
 
@@ -8965,7 +8976,9 @@ mod tests {
             })
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+        fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
+            self.cancel_calls.borrow_mut().push(session_id.clone());
+        }
 
         fn truncate(
             &self,
@@ -10272,6 +10285,64 @@ mod tests {
             thread.read_with(cx, |t, _| t.status()),
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
+        );
+    }
+
+    /// Regression test: a derived subagent thread never owns a `running_turn`
+    /// (its entries arrive as notifications routed out of the parent's turn),
+    /// so gating cancellation on `running_turn` made every "Stop Subagent"
+    /// button a silent no-op. The connection is what knows how to map a
+    /// subagent back to the turn it runs inside, so the request has to reach it.
+    #[gpui::test]
+    async fn test_cancelling_a_subagent_reaches_the_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let cancel_calls = connection.cancel_calls.clone();
+        let work_dirs = PathList::new(&[Path::new(path!("/test"))]);
+
+        let subagent_session_id = acp::SessionId::new("parent/subagent/tool-1");
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let subagent = cx.new(|cx| {
+            AcpThread::new(
+                Some(acp::SessionId::new("parent")),
+                None,
+                Some(work_dirs.clone()),
+                connection.clone(),
+                project.clone(),
+                action_log,
+                subagent_session_id.clone(),
+                watch::Receiver::constant(acp::PromptCapabilities::new()),
+                cx,
+            )
+        });
+
+        assert_eq!(
+            subagent.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle,
+            "a subagent owns no turn, so its own status is Idle even while it runs"
+        );
+
+        subagent.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        assert_eq!(
+            cancel_calls.borrow().clone(),
+            vec![subagent_session_id],
+            "cancelling a subagent must reach the connection"
+        );
+
+        cancel_calls.borrow_mut().clear();
+        let root = cx
+            .update(|cx| connection.clone().new_session(project, work_dirs, cx))
+            .await
+            .unwrap();
+        root.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        assert!(
+            cancel_calls.borrow().is_empty(),
+            "a genuinely idle root thread has nothing to cancel"
         );
     }
 }

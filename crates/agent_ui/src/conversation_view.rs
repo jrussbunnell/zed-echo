@@ -1384,7 +1384,13 @@ impl ConversationView {
             list_state.scroll_to_end();
         }
 
-        AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        // There is one AgentDiff per workspace, so pointing it at a subagent
+        // would silently narrow Keep All / Reject All to that subagent's files
+        // while the parent turn is still editing others. Subagents load
+        // mid-turn, so this has to stay on the root thread.
+        if thread.read(cx).parent_session_id().is_none() {
+            AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        }
 
         let connection = thread.read(cx).connection().clone();
         let session_id = thread.read(cx).session_id().clone();
@@ -12337,6 +12343,75 @@ pub(crate) mod tests {
                 Some(subagent_session_id.clone()),
             );
         });
+    }
+
+    /// Regression test: there is one `AgentDiff` per workspace, and subagents
+    /// load while the parent turn is still running. Pointing the workspace's
+    /// diff review at a subagent as it loads silently narrowed Keep All /
+    /// Reject All to that subagent's files.
+    #[gpui::test]
+    async fn test_loading_a_subagent_leaves_workspace_review_on_the_parent(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let workspace = conversation_view.read_with(cx, |view, _cx| view.workspace.clone());
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread);
+
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            acp::ToolCallStatus::InProgress,
+            cx,
+        );
+        cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.subagent_spawned(subagent_session_id.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            conversation_view
+                .read_with(cx, |view, _cx| view.thread_view(&subagent_session_id))
+                .is_some(),
+            "this test is only meaningful once the subagent has actually loaded"
+        );
+
+        let reviewing = cx
+            .update(|_window, cx| AgentDiff::active_thread(&workspace, cx))
+            .expect("the workspace should still be reviewing some thread");
+        assert_eq!(
+            reviewing.read_with(cx, |thread, _| thread.session_id().clone()),
+            parent_session_id,
+            "loading a subagent must not retarget the workspace's diff review"
+        );
     }
 
     #[gpui::test]
