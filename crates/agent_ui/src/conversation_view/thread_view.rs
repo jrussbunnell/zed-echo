@@ -3424,6 +3424,13 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A derived subagent has no session on the agent side, so prompting it
+        // directly would name a session the agent has never heard of. Claude
+        // Code's agent teams address a member by name instead, which only the
+        // parent can do.
+        if self.is_subagent() && self.send_to_subagent(window, cx) {
+            return;
+        }
         let thread = &self.thread;
 
         if self.is_loading_contents {
@@ -6456,6 +6463,79 @@ impl ThreadView {
         Some(f(tool_call))
     }
 
+    /// The name the parent addresses this subagent by, when it is a member of a
+    /// Claude Code agent team.
+    ///
+    /// Present only when the parent named it on spawn. Without a name there is
+    /// nothing for `SendMessage` to address, so the composer stays disabled
+    /// rather than sending something that cannot be delivered.
+    fn agent_team_name(&self, cx: &App) -> Option<SharedString> {
+        self.with_subagent_tool_call(cx, acp_thread::AcpThread::agent_team_name)
+            .flatten()
+    }
+
+    /// The parent's thread, which is what actually talks to the agent: a
+    /// derived subagent has no session on the agent side, so a message for it
+    /// has to be delivered by the parent calling `SendMessage`.
+    fn parent_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
+        let parent_session_id = self.parent_session_id.as_ref()?;
+        Some(
+            self.server_view
+                .upgrade()?
+                .read(cx)
+                .thread_view(parent_session_id)?
+                .read(cx)
+                .thread
+                .clone(),
+        )
+    }
+
+    /// Sends the composer's text to this subagent by asking the parent to
+    /// relay it with `SendMessage`.
+    ///
+    /// Returns false when there is nothing to relay through — an unnamed
+    /// subagent, or a parent that is no longer loaded — so the caller can fall
+    /// back rather than silently swallowing the message.
+    fn send_to_subagent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(name), Some(parent)) = (self.agent_team_name(cx), self.parent_thread(cx)) else {
+            return false;
+        };
+        let text = self.message_editor.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return false;
+        }
+
+        // Shown where it was typed. The parent relays it, but the user is
+        // talking to this subagent and this is the transcript they are looking
+        // at.
+        self.thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, acp::ContentBlock::from(text.clone()), cx);
+        });
+        self.message_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+
+        // `send_command` rather than `send`: the user did not write this to the
+        // parent, and a verbatim copy of the directive in the parent's
+        // transcript reads as though they did. The parent's `SendMessage` tool
+        // call still shows there.
+        let directive = format!(
+            "Use the SendMessage tool to deliver this message to the agent named \"{name}\". \
+             Relay it verbatim and do not act on it yourself:\n\n{text}"
+        );
+        let send = parent.update(cx, |parent, cx| {
+            parent.send_command(vec![acp::ContentBlock::from(directive)], cx)
+        });
+        cx.spawn(async move |_this, _cx| {
+            // The reply arrives as tagged updates routed back into this
+            // subagent's thread, so nothing here consumes the response; this
+            // only surfaces a delivery failure.
+            send.await.log_err();
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
     fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
         self.with_subagent_tool_call(cx, |tool_call| {
             matches!(
@@ -6567,7 +6647,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.is_subagent() {
+        // A subagent gets a composer only when the parent named it: the message
+        // is delivered by the parent calling `SendMessage`, which addresses a
+        // team member by name, so an unnamed subagent has nothing to send to
+        // and its composer would swallow whatever was typed.
+        if self.is_subagent() && self.agent_team_name(cx).is_none() {
             return div().into_any_element();
         }
 

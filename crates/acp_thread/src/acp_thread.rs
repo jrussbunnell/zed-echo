@@ -407,6 +407,19 @@ pub fn subagent_transcript_store(cx: &App) -> Option<Rc<dyn SubagentTranscriptSt
         .map(|global| global.0.clone())
 }
 
+/// The agent-team name carried by a spawn or resume tool call's raw input.
+///
+/// `name` on an `Agent` spawn, `to` on a `SendMessage` resume — checked in that
+/// order because a spawn carries only the former and a resume only the latter.
+pub fn agent_team_name_from_raw_input(raw_input: &serde_json::Value) -> Option<SharedString> {
+    let name = raw_input
+        .get("name")
+        .or_else(|| raw_input.get("to"))?
+        .as_str()?
+        .trim();
+    (!name.is_empty()).then(|| SharedString::from(name.to_string()))
+}
+
 /// The session id given to the thread that collects a Claude Code subagent's
 /// work.
 ///
@@ -3634,6 +3647,29 @@ impl AcpThread {
                 }
                 _ => None,
             })
+    }
+
+    /// The name the parent addresses a spawned agent by, read from the tool
+    /// call that started it.
+    ///
+    /// Claude Code's agent teams give each member a name (`Agent`'s `name`) and
+    /// resume it by that name (`SendMessage`'s `to`). Both calls are ordinary
+    /// tool calls in the parent transcript, so the name is the one identifier
+    /// that survives a resume — the task id does not, because a resume is
+    /// started by the `SendMessage` call rather than the original spawn.
+    pub fn agent_team_name(tool_call: &ToolCall) -> Option<SharedString> {
+        agent_team_name_from_raw_input(tool_call.raw_input.as_ref()?)
+    }
+
+    /// The derived subagent session already representing `name`, if one exists.
+    ///
+    /// A `SendMessage` resume arrives under the resuming call's id, so without
+    /// this every message sent to a team member would open a second subagent
+    /// thread beside the first instead of continuing the conversation.
+    pub fn subagent_session_for_agent_name(&self, name: &str) -> Option<acp::SessionId> {
+        self.subagent_tool_calls().find_map(|(_, tool_call, info)| {
+            (Self::agent_team_name(tool_call)?.as_ref() == name).then(|| info.session_id.clone())
+        })
     }
 
     pub fn tool_call_for_subagent(&self, session_id: &acp::SessionId) -> Option<&ToolCall> {
@@ -10535,6 +10571,39 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+    }
+
+    /// Claude Code's agent teams address a member by name: `Agent` spawns with
+    /// `name`, `SendMessage` resumes with `to`. The name is the only identifier
+    /// that survives a resume, because the resume runs as a new task started by
+    /// the `SendMessage` call rather than by the original spawn.
+    #[test]
+    fn an_agent_team_member_is_identified_by_name_across_a_resume() {
+        let spawn = serde_json::json!({
+            "name": "read-aloud-audit",
+            "subagent_type": "general-purpose",
+            "prompt": "audit the read aloud crate",
+        });
+        let resume = serde_json::json!({
+            "to": "read-aloud-audit",
+            "summary": "follow up",
+            "message": "also check the sink",
+        });
+        let unnamed = serde_json::json!({ "prompt": "no name" });
+        let blank = serde_json::json!({ "name": "   " });
+
+        for (raw_input, expected) in [
+            (spawn, Some("read-aloud-audit")),
+            (resume, Some("read-aloud-audit")),
+            (unnamed, None),
+            (blank, None),
+        ] {
+            assert_eq!(
+                agent_team_name_from_raw_input(&raw_input).as_deref(),
+                expected,
+                "a spawn and a resume must resolve to the same agent"
+            );
+        }
     }
 
     /// Regression test: replaying a transcript through `handle_session_update`
