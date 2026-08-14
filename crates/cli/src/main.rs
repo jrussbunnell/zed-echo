@@ -1290,6 +1290,10 @@ mod mac_os {
     struct InfoPlist {
         #[serde(rename = "CFBundleShortVersionString")]
         bundle_short_version_string: String,
+        // Read rather than hardcoded: the executable is named after the release
+        // channel, so a hardcoded name breaks every rebranded bundle.
+        #[serde(rename = "CFBundleExecutable")]
+        bundle_executable: String,
     }
 
     enum Bundle {
@@ -1421,10 +1425,7 @@ mod mac_os {
             ipc_url: String,
             user_data_dir: Option<&str>,
         ) -> io::Result<ExitStatus> {
-            let path = match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
-                Bundle::LocalPath { executable, .. } => executable.clone(),
-            };
+            let path = self.executable_path();
 
             let mut cmd = std::process::Command::new(path);
             cmd.arg(ipc_url);
@@ -1435,10 +1436,7 @@ mod mac_os {
         }
 
         fn path(&self) -> PathBuf {
-            match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
-                Bundle::LocalPath { executable, .. } => executable.clone(),
-            }
+            self.executable_path()
         }
     }
 
@@ -1454,6 +1452,15 @@ mod mac_os {
             match self {
                 Self::App { app_bundle, .. } => app_bundle,
                 Self::LocalPath { executable, .. } => executable,
+            }
+        }
+
+        fn executable_path(&self) -> PathBuf {
+            match self {
+                Self::App { app_bundle, plist } => app_bundle
+                    .join("Contents/MacOS")
+                    .join(&plist.bundle_executable),
+                Self::LocalPath { executable, .. } => executable.clone(),
             }
         }
     }
