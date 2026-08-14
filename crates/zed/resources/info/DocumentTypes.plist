@@ -26,8 +26,13 @@
         <array>
             <string>****</string>
         </array>
+        <!-- Alternate, not Default: this fork is installed alongside stock Zed,
+             and two bundles both claiming Default for the same ~28 extensions
+             makes LaunchServices pick a winner nondeterministically across
+             rebuilds. Alternate keeps Zed Echo in the "Open With" menu without
+             stealing the default handler from whatever the user chose. -->
         <key>LSHandlerRank</key>
-        <string>Default</string>
+        <string>Alternate</string>
         <key>CFBundleTypeExtensions</key>
         <array>
             <string>Gemfile</string>
