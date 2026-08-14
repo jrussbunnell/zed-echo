@@ -2693,6 +2693,130 @@ impl AcpThread {
         false
     }
 
+    /// Applies a session update along with the terminal side-effects Claude
+    /// Code carries in its meta.
+    ///
+    /// A `tool_call` for a shell command arrives with `_meta.terminal_info` and
+    /// content that already references the terminal by id, so the terminal has
+    /// to exist *before* the update is handled — otherwise `ToolCall::from_acp`
+    /// cannot resolve it, the tool call is never created, and every later
+    /// update for it renders as "Tool call not found". Output and exit status
+    /// arrive afterwards on `tool_call_update` meta.
+    ///
+    /// Both the live connection and transcript replay go through here so the
+    /// two cannot drift; replaying updates through `handle_session_update`
+    /// alone silently dropped every shell command a subagent ran.
+    pub fn apply_session_update(
+        &mut self,
+        update: acp::SessionUpdate,
+        cx: &mut Context<Self>,
+    ) -> Result<(), acp::Error> {
+        self.register_terminal_from_meta(&update, cx);
+        let result = self.handle_session_update(update.clone(), cx);
+        self.stream_terminal_from_meta(&update, cx);
+        result
+    }
+
+    /// Creates the display-only terminal a `tool_call` names in its meta.
+    fn register_terminal_from_meta(&mut self, update: &acp::SessionUpdate, cx: &mut Context<Self>) {
+        let acp::SessionUpdate::ToolCall(tool_call) = update else {
+            return;
+        };
+        let Some(terminal_info) = tool_call
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("terminal_info"))
+        else {
+            return;
+        };
+        let Some(terminal_id) = terminal_info
+            .get("terminal_id")
+            .and_then(|id| id.as_str())
+            .map(acp::TerminalId::new)
+        else {
+            return;
+        };
+        if self.terminals.contains_key(&terminal_id) {
+            return;
+        }
+        let cwd = terminal_info
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str().map(PathBuf::from));
+        // `::terminal` rather than `terminal`: this crate has a module of the
+        // same name, which would shadow the crate here.
+        let builder = ::terminal::TerminalBuilder::new_display_only(
+            ::terminal::terminal_settings::CursorShape::default(),
+            ::terminal::terminal_settings::AlternateScroll::On,
+            None,
+            0,
+            cx.background_executor(),
+            self.project.read(cx).path_style(cx),
+        );
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        self.on_terminal_provider_event(
+            TerminalProviderEvent::Created {
+                terminal_id,
+                label: tool_call.title.clone(),
+                cwd,
+                output_byte_limit: None,
+                terminal,
+            },
+            cx,
+        );
+    }
+
+    /// Feeds the output and exit status a `tool_call_update` carries in its meta
+    /// to the terminal the tool call created.
+    fn stream_terminal_from_meta(&mut self, update: &acp::SessionUpdate, cx: &mut Context<Self>) {
+        let acp::SessionUpdate::ToolCallUpdate(tool_call_update) = update else {
+            return;
+        };
+        let Some(meta) = tool_call_update.meta.as_ref() else {
+            return;
+        };
+
+        if let Some(output) = meta.get("terminal_output")
+            && let Some(terminal_id) = output
+                .get("terminal_id")
+                .and_then(|id| id.as_str())
+                .map(acp::TerminalId::new)
+            && let Some(data) = output.get("data").and_then(|data| data.as_str())
+        {
+            self.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id,
+                    data: data.as_bytes().to_vec(),
+                },
+                cx,
+            );
+        }
+
+        if let Some(exit) = meta.get("terminal_exit")
+            && let Some(terminal_id) = exit
+                .get("terminal_id")
+                .and_then(|id| id.as_str())
+                .map(acp::TerminalId::new)
+        {
+            let status = acp::TerminalExitStatus::new()
+                .exit_code(
+                    exit.get("exit_code")
+                        .and_then(|code| code.as_u64())
+                        .map(|code| code as u32),
+                )
+                .signal(
+                    exit.get("signal")
+                        .and_then(|signal| signal.as_str().map(|signal| signal.to_string())),
+                );
+            self.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id,
+                    status,
+                },
+                cx,
+            );
+        }
+    }
+
     pub fn handle_session_update(
         &mut self,
         update: acp::SessionUpdate,
@@ -10411,6 +10535,92 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+    }
+
+    /// Regression test: replaying a transcript through `handle_session_update`
+    /// alone dropped every shell command a subagent ran.
+    ///
+    /// Claude Code sends a shell `tool_call` whose content already references a
+    /// terminal by id, with the terminal described only in `_meta.terminal_info`.
+    /// If that terminal is not registered first, `ToolCall::from_acp` cannot
+    /// resolve it, the tool call is never created, and each later update for it
+    /// synthesizes a "Tool call not found" entry — which is exactly what a
+    /// restored subagent showed, dozens of times.
+    #[gpui::test]
+    async fn a_shell_tool_call_replays_without_fabricating_a_missing_tool_call(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_shell");
+        let terminal_id = "term-1";
+        let creation: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_call_id.0.as_ref(),
+            "title": "ls -la",
+            "kind": "execute",
+            "content": [{ "type": "terminal", "terminalId": terminal_id }],
+            "_meta": { "terminal_info": { "terminal_id": terminal_id, "cwd": "/test" } },
+        }))
+        .expect("the shape Claude Code sends deserializes");
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_session_update(creation, cx)
+                .expect("the tool call is created rather than dropped");
+        });
+
+        let completion: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id.0.as_ref(),
+            "status": "completed",
+            "_meta": {
+                "terminal_output": { "terminal_id": terminal_id, "data": "total 0\n" },
+                "terminal_exit": { "terminal_id": terminal_id, "exit_code": 0 },
+            },
+        }))
+        .expect("the update shape deserializes");
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_session_update(completion, cx)
+                .expect("the completion applies to the existing tool call");
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let tool_calls: Vec<&ToolCall> = thread
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                tool_calls.len(),
+                1,
+                "no phantom tool call may be synthesized"
+            );
+
+            let call = tool_calls[0];
+            assert_eq!(call.id, tool_call_id);
+            assert_eq!(
+                call.label.read(cx).source(),
+                "ls -la",
+                "the real tool call survived, rather than a 'Tool call not found' stand-in"
+            );
+            assert!(matches!(call.status, ToolCallStatus::Completed));
+        });
     }
 
     /// Regression test: a derived subagent thread never owns a `running_turn`

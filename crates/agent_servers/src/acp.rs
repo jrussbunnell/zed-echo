@@ -37,9 +37,7 @@ use util::process::Child;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 
-use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
-use terminal::TerminalBuilder;
-use terminal::terminal_settings::{AlternateScroll, CursorShape};
+use acp_thread::{AcpThread, AuthRequired, LoadError};
 
 use crate::{CURSOR_ID, GEMINI_ID};
 
@@ -5725,48 +5723,13 @@ fn handle_session_notification(
     // spawning tool call, which renders as the subagent card.
     let thread = route_to_subagent(&notification, &thread, cx, ctx).unwrap_or(thread);
 
-    // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
-    if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
-        if let Some(meta) = &tc.meta {
-            if let Some(terminal_info) = meta.get("terminal_info") {
-                if let Some(id_str) = terminal_info.get("terminal_id").and_then(|v| v.as_str()) {
-                    let terminal_id = acp::TerminalId::new(id_str);
-                    let cwd = terminal_info
-                        .get("cwd")
-                        .and_then(|v| v.as_str().map(PathBuf::from));
-
-                    thread
-                        .update(cx, |thread, cx| {
-                            let builder = TerminalBuilder::new_display_only(
-                                CursorShape::default(),
-                                AlternateScroll::On,
-                                None,
-                                0,
-                                cx.background_executor(),
-                                thread.project().read(cx).path_style(cx),
-                            );
-                            let lower = cx.new(|cx| builder.subscribe(cx));
-                            thread.on_terminal_provider_event(
-                                TerminalProviderEvent::Created {
-                                    terminal_id,
-                                    label: tc.title.clone(),
-                                    cwd,
-                                    output_byte_limit: None,
-                                    terminal: lower,
-                                },
-                                cx,
-                            );
-                        })
-                        .log_err();
-                }
-            }
-        }
-    }
-
-    // Forward the update to the acp_thread as usual.
+    // Terminal registration, the update itself, and terminal output/exit all
+    // happen in `apply_session_update` so the replay path cannot drift from
+    // this one — it did, and every shell command a restored subagent ran came
+    // back as "Tool call not found".
     if let Err(err) = thread
         .update(cx, |thread, cx| {
-            thread.handle_session_update(notification.update.clone(), cx)
+            thread.apply_session_update(notification.update.clone(), cx)
         })
         .flatten_acp()
     {
@@ -5774,58 +5737,6 @@ fn handle_session_notification(
             "Failed to handle session update for {:?}: {err:?}",
             notification.session_id
         );
-    }
-
-    // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.
-    if let acp::SessionUpdate::ToolCallUpdate(tcu) = &notification.update {
-        if let Some(meta) = &tcu.meta {
-            if let Some(term_out) = meta.get("terminal_output") {
-                if let Some(id_str) = term_out.get("terminal_id").and_then(|v| v.as_str()) {
-                    let terminal_id = acp::TerminalId::new(id_str);
-                    if let Some(s) = term_out.get("data").and_then(|v| v.as_str()) {
-                        let data = s.as_bytes().to_vec();
-                        thread
-                            .update(cx, |thread, cx| {
-                                thread.on_terminal_provider_event(
-                                    TerminalProviderEvent::Output { terminal_id, data },
-                                    cx,
-                                );
-                            })
-                            .log_err();
-                    }
-                }
-            }
-
-            if let Some(term_exit) = meta.get("terminal_exit") {
-                if let Some(id_str) = term_exit.get("terminal_id").and_then(|v| v.as_str()) {
-                    let terminal_id = acp::TerminalId::new(id_str);
-                    let status = acp::TerminalExitStatus::new()
-                        .exit_code(
-                            term_exit
-                                .get("exit_code")
-                                .and_then(|v| v.as_u64())
-                                .map(|i| i as u32),
-                        )
-                        .signal(
-                            term_exit
-                                .get("signal")
-                                .and_then(|v| v.as_str().map(|s| s.to_string())),
-                        );
-
-                    thread
-                        .update(cx, |thread, cx| {
-                            thread.on_terminal_provider_event(
-                                TerminalProviderEvent::Exit {
-                                    terminal_id,
-                                    status,
-                                },
-                                cx,
-                            );
-                        })
-                        .log_err();
-                }
-            }
-        }
     }
 }
 

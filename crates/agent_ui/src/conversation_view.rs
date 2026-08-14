@@ -2232,7 +2232,7 @@ impl ConversationView {
                 for update in updates {
                     // One malformed step must not lose the rest of the
                     // transcript, so a failed update is logged and skipped.
-                    thread.handle_session_update(update, cx).log_err();
+                    thread.apply_session_update(update, cx).log_err();
                 }
             });
 
