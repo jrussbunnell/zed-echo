@@ -6556,8 +6556,29 @@ impl ThreadView {
                     parent.set_title_updates_suppressed(false);
                 })
                 .log_err();
+            if !delivered {
+                this.update(cx, |this, cx| {
+                    this.awaiting_subagent_reply = false;
+                    cx.notify();
+                })
+                .log_err();
+                return;
+            }
+
+            // The resumed agent runs in the background, so the parent's turn
+            // ends long before a reply arrives and cannot bound the wait. The
+            // subagent's own next entry clears this; the timer only covers the
+            // case where nothing ever comes — a parent that answered instead of
+            // relaying, or an agent that died — so the header stops claiming
+            // work that is not happening.
+            //
+            // ponytail: fixed ceiling rather than a real liveness signal, which
+            // the protocol does not offer for a backgrounded resume.
+            const REPLY_WATCHDOG: Duration = Duration::from_secs(15 * 60);
+            cx.background_executor().timer(REPLY_WATCHDOG).await;
             this.update(cx, |this, cx| {
-                if !delivered {
+                if this.awaiting_subagent_reply {
+                    log::warn!("subagent relay: no reply arrived within the watchdog window");
                     this.awaiting_subagent_reply = false;
                     cx.notify();
                 }
