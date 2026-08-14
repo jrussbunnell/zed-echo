@@ -2252,6 +2252,10 @@ pub struct AcpThread {
     parent_session_id: Option<acp::SessionId>,
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
+    /// Set while relaying a message to a subagent, so the directive that relay
+    /// prompts with cannot rename this thread. See
+    /// [`Self::set_title_updates_suppressed`].
+    title_updates_suppressed: bool,
     entries: Vec<AgentThreadEntry>,
     elicitations: ElicitationStore,
     plan: Plan,
@@ -2471,6 +2475,7 @@ impl AcpThread {
             plan: Default::default(),
             title,
             provisional_title: None,
+            title_updates_suppressed: false,
             project,
             running_turn: None,
             turn_id: 0,
@@ -2895,7 +2900,9 @@ impl AcpThread {
                 self.update_plan(plan, cx);
             }
             acp::SessionUpdate::SessionInfoUpdate(info_update) => {
-                if let MaybeUndefined::Value(title) = info_update.title {
+                if let MaybeUndefined::Value(title) = info_update.title
+                    && !self.title_updates_suppressed
+                {
                     let had_provisional = self.provisional_title.take().is_some();
                     let title: SharedString = title.into();
                     if self.title.as_ref() != Some(&title) {
@@ -3378,6 +3385,17 @@ impl AcpThread {
     pub fn set_provisional_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         self.provisional_title = Some(title);
         cx.emit(AcpThreadEvent::TitleUpdated);
+    }
+
+    /// Ignores titles the agent proposes while set.
+    ///
+    /// Relaying a message to a subagent prompts this thread with a directive
+    /// the user never wrote, and the agent titles a session from the prompt it
+    /// was given — so without this, messaging a subagent renamed the parent
+    /// thread to "Use the SendMessage tool to deliver this message...". Scoped
+    /// to the relay rather than latched, so an ordinary retitle still works.
+    pub fn set_title_updates_suppressed(&mut self, suppressed: bool) {
+        self.title_updates_suppressed = suppressed;
     }
 
     pub fn subagent_spawned(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
@@ -10604,6 +10622,64 @@ mod tests {
                 "a spawn and a resume must resolve to the same agent"
             );
         }
+    }
+
+    /// Relaying a message to a subagent prompts the parent with a directive the
+    /// user never wrote, and the agent titles a session from its prompt — so
+    /// without suppression, messaging a subagent renamed the parent thread to
+    /// "Use the SendMessage tool to deliver this message...".
+    #[gpui::test]
+    async fn a_relay_cannot_rename_the_thread_it_relays_through(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let retitle = |title: &str| {
+            acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title(title))
+        };
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(retitle("Review the codebase"), cx)
+                .unwrap();
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.title()),
+            Some("Review the codebase".into())
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.set_title_updates_suppressed(true);
+            thread
+                .handle_session_update(retitle("Use the SendMessage tool to deliver this"), cx)
+                .unwrap();
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.title()),
+            Some("Review the codebase".into()),
+            "a relay must not rename the thread it borrows"
+        );
+
+        // Suppression is scoped to the relay, not latched: ordinary retitling
+        // has to keep working afterwards.
+        thread.update(cx, |thread, cx| {
+            thread.set_title_updates_suppressed(false);
+            thread
+                .handle_session_update(retitle("Something the user asked for"), cx)
+                .unwrap();
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.title()),
+            Some("Something the user asked for".into())
+        );
     }
 
     /// Regression test: replaying a transcript through `handle_session_update`

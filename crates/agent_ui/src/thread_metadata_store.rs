@@ -1747,6 +1747,18 @@ impl ThreadMetadataDb {
     /// new one. Transcripts are worthless without their parent anyway.
     pub async fn delete_orphaned_subagent_updates(&self) -> anyhow::Result<()> {
         self.write(move |connection| {
+            // Guarded on the thread list being populated. This runs at startup,
+            // alongside the migrations that fill `sidebar_threads`; if it were
+            // to win that race the table would look empty, every transcript
+            // would look orphaned, and the sweep would delete all of them.
+            // "No threads at all" is also the one case where the sweep has
+            // nothing worth reclaiming, so skipping it costs nothing.
+            let mut count = connection.select::<i64>(
+                "SELECT COUNT(*) FROM sidebar_threads WHERE session_id IS NOT NULL",
+            )?;
+            if count()?.first().copied().unwrap_or(0) == 0 {
+                return Ok(());
+            }
             connection.exec(
                 "DELETE FROM subagent_transcript_updates \
                  WHERE parent_session_id NOT IN ( \
@@ -4113,13 +4125,84 @@ mod tests {
         let store =
             cx.update(|cx| SubagentTranscripts::new(db.clone(), cx.background_executor().clone()));
 
-        let session_id = acp::SessionId::new("ghost/subagent/tool-1");
+        // A live thread, so the table is populated and the sweep is allowed to
+        // run at all — see the guard in `delete_orphaned_subagent_updates`.
+        db.save(ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new("live")),
+            agent_id: ZED_AGENT_ID.clone(),
+            title: Some("a real thread".into()),
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: Default::default(),
+            remote_connection: None,
+            archived: false,
+        })
+        .await
+        .expect("the thread saves");
+
+        let kept = acp::SessionId::new("live/subagent/tool-1");
+        let orphan = acp::SessionId::new("ghost/subagent/tool-1");
+        for (session, parent) in [
+            (&kept, acp::SessionId::new("live")),
+            (&orphan, acp::SessionId::new("ghost")),
+        ] {
+            store.append(
+                session,
+                &parent,
+                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::from("work".to_string()),
+                )),
+            );
+        }
+        cx.run_until_parked();
+
+        db.delete_orphaned_subagent_updates()
+            .await
+            .expect("the sweep runs");
+
+        assert!(
+            cx.update(|cx| store.load(&orphan, cx))
+                .await
+                .expect("the load succeeds")
+                .is_empty(),
+            "a transcript whose parent thread is gone must not survive"
+        );
+        assert!(
+            !cx.update(|cx| store.load(&kept, cx))
+                .await
+                .expect("the load succeeds")
+                .is_empty(),
+            "a transcript whose parent is still listed must be left alone"
+        );
+    }
+
+    /// The sweep runs at startup, racing the migrations that populate
+    /// `sidebar_threads`. If it won that race the table would look empty, every
+    /// transcript would look orphaned, and all of them would be deleted — the
+    /// same shape of mistake that already destroyed one transcript.
+    #[gpui::test]
+    async fn the_sweep_declines_to_run_against_an_empty_thread_list(cx: &mut TestAppContext) {
+        use acp_thread::SubagentTranscriptStore as _;
+
+        init_test(cx);
+        let db = cx.update(|cx| {
+            let db_name = TestMetadataDbName::global(cx);
+            ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+                &db_name,
+            )))
+        });
+        let store =
+            cx.update(|cx| SubagentTranscripts::new(db.clone(), cx.background_executor().clone()));
+
+        let session_id = acp::SessionId::new("parent/subagent/tool-1");
         store.append(
             &session_id,
-            // No `sidebar_threads` row exists for this parent.
-            &acp::SessionId::new("ghost"),
+            &acp::SessionId::new("parent"),
             &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                acp::ContentBlock::from("orphan".to_string()),
+                acp::ContentBlock::from("irreplaceable".to_string()),
             )),
         );
         cx.run_until_parked();
@@ -4128,13 +4211,12 @@ mod tests {
             .await
             .expect("the sweep runs");
 
-        let loaded = cx
-            .update(|cx| store.load(&session_id, cx))
-            .await
-            .expect("the load succeeds");
         assert!(
-            loaded.is_empty(),
-            "a transcript whose parent thread is gone must not survive"
+            !cx.update(|cx| store.load(&session_id, cx))
+                .await
+                .expect("the load succeeds")
+                .is_empty(),
+            "with no threads listed the sweep must do nothing rather than delete everything"
         );
     }
 

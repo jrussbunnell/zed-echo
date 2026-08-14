@@ -6536,16 +6536,26 @@ impl ThreadView {
              answer on its behalf. Relay the message verbatim, add nothing, and do not act \
              on it yourself:\n\n{text}"
         );
+        // The agent titles a session from the prompt it is given, and the user
+        // never wrote this directive — without suppressing it, messaging a
+        // subagent renames the parent thread to the directive's first line.
         let send = parent.update(cx, |parent, cx| {
+            parent.set_title_updates_suppressed(true);
             parent.send_command(vec![acp::ContentBlock::from(directive)], cx)
         });
         self.awaiting_subagent_reply = true;
+        let parent_for_title = parent.downgrade();
         cx.spawn(async move |this, cx| {
             // The reply arrives as tagged updates routed back into this
             // subagent's thread, so nothing here consumes the response. The
             // await only bounds the "working" state: if the relay itself fails,
             // nothing else would ever clear it.
             let delivered = send.await.log_err().is_some();
+            parent_for_title
+                .update(cx, |parent, _cx| {
+                    parent.set_title_updates_suppressed(false);
+                })
+                .log_err();
             this.update(cx, |this, cx| {
                 if !delivered {
                     this.awaiting_subagent_reply = false;
