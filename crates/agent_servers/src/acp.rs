@@ -1904,6 +1904,28 @@ impl AgentConnection for AcpConnection {
         self.derived_subagents.borrow().thread(session_id).cloned()
     }
 
+    fn adopt_local_session_thread(
+        &self,
+        session_id: &acp::SessionId,
+        parent_session_id: &acp::SessionId,
+        thread: Entity<AcpThread>,
+    ) {
+        let mut derived = self.derived_subagents.borrow_mut();
+        if derived.sessions.contains_key(session_id) {
+            return;
+        }
+        derived.sessions.insert(
+            session_id.clone(),
+            DerivedSubagentSession {
+                thread,
+                parent_session_id: parent_session_id.clone(),
+                // The client re-stamped the spawning tool call while restoring;
+                // announcing again would emit a second card for it.
+                announced: true,
+            },
+        );
+    }
+
     fn close_session(
         self: Rc<Self>,
         session_id: &acp::SessionId,
@@ -5450,21 +5472,12 @@ fn route_to_subagent(
                 .get(&spawning_tool_call_id)
                 .cloned()
                 .unwrap_or_else(|| notification.session_id.clone());
-            // A `SendMessage` resume is started by the resuming call, not the
-            // original spawn, so its updates arrive under a different tool call
-            // id. Rejoin the session already representing that agent instead of
-            // opening a second thread beside it; the agent's name is what
-            // survives a resume.
-            let session_id = resumed_subagent_session(
-                &parent_session_id,
-                &spawning_tool_call_id,
-                session_thread,
-                cx,
-                ctx,
-            )
-            .unwrap_or_else(|| {
-                acp_thread::derived_subagent_session_id(&parent_session_id, &spawning_tool_call_id)
-            });
+            // A `SendMessage` resume arrives tagged with the *original* spawn's
+            // tool call id, not the resuming call's — verified against a live
+            // resume, whose reply landed on the session the spawn created. So
+            // the ordinary derivation already rejoins the right thread.
+            let session_id =
+                acp_thread::derived_subagent_session_id(&parent_session_id, &spawning_tool_call_id);
             ensure_derived_subagent(
                 &parent_session_id,
                 &spawning_tool_call_id,
@@ -5516,45 +5529,6 @@ fn route_to_subagent(
         .borrow()
         .thread(&owner_session_id)
         .map(|thread| thread.downgrade())
-}
-
-/// The session already representing the agent this tool call addresses, when
-/// the call is a resume rather than a fresh spawn.
-///
-/// Claude Code's agent teams address a member by name: `Agent` spawns it with a
-/// `name`, and `SendMessage` resumes it with `to`. The resume runs as a new
-/// background task whose `parentToolUseId` is the `SendMessage` call, so
-/// without matching on the name every message the user sends would open another
-/// subagent thread instead of continuing the one they are looking at.
-fn resumed_subagent_session(
-    parent_session_id: &acp::SessionId,
-    tool_call_id: &acp::ToolCallId,
-    session_thread: &WeakEntity<AcpThread>,
-    cx: &mut AsyncApp,
-    ctx: &ClientContext,
-) -> Option<acp::SessionId> {
-    let parent_thread = ctx
-        .derived_subagents
-        .borrow()
-        .thread(parent_session_id)
-        .map(|thread| thread.downgrade())
-        .unwrap_or_else(|| session_thread.clone());
-
-    parent_thread
-        .read_with(cx, |parent, _cx| {
-            let (_, tool_call) = parent.tool_call(tool_call_id)?;
-            let name = AcpThread::agent_team_name(tool_call)?;
-            let existing = parent.subagent_session_for_agent_name(&name)?;
-            // The spawn itself resolves to its own session; only a later call
-            // addressing the same name is a resume.
-            (parent
-                .tool_call_for_subagent(&existing)
-                .map(|call| &call.id)
-                != Some(tool_call_id))
-            .then_some(existing)
-        })
-        .ok()
-        .flatten()
 }
 
 /// Creates the subagent's thread if this is the first time it has been seen,

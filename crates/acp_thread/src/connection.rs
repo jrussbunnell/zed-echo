@@ -125,6 +125,23 @@ pub trait AgentConnection {
         None
     }
 
+    /// Hands a client-assembled thread back to the connection so later updates
+    /// for that session reach it.
+    ///
+    /// A derived subagent restored from its stored transcript is built by the
+    /// client, not the connection, so the connection has no handle to it.
+    /// Without adopting it, the next update for that session builds a *second*
+    /// thread and applies the update there — the restored thread the user is
+    /// looking at never changes, which is exactly what "the reply never
+    /// appeared" looked like.
+    fn adopt_local_session_thread(
+        &self,
+        _session_id: &acp::SessionId,
+        _parent_session_id: &acp::SessionId,
+        _thread: Entity<AcpThread>,
+    ) {
+    }
+
     /// Load an existing session by ID.
     fn load_session(
         self: Rc<Self>,
@@ -958,6 +975,18 @@ mod test_support {
 
         fn supports_load_session(&self) -> bool {
             self.supports_load_session
+        }
+
+        fn adopt_local_session_thread(
+            &self,
+            session_id: &acp::SessionId,
+            _parent_session_id: &acp::SessionId,
+            thread: Entity<AcpThread>,
+        ) {
+            self.local_threads
+                .lock()
+                .entry(session_id.clone())
+                .or_insert(thread);
         }
 
         fn local_session_thread(

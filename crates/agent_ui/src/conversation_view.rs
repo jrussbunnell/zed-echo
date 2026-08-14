@@ -1744,6 +1744,12 @@ impl ConversationView {
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
                 let index = len - 1;
+                if is_subagent && let Some(active) = self.thread_view(&session_id) {
+                    // The relayed message produced something: this subagent is
+                    // demonstrably working again, so it no longer needs the
+                    // awaiting-reply stand-in to look busy.
+                    active.update(cx, |active, cx| active.subagent_reply_arrived(cx));
+                }
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
@@ -2203,6 +2209,9 @@ impl ConversationView {
         };
         let project = self.project.clone();
         let updates = store.load(&subagent_id, cx);
+        let connection_for_adoption = connection.clone();
+        let subagent_id_for_adoption = subagent_id.clone();
+        let parent_session_id_for_adoption = parent_session_id.clone();
 
         cx.spawn(async move |_this, cx| {
             let updates = updates.await?;
@@ -2234,6 +2243,17 @@ impl ConversationView {
                     // transcript, so a failed update is logged and skipped.
                     thread.apply_session_update(update, cx).log_err();
                 }
+            });
+
+            // Hand it to the connection, or a later reply for this subagent
+            // builds a second thread and updates that one instead — leaving the
+            // restored thread the user is reading frozen.
+            cx.update(|_cx| {
+                connection_for_adoption.adopt_local_session_thread(
+                    &subagent_id_for_adoption,
+                    &parent_session_id_for_adoption,
+                    thread.clone(),
+                );
             });
 
             Ok(thread)
@@ -12446,6 +12466,59 @@ pub(crate) mod tests {
                 Some(subagent_session_id.clone()),
             );
         });
+    }
+
+    /// Regression test: a restored subagent's thread is built by the client, so
+    /// the connection has no handle to it. Until it is adopted, the next update
+    /// for that session builds a second thread and applies the update there —
+    /// the thread the user is reading never changes, which is what "I sent a
+    /// message and nothing happened" looked like.
+    #[gpui::test]
+    async fn a_restored_subagent_receives_later_updates(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent_session_id = acp::SessionId::new("parent/subagent/task-1");
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "parent/subagent/task-1",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+
+        // Stand in for a restored thread: the client built it, and the
+        // connection is told about it the way `rebuild_subagent_from_transcript`
+        // does.
+        connection.adopt_local_session_thread(
+            &subagent_session_id,
+            &parent_session_id,
+            subagent_thread.clone(),
+        );
+
+        assert_eq!(
+            cx.update(|_window, cx| connection
+                .local_session_thread(&subagent_session_id, cx)
+                .map(|thread| thread.entity_id())),
+            Some(subagent_thread.entity_id()),
+            "the connection must hand back the very thread the client restored, \
+             not build a second one for the same session"
+        );
     }
 
     /// Regression test: there is one `AgentDiff` per workspace, and subagents

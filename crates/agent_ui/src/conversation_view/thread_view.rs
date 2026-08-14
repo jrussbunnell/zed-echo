@@ -683,6 +683,10 @@ pub struct ThreadView {
     /// The concrete Inworld provider, kept alongside the type-erased handle
     /// inside `ReadAloud` so a settings change can re-target its voice.
     read_aloud_provider: Option<Arc<read_aloud::InworldTts>>,
+    /// Set while a message relayed to this subagent has not yet produced a
+    /// reply, so it reads as working rather than as the "done" its long-since
+    /// completed spawn call reports.
+    awaiting_subagent_reply: bool,
     /// The system-voice provider, when `read_aloud.provider` selects it. Held
     /// for the same reason as `read_aloud_provider`: applying a voice change
     /// without rebuilding the reader.
@@ -1412,6 +1416,7 @@ impl ThreadView {
             agent_panel_styling: AgentPanelStylingSettings::get_global(cx).clone(),
             read_aloud_subscriptions: Vec::new(),
             read_aloud_activation: None,
+            awaiting_subagent_reply: false,
             read_aloud_provider: None,
             #[cfg(target_os = "macos")]
             read_aloud_system_provider: None,
@@ -6518,22 +6523,52 @@ impl ThreadView {
         // parent, and a verbatim copy of the directive in the parent's
         // transcript reads as though they did. The parent's `SendMessage` tool
         // call still shows there.
+        // The name is only reachable within the session that spawned the agent.
+        // After a restart Claude Code re-registers it under an opaque spawn id,
+        // and `SendMessage` answers "No agent named ... is reachable" — so the
+        // directive has to name the recovery path rather than assume the name
+        // still resolves. Observed live: the parent recovered via ListAgents on
+        // its own, and this makes that deterministic rather than lucky.
         let directive = format!(
             "Use the SendMessage tool to deliver this message to the agent named \"{name}\". \
-             Relay it verbatim and do not act on it yourself:\n\n{text}"
+             If that name is not reachable, call ListAgents and match it by name or by the \
+             task it was given, then send to that agent's id — do not give up and do not \
+             answer on its behalf. Relay the message verbatim, add nothing, and do not act \
+             on it yourself:\n\n{text}"
         );
         let send = parent.update(cx, |parent, cx| {
             parent.send_command(vec![acp::ContentBlock::from(directive)], cx)
         });
-        cx.spawn(async move |_this, _cx| {
+        self.awaiting_subagent_reply = true;
+        cx.spawn(async move |this, cx| {
             // The reply arrives as tagged updates routed back into this
-            // subagent's thread, so nothing here consumes the response; this
-            // only surfaces a delivery failure.
-            send.await.log_err();
+            // subagent's thread, so nothing here consumes the response. The
+            // await only bounds the "working" state: if the relay itself fails,
+            // nothing else would ever clear it.
+            let delivered = send.await.log_err().is_some();
+            this.update(cx, |this, cx| {
+                if !delivered {
+                    this.awaiting_subagent_reply = false;
+                    cx.notify();
+                }
+            })
+            .log_err();
         })
         .detach();
         cx.notify();
         true
+    }
+
+    /// Clears the awaiting-reply state once the subagent produces anything.
+    ///
+    /// Its own entries are the only reliable end of the wait: the parent's
+    /// relay call returns as soon as the resume is accepted, long before the
+    /// agent has said anything.
+    pub(crate) fn subagent_reply_arrived(&mut self, cx: &mut Context<Self>) {
+        if self.awaiting_subagent_reply {
+            self.awaiting_subagent_reply = false;
+            cx.notify();
+        }
     }
 
     fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
@@ -6547,6 +6582,13 @@ impl ThreadView {
     }
 
     fn is_subagent_running(&self, cx: &App) -> bool {
+        // A relayed message resumes an agent whose spawning tool call completed
+        // long ago, so that call's status says "done" for the entire time the
+        // agent is working on the reply. Awaiting a relay is the only signal
+        // that it is busy again.
+        if self.awaiting_subagent_reply {
+            return true;
+        }
         self.with_subagent_tool_call(cx, |tool_call| {
             matches!(
                 tool_call.status,
