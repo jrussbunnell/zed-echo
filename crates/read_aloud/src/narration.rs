@@ -638,11 +638,12 @@ impl ToolCallFacts {
         ) {
             return described;
         }
-        match self.output.as_deref().map(str::trim).filter(|output| {
-            output
-                .chars()
-                .any(|character| character.is_alphanumeric())
-        }) {
+        match self
+            .output
+            .as_deref()
+            .map(str::trim)
+            .filter(|output| output.chars().any(|character| character.is_alphanumeric()))
+        {
             // Already excerpted by `tool_output`, so this is a bounded string
             // however large the command's output was.
             Some(output) => format!("{described} — it printed: {output}"),
@@ -3633,14 +3634,18 @@ mod tests {
     /// transcribed: every claim about outputs in this file is measured from
     /// the same bytes the user's session produced.
     fn captured_calls(section: &str) -> Vec<CapturedCall> {
-        let capture: serde_json::Value = serde_json::from_str(crate::CLAUDE_CODE_TOOL_OUTPUT_CAPTURE)
-            .expect("the output capture parses");
+        let capture: serde_json::Value =
+            serde_json::from_str(crate::CLAUDE_CODE_TOOL_OUTPUT_CAPTURE)
+                .expect("the output capture parses");
         let mut calls: Vec<(String, CapturedCall)> = Vec::new();
         for update in capture[section]
             .as_array()
             .expect("the capture section is a list of updates")
         {
-            let id = update["toolCallId"].as_str().unwrap_or_default().to_string();
+            let id = update["toolCallId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let position = calls.iter().position(|(seen, _)| *seen == id);
             let index = match position {
                 Some(index) => index,
@@ -4002,8 +4007,9 @@ mod tests {
             let printed = serde_json::json!(format!("Exit code 1\n{}", "noise ".repeat(4_000)));
             let output = tool_output(Some(&printed));
             assert!(
-                output.as_ref().is_some_and(|output| output.chars().count()
-                    <= MAX_ACTION_CHARS + 3),
+                output
+                    .as_ref()
+                    .is_some_and(|output| output.chars().count() <= MAX_ACTION_CHARS + 3),
                 "the excerpt is taken before the text is stored, not at the prompt"
             );
             let flooded = ToolCallFacts {
@@ -4196,8 +4202,8 @@ mod tests {
                 .as_i64()
                 .expect("a failed terminal call reports its exit code out of band");
             assert_ne!(exit_code, 0, "a failure exits non-zero");
-            let printed = tool_output(update.get("rawOutput"))
-                .expect("and puts something in rawOutput");
+            let printed =
+                tool_output(update.get("rawOutput")).expect("and puts something in rawOutput");
             assert!(
                 printed.starts_with(&format!("Exit code {exit_code}")),
                 "the two agree, and the reachable one leads with the code: {printed:?}"

@@ -594,6 +594,14 @@ pub struct ReadAloudSettingsContent {
     pub auto_play: Option<bool>,
     /// Which text-to-speech provider to use.
     ///
+    /// "inworld" needs an API key in `INWORLD_API_KEY` or the keychain and
+    /// gives word-level highlighting. "system" (macOS only) uses the built-in
+    /// speech synthesizer: no key and no network, but it reports no word
+    /// timings, so highlighting falls back to whole sentences.
+    ///
+    /// Any other value disables read aloud with a notice rather than silently
+    /// falling back to Inworld.
+    ///
     /// Default: inworld
     pub provider: Option<String>,
     /// The provider voice identifier.

@@ -611,6 +611,9 @@
   "read_aloud": {
     "enabled": false,
     "auto_play": true,
+    // "inworld" needs an API key (INWORLD_API_KEY or the keychain) and gives
+    // word-level highlighting. "system" (macOS) uses the built-in speech
+    // synthesizer: no key, no network, but sentence-level highlighting only.
     "provider": "inworld",
     "voice_id": "Dennis",
     "model_id": "inworld-tts-2",

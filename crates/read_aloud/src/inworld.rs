@@ -1,7 +1,9 @@
-use crate::provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
+use crate::provider::{Pcm, TtsProvider, TtsVoice, WordTiming, decode_linear16, strip_wav_header};
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
-use futures::AsyncReadExt as _;
+use futures::channel::mpsc;
+use futures::io::BufReader;
+use futures::{AsyncBufReadExt as _, AsyncReadExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use std::sync::{Arc, Mutex};
@@ -57,76 +59,145 @@ impl InworldTts {
 }
 
 impl TtsProvider for InworldTts {
-    fn synthesize(&self, text: String, cx: &App) -> Task<Result<Pcm>> {
+    fn synthesize(&self, text: String, cx: &App) -> mpsc::UnboundedReceiver<Result<Pcm>> {
+        let (sender, receiver) = mpsc::unbounded();
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let (voice_id, model_id) = match self.voice.lock() {
             Ok(voice) => (voice.voice_id.clone(), voice.model_id.clone()),
             Err(error) => {
-                return Task::ready(Err(anyhow!("voice selection poisoned: {error}")));
+                sender
+                    .unbounded_send(Err(anyhow!("voice selection poisoned: {error}")))
+                    .ok();
+                return receiver;
             }
         };
 
         let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
-            let body = serde_json::json!({
-                "text": text,
-                "voiceId": voice_id,
-                "modelId": model_id,
-                "audioConfig": {
-                    "audioEncoding": "LINEAR16",
-                    "sampleRateHertz": SAMPLE_RATE,
-                },
-                "deliveryMode": "BALANCED",
-                "timestampType": "WORD",
-            });
-            let body = serde_json::to_string(&body)?;
+            let result = stream_utterance(
+                client,
+                api_key,
+                text,
+                voice_id,
+                model_id,
+                executor,
+                sender.clone(),
+            )
+            .await;
+            if let Err(error) = result {
+                sender.unbounded_send(Err(error)).ok();
+            }
+        })
+        .detach();
 
-            let mut backoff = RATE_LIMIT_INITIAL_BACKOFF;
-            for attempt in 0..=RATE_LIMIT_MAX_RETRIES {
-                let request = HttpRequest::builder()
-                    .method(Method::POST)
-                    .uri(INWORLD_API_URL)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Basic {}", api_key.trim()))
-                    .body(AsyncBody::from(body.clone()))?;
+        receiver
+    }
+}
 
-                let mut response = client.send(request).await?;
-                let status = response.status();
-                let mut text_body = String::new();
-                response.body_mut().read_to_string(&mut text_body).await?;
+/// Issues the request and forwards each streamed chunk as it decodes.
+///
+/// The endpoint is `voice:stream`: the body is JSON-lines, one object per audio
+/// chunk, and each chunk is a self-contained WAV. Reading it to the end before
+/// decoding — which is what this used to do — meant waiting out synthesis of
+/// the entire utterance before a single sample could play. Forwarding per line
+/// is the whole point of the streaming endpoint.
+#[allow(clippy::too_many_arguments)]
+async fn stream_utterance(
+    client: Arc<dyn HttpClient>,
+    api_key: String,
+    text: String,
+    voice_id: String,
+    model_id: String,
+    executor: gpui::BackgroundExecutor,
+    sender: mpsc::UnboundedSender<Result<Pcm>>,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "text": text,
+        "voiceId": voice_id,
+        "modelId": model_id,
+        "audioConfig": {
+            "audioEncoding": "LINEAR16",
+            "sampleRateHertz": SAMPLE_RATE,
+        },
+        "deliveryMode": "BALANCED",
+        "timestampType": "WORD",
+    });
+    let body = serde_json::to_string(&body)?;
 
-                if status.is_success() {
-                    let (samples, words) = collect_audio_content(&text_body)?;
-                    return Ok(Pcm {
-                        samples,
-                        sample_rate: SAMPLE_RATE,
-                        channels: 1,
-                        words,
-                    });
-                }
+    let mut backoff = RATE_LIMIT_INITIAL_BACKOFF;
+    for attempt in 0..=RATE_LIMIT_MAX_RETRIES {
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(INWORLD_API_URL)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Basic {}", api_key.trim()))
+            .body(AsyncBody::from(body.clone()))?;
 
-                // Back off on rate limits, but give up quickly rather than
-                // holding the queue. A dropped utterance is better than a
-                // stalled panel.
-                if status == http_client::StatusCode::TOO_MANY_REQUESTS
-                    && attempt < RATE_LIMIT_MAX_RETRIES
-                {
-                    log::warn!("read_aloud: Inworld rate limited, retrying in {backoff:?}");
-                    executor.timer(backoff).await;
-                    backoff *= 2;
-                    continue;
-                }
+        let mut response = client.send(request).await?;
+        let status = response.status();
 
-                return Err(anyhow!(
-                    "Inworld TTS returned {status}: {}",
-                    text_body.trim()
-                ));
+        if !status.is_success() {
+            // The error body is small and only read on the failure path, so
+            // buffering it whole costs nothing.
+            let mut error_body = String::new();
+            response.body_mut().read_to_string(&mut error_body).await?;
+
+            // Back off on rate limits, but give up quickly rather than
+            // holding the queue. A dropped utterance is better than a
+            // stalled panel.
+            if status == http_client::StatusCode::TOO_MANY_REQUESTS
+                && attempt < RATE_LIMIT_MAX_RETRIES
+            {
+                log::warn!("read_aloud: Inworld rate limited, retrying in {backoff:?}");
+                executor.timer(backoff).await;
+                backoff *= 2;
+                continue;
             }
 
-            Err(anyhow!("Inworld TTS exhausted rate-limit retries"))
-        })
+            return Err(anyhow!(
+                "Inworld TTS returned {status}: {}",
+                error_body.trim()
+            ));
+        }
+
+        let mut lines = BufReader::new(response.into_body()).lines();
+        // Word timings arrive per chunk but are timed against the whole
+        // utterance, so they accumulate and every chunk carries the list so
+        // far. The player realigns on each one.
+        let mut words = Vec::new();
+        let mut sent_any = false;
+
+        while let Some(line) = lines.next().await {
+            let line = line?;
+            let Some((samples, chunk_words)) = decode_audio_line(&line)? else {
+                continue;
+            };
+            words.extend(chunk_words);
+            if samples.is_empty() {
+                continue;
+            }
+            sent_any = true;
+            let chunk = Pcm {
+                samples,
+                sample_rate: SAMPLE_RATE,
+                channels: 1,
+                words: words.clone(),
+            };
+            // A closed receiver means the player cancelled this utterance —
+            // stop pulling the body rather than synthesizing into the void.
+            if sender.unbounded_send(Ok(chunk)).is_err() {
+                return Ok(());
+            }
+        }
+
+        if !sent_any {
+            return Err(anyhow!("Inworld response contained no audio content"));
+        }
+        return Ok(());
     }
+
+    Err(anyhow!("Inworld TTS exhausted rate-limit retries"))
 }
 
 /// Fetches the provider's voice catalog. English voices only, sorted by
@@ -215,44 +286,36 @@ pub fn fallback_voices() -> Vec<TtsVoice> {
     .collect()
 }
 
-/// Walks the streamed JSON-lines body, concatenating every `result.audioContent`
-/// chunk and every `result.timestampInfo.wordAlignment` entry. Malformed lines
-/// are skipped rather than failing the whole utterance, and missing timestamp
-/// info degrades to an empty word list rather than an error.
-fn collect_audio_content(body: &str) -> Result<(Vec<f32>, Vec<WordTiming>)> {
-    let mut samples = Vec::new();
+/// Decodes one JSON-lines record into its samples and word timings.
+///
+/// `Ok(None)` covers the lines that carry no audio — blanks, keep-alives, and
+/// anything unparseable. Those are skipped rather than failing the utterance,
+/// matching how the buffered decoder behaved. Only malformed base64, which
+/// means the stream itself is corrupt, is an error.
+fn decode_audio_line(line: &str) -> Result<Option<(Vec<f32>, Vec<WordTiming>)>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Ok(None);
+    };
+    let Some(result) = value.get("result") else {
+        return Ok(None);
+    };
+    let Some(encoded) = result
+        .get("audioContent")
+        .and_then(|content| content.as_str())
+    else {
+        return Ok(None);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("Inworld returned audioContent that is not valid base64")?;
+    let samples = decode_linear16(strip_wav_header(&decoded));
     let mut words = Vec::new();
-    let mut found_any = false;
-
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(result) = value.get("result") else {
-            continue;
-        };
-        let Some(encoded) = result
-            .get("audioContent")
-            .and_then(|content| content.as_str())
-        else {
-            continue;
-        };
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .context("Inworld returned audioContent that is not valid base64")?;
-        samples.extend(decode_linear16(strip_wav_header(&decoded)));
-        found_any = true;
-        collect_word_alignment(result, &mut words);
-    }
-
-    if !found_any {
-        return Err(anyhow!("Inworld response contained no audio content"));
-    }
-    Ok((samples, words))
+    collect_word_alignment(result, &mut words);
+    Ok(Some((samples, words)))
 }
 
 /// Word timestamps arrive as three parallel arrays under
@@ -293,56 +356,6 @@ fn collect_word_alignment(result: &serde_json::Value, words: &mut Vec<WordTiming
     }
 }
 
-/// Each streamed Inworld chunk is a self-contained WAV file: a RIFF/WAVE
-/// container header followed by a `data` subchunk holding the raw LINEAR16
-/// samples. Decoding the header bytes as PCM produces an audible click at
-/// every chunk boundary, so locate and strip the header first. The `data`
-/// subchunk is not always at a fixed offset (extra subchunks, e.g. `fact`,
-/// can precede it), so this walks the chunk list using each subchunk's
-/// declared length rather than assuming a fixed 44-byte header. Chunks that
-/// are not RIFF/WAVE (i.e. already-raw PCM) are returned unchanged.
-fn strip_wav_header(bytes: &[u8]) -> &[u8] {
-    const RIFF: &[u8] = b"RIFF";
-    const WAVE: &[u8] = b"WAVE";
-    const DATA: &[u8] = b"data";
-    const RIFF_HEADER_LEN: usize = 12;
-    const SUBCHUNK_HEADER_LEN: usize = 8;
-
-    if bytes.len() < RIFF_HEADER_LEN || &bytes[0..4] != RIFF || &bytes[8..12] != WAVE {
-        return bytes;
-    }
-
-    let mut offset = RIFF_HEADER_LEN;
-    while offset + SUBCHUNK_HEADER_LEN <= bytes.len() {
-        let id = &bytes[offset..offset + 4];
-        let Ok(size_bytes) = <[u8; 4]>::try_from(&bytes[offset + 4..offset + 8]) else {
-            break;
-        };
-        let size = u32::from_le_bytes(size_bytes) as usize;
-        let data_start = offset + SUBCHUNK_HEADER_LEN;
-
-        if id == DATA {
-            let data_end = data_start.saturating_add(size).min(bytes.len());
-            return &bytes[data_start..data_end];
-        }
-
-        // Subchunks are padded to an even number of bytes.
-        let padded_size = size + (size % 2);
-        offset = data_start.saturating_add(padded_size);
-    }
-
-    bytes
-}
-
-/// LINEAR16 is little-endian signed 16-bit PCM. A trailing odd byte is not a
-/// sample and is discarded.
-fn decode_linear16(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
-        .collect()
-}
-
 /// Environment variable first, then the keychain. Never `settings.json`.
 pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
     if let Ok(key) = std::env::var(INWORLD_API_KEY_VAR) {
@@ -364,6 +377,35 @@ pub fn resolve_api_key(cx: &App) -> Task<Result<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::collect_utterance;
+
+    /// Test-only aggregation of a whole JSON-lines body, composing
+    /// `decode_audio_line` the way the streaming path does. Production
+    /// forwards each line as its own chunk instead of concatenating.
+    /// Walks the streamed JSON-lines body, concatenating every `result.audioContent`
+    /// chunk and every `result.timestampInfo.wordAlignment` entry. Malformed lines
+    /// are skipped rather than failing the whole utterance, and missing timestamp
+    /// info degrades to an empty word list rather than an error.
+    fn collect_audio_content(body: &str) -> Result<(Vec<f32>, Vec<WordTiming>)> {
+        let mut samples = Vec::new();
+        let mut words = Vec::new();
+        let mut found_any = false;
+
+        for line in body.lines() {
+            let Some((chunk_samples, chunk_words)) = decode_audio_line(line)? else {
+                continue;
+            };
+            samples.extend(chunk_samples);
+            words.extend(chunk_words);
+            found_any = true;
+        }
+
+        if !found_any {
+            return Err(anyhow!("Inworld response contained no audio content"));
+        }
+        Ok((samples, words))
+    }
+
     use gpui::TestAppContext;
 
     /// A fake Inworld endpoint that records every request body it is sent
@@ -389,6 +431,107 @@ mod tests {
         (client, bodies)
     }
 
+    /// Answers with a body of `chunk_count` JSON-lines records, each a
+    /// single-sample WAV, mirroring the shape of the `voice:stream` endpoint.
+    fn streaming_client(chunk_count: usize) -> Arc<dyn HttpClient> {
+        // A minimal RIFF/WAVE container holding one 16-bit sample, so the
+        // decoder's header-stripping runs on the streamed path too.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&2u32.to_le_bytes());
+        wav.extend_from_slice(&1234i16.to_le_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&wav);
+
+        let body: String = (0..chunk_count)
+            .map(|chunk| {
+                format!(
+                    "{{\"result\":{{\"audioContent\":\"{encoded}\",\"timestampInfo\":\
+                     {{\"wordAlignment\":{{\"words\":[\"w{chunk}\"],\
+                     \"wordStartTimeSeconds\":[{chunk}.0],\
+                     \"wordEndTimeSeconds\":[{}.0]}}}}}}}}\n",
+                    chunk + 1
+                )
+            })
+            .collect();
+
+        http_client::FakeHttpClient::create(move |_request| {
+            let body = body.clone();
+            async move {
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(body))?)
+            }
+        })
+    }
+
+    /// The whole point of #2: the endpoint streams JSON-lines, and each line
+    /// must reach the player as its own chunk. Buffering the body to the end
+    /// before decoding — which is what this used to do — meant waiting out
+    /// synthesis of the entire utterance before a single sample could play.
+    #[gpui::test]
+    async fn each_streamed_line_is_forwarded_as_its_own_chunk(cx: &mut TestAppContext) {
+        let tts = InworldTts::new(
+            streaming_client(3),
+            "key".to_string(),
+            "Dennis".to_string(),
+            "inworld-tts-2".to_string(),
+        );
+
+        let mut chunks = cx.update(|cx| tts.synthesize("Three chunks.".to_string(), cx));
+        let mut received = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            received.push(chunk.expect("every chunk decodes"));
+        }
+
+        assert_eq!(
+            received.len(),
+            3,
+            "one chunk per streamed line, not one buffered utterance"
+        );
+        for chunk in &received {
+            assert_eq!(
+                chunk.samples.len(),
+                1,
+                "the WAV header must be stripped on the streamed path too"
+            );
+            assert_eq!(chunk.sample_rate, SAMPLE_RATE);
+        }
+        assert_eq!(
+            received
+                .iter()
+                .map(|chunk| chunk.words.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "word timings are cumulative for the utterance, so each chunk \
+             supersedes the last rather than restarting"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_response_with_no_audio_is_an_error(cx: &mut TestAppContext) {
+        let client = http_client::FakeHttpClient::create(move |_request| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from("{\"result\":{}}\n".to_string()))?)
+        });
+        let tts = InworldTts::new(
+            client,
+            "key".to_string(),
+            "Dennis".to_string(),
+            "inworld-tts-2".to_string(),
+        );
+
+        let result =
+            collect_utterance(cx.update(|cx| tts.synthesize("Silent.".to_string(), cx))).await;
+        assert!(
+            result.is_err(),
+            "an utterance that produced no audio must surface, not play as silence"
+        );
+    }
+
     #[gpui::test]
     async fn a_voice_change_applies_to_the_next_synthesis_request(cx: &mut TestAppContext) {
         let (client, bodies) = recording_client();
@@ -399,11 +542,11 @@ mod tests {
             "inworld-tts-2".to_string(),
         );
 
-        cx.update(|cx| tts.synthesize("First.".to_string(), cx))
+        collect_utterance(cx.update(|cx| tts.synthesize("First.".to_string(), cx)))
             .await
             .unwrap();
         tts.set_voice("Clive".to_string(), "inworld-tts-2".to_string());
-        cx.update(|cx| tts.synthesize("Second.".to_string(), cx))
+        collect_utterance(cx.update(|cx| tts.synthesize("Second.".to_string(), cx)))
             .await
             .unwrap();
 

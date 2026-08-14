@@ -683,6 +683,11 @@ pub struct ThreadView {
     /// The concrete Inworld provider, kept alongside the type-erased handle
     /// inside `ReadAloud` so a settings change can re-target its voice.
     read_aloud_provider: Option<Arc<read_aloud::InworldTts>>,
+    /// The system-voice provider, when `read_aloud.provider` selects it. Held
+    /// for the same reason as `read_aloud_provider`: applying a voice change
+    /// without rebuilding the reader.
+    #[cfg(target_os = "macos")]
+    read_aloud_system_provider: Option<Arc<read_aloud::SystemTts>>,
     /// The provider's voice catalog, fetched lazily the first time the voice
     /// menu opens and cached for this view's lifetime.
     read_aloud_voices: Option<Vec<read_aloud::TtsVoice>>,
@@ -1408,6 +1413,8 @@ impl ThreadView {
             read_aloud_subscriptions: Vec::new(),
             read_aloud_activation: None,
             read_aloud_provider: None,
+            #[cfg(target_os = "macos")]
+            read_aloud_system_provider: None,
             read_aloud_voices: None,
             read_aloud_voices_task: None,
             read_aloud_tool_calls: HashMap::default(),
@@ -1475,6 +1482,32 @@ impl ThreadView {
         // always passes through `shutdown_read_aloud` first, which clears
         // both.
         if self.read_aloud.is_some() || self.read_aloud_activation.is_some() {
+            return;
+        }
+
+        // Resolved before anything is built: an unimplemented `provider` used
+        // to fall through to Inworld, so the setting silently did nothing.
+        let provider_name = match read_aloud::ReadAloudSettings::get_global(cx).resolve_provider() {
+            Ok(provider_name) => provider_name,
+            Err(unsupported) => {
+                self.notify_read_aloud_disabled(
+                    format!(
+                        "`read_aloud.provider` is set to \"{unsupported}\", which is not \
+                         implemented. Supported: {}.",
+                        read_aloud::SUPPORTED_PROVIDERS.join(", ")
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        // The system voice needs no key and no network, so it skips the whole
+        // credential dance the cloud provider has to go through first.
+        #[cfg(target_os = "macos")]
+        if provider_name == read_aloud::SYSTEM_PROVIDER {
+            self.subscribe_read_aloud(cx);
+            self.start_read_aloud_with_system_voice(cx);
             return;
         }
 
@@ -1548,6 +1581,46 @@ impl ThreadView {
         }));
     }
 
+    /// Brings up read aloud on the platform's own synthesizer.
+    ///
+    /// Split from the cloud path because it shares almost none of it: no API
+    /// key, no HTTP client, and no model id — just an optional voice name.
+    #[cfg(target_os = "macos")]
+    fn start_read_aloud_with_system_voice(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = audio::Audio::connect_player(cx) else {
+            self.notify_read_aloud_disabled("no audio output device available".to_string(), cx);
+            return;
+        };
+
+        let settings = read_aloud::ReadAloudSettings::get_global(cx);
+        // `voice_id` defaults to the Inworld voice name, which `say` does not
+        // have. An unknown name would make every utterance fail, so anything
+        // the system does not know falls back to the user's default voice.
+        let voice = Some(settings.voice_id.clone());
+        let speaking_rate = settings.speaking_rate;
+        let click_to_seek = settings.click_to_seek;
+        let mode = settings.mode;
+        let narration_detail = settings.narration_detail;
+
+        let provider = Arc::new(read_aloud::SystemTts::new(voice));
+        let read_aloud = cx.new(|cx| {
+            let mut read_aloud = read_aloud::ReadAloud::new(
+                provider.clone(),
+                Box::new(read_aloud::RodioSink::new(player)),
+                cx,
+            );
+            read_aloud.set_speed(speaking_rate, cx);
+            read_aloud.set_click_to_seek(click_to_seek, cx);
+            read_aloud.set_mode(mode, cx);
+            read_aloud.set_narration_detail(narration_detail, cx);
+            read_aloud
+        });
+        self.watch_read_aloud(&read_aloud, cx);
+        self.read_aloud_system_provider = Some(provider);
+        self.read_aloud = Some(read_aloud);
+        cx.notify();
+    }
+
     /// Re-renders when the reader changes, and speaks up when it reports
     /// that narration has stopped being the product it is supposed to be.
     fn watch_read_aloud(
@@ -1609,9 +1682,22 @@ impl ThreadView {
             return;
         }
 
+        // Switching providers has to rebuild the reader: the provider is baked
+        // into the player at construction, so re-applying settings to the old
+        // one would keep speaking through it.
+        if settings.provider != previous.provider {
+            self.shutdown_read_aloud(cx);
+            self.init_read_aloud(cx);
+            cx.notify();
+            return;
+        }
         if settings.voice_id != previous.voice_id || settings.model_id != previous.model_id {
             if let Some(provider) = &self.read_aloud_provider {
                 provider.set_voice(settings.voice_id.clone(), settings.model_id.clone());
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(provider) = &self.read_aloud_system_provider {
+                provider.set_voice(Some(settings.voice_id.clone()));
             }
         }
         if let Some(read_aloud) = self.read_aloud.clone() {
@@ -1669,6 +1755,10 @@ impl ThreadView {
         self.read_aloud_activation = None;
         self.read_aloud_subscriptions.clear();
         self.read_aloud_provider = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.read_aloud_system_provider = None;
+        }
         if let Some(read_aloud) = self.read_aloud.take() {
             read_aloud.update(cx, |read_aloud, cx| read_aloud.dismiss(cx));
         }

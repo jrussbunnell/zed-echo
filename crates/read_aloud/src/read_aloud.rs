@@ -4,22 +4,26 @@ mod player;
 mod provider;
 mod segmenter;
 mod sink;
+#[cfg(target_os = "macos")]
+mod system_tts;
 
 pub use inworld::{
     INWORLD_CREDENTIALS_URL, InworldTts, fallback_voices, fetch_voices, resolve_api_key,
 };
 pub use narration::{
     MAX_ACTIVITY_ACTIONS, MAX_STEP_LINE_CHARS, MAX_SUMMARY_CHARS, MAX_WRAP_UP_CHARS,
-    NOTHING_TO_ADD, NarrationKind, RawToolInput, SummaryModel, TRIVIAL_MESSAGE_CHARS, ToolCallFacts,
-    ToolCallInput, ToolCallOutcome, WrapUpBudget, WrapUpMaterial, bounded_activity, files_changed,
-    step_prompt, summary_prompt, tool_output, wrap_up_prompt,
+    NOTHING_TO_ADD, NarrationKind, RawToolInput, SummaryModel, TRIVIAL_MESSAGE_CHARS,
+    ToolCallFacts, ToolCallInput, ToolCallOutcome, WrapUpBudget, WrapUpMaterial, bounded_activity,
+    files_changed, step_prompt, summary_prompt, tool_output, wrap_up_prompt,
 };
 
 pub use player::{Player, PlayerEvent};
-pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming};
+pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming, collect_utterance};
 pub use segmenter::{Utterance, segment};
 pub use settings::{NarrationDetail, ReadAloudMode};
 pub use sink::{AudioSink, RodioSink};
+#[cfg(target_os = "macos")]
+pub use system_tts::{SYSTEM_PROVIDER, SystemTts, available_voices as system_voices};
 
 // Test doubles are only part of the crate's public surface under
 // `test-support`, so downstream crates (e.g. agent_ui's own tests) can build
@@ -85,6 +89,20 @@ gpui::actions!(
     ]
 );
 
+/// The `read_aloud.provider` values with an implementation behind them.
+///
+/// The setting is a free-form string in the schema, so anything else parses
+/// fine and would otherwise be served by Inworld anyway — a silent lie. See
+/// [`ReadAloudSettings::resolve_provider`].
+pub const INWORLD_PROVIDER: &str = "inworld";
+
+/// Every provider this build can actually speak through, for error messages.
+pub const SUPPORTED_PROVIDERS: &[&str] = &[
+    INWORLD_PROVIDER,
+    #[cfg(target_os = "macos")]
+    SYSTEM_PROVIDER,
+];
+
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
 pub struct ReadAloudSettings {
     pub enabled: bool,
@@ -103,6 +121,23 @@ pub struct ReadAloudSettings {
     pub summary_model: Option<LanguageModelSelection>,
 }
 
+impl ReadAloudSettings {
+    /// Resolves `read_aloud.provider` to a provider that actually exists.
+    ///
+    /// Returns `Err` with the offending value when the setting names something
+    /// unimplemented, so the caller can tell the user instead of quietly
+    /// speaking through Inworld and leaving the schema's promise unkept.
+    /// Matching is case-insensitive because the value is hand-written.
+    pub fn resolve_provider(&self) -> Result<&'static str, String> {
+        let requested = self.provider.trim();
+        SUPPORTED_PROVIDERS
+            .iter()
+            .find(|supported| requested.eq_ignore_ascii_case(supported))
+            .copied()
+            .ok_or_else(|| self.provider.clone())
+    }
+}
+
 impl Settings for ReadAloudSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let read_aloud = content.read_aloud.as_ref();
@@ -111,7 +146,7 @@ impl Settings for ReadAloudSettings {
             auto_play: read_aloud.and_then(|s| s.auto_play).unwrap_or(true),
             provider: read_aloud
                 .and_then(|s| s.provider.clone())
-                .unwrap_or_else(|| "inworld".to_string()),
+                .unwrap_or_else(|| INWORLD_PROVIDER.to_string()),
             voice_id: read_aloud
                 .and_then(|s| s.voice_id.clone())
                 .unwrap_or_else(|| "Dennis".to_string()),
@@ -2702,6 +2737,51 @@ mod tests {
     use crate::sink::FakeSink;
     use gpui::TestAppContext;
     use markdown::Markdown;
+
+    /// The setting is documented and parsed but had no dispatch behind it, so
+    /// `"provider": "openai"` silently spoke through Inworld. An unimplemented
+    /// provider must be reported, not substituted.
+    #[test]
+    fn an_unimplemented_provider_is_reported_rather_than_substituted() {
+        let mut settings = ReadAloudSettings::from_settings(&settings::SettingsContent::default());
+        assert_eq!(settings.resolve_provider(), Ok(INWORLD_PROVIDER));
+
+        settings.provider = "  InWorld  ".to_string();
+        assert_eq!(
+            settings.resolve_provider(),
+            Ok(INWORLD_PROVIDER),
+            "the value is hand-written, so spacing and case must not break it"
+        );
+
+        settings.provider = "openai".to_string();
+        assert_eq!(
+            settings.resolve_provider(),
+            Err("openai".to_string()),
+            "an unimplemented provider must surface, not fall back to Inworld"
+        );
+    }
+
+    /// A fresh install has no Inworld key, so without a keyless provider the
+    /// fork's headline feature is dark on first run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_voice_is_selectable_and_needs_no_key() {
+        let mut settings = ReadAloudSettings::from_settings(&settings::SettingsContent::default());
+        settings.provider = SYSTEM_PROVIDER.to_string();
+        assert_eq!(settings.resolve_provider(), Ok(SYSTEM_PROVIDER));
+
+        settings.provider = "System".to_string();
+        assert_eq!(
+            settings.resolve_provider(),
+            Ok(SYSTEM_PROVIDER),
+            "the value is hand-written, so case must not break it"
+        );
+
+        assert!(
+            SUPPORTED_PROVIDERS.contains(&SYSTEM_PROVIDER),
+            "the error message must list every provider that actually resolves"
+        );
+    }
 
     #[test]
     fn defaults_are_inert_but_autoplay_once_enabled() {

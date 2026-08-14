@@ -1,6 +1,7 @@
 use crate::provider::{TtsProvider, WordTiming};
 use crate::segmenter::Utterance;
 use crate::sink::AudioSink;
+use futures::StreamExt as _;
 use gpui::{Context, EventEmitter, Task};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -29,6 +30,10 @@ pub struct Player {
     /// on the sped-up output clock, so word timings — which are on the
     /// recording's clock — need the position multiplied back up by this.
     speed: f32,
+    /// Identifies each streamed utterance to the sink, so it can tell one
+    /// utterance's chunks from the next one's. Monotonic rather than the
+    /// utterance index, which repeats across seeks and resets.
+    next_utterance_token: u64,
 }
 
 /// A word timing resolved against the utterance's spoken text. `source_range`
@@ -56,6 +61,7 @@ impl Player {
             synthesis: None,
             word_timings: HashMap::new(),
             speed: 1.0,
+            next_utterance_token: 0,
         }
     }
 
@@ -243,33 +249,61 @@ impl Player {
         };
         let text = utterance.spoken_text.clone();
         let provider = self.provider.clone();
+        // A token rather than the index: seeking and resetting can queue the
+        // same index again, and the sink must not glue the new audio onto the
+        // old utterance's tail.
+        let token = self.next_utterance_token;
+        self.next_utterance_token += 1;
 
         self.synthesis = Some(cx.spawn(async move |this, cx| {
-            let synthesized = cx.update(|cx| provider.synthesize(text, cx)).await;
+            let mut chunks = cx.update(|cx| provider.synthesize(text, cx));
+
+            // Each chunk is appended as it lands, so playback starts on the
+            // first one instead of waiting out the whole utterance. Advancing
+            // `next_to_synthesize` is deferred to the end: it is what
+            // `speaking_index` measures the queue against, and moving it while
+            // chunks are still arriving would report the next utterance as
+            // already speaking.
+            while let Some(chunk) = chunks.next().await {
+                let landed = this
+                    .update(cx, |this, cx| match chunk {
+                        Ok(pcm) => {
+                            let timed = this
+                                .utterances
+                                .get(index)
+                                .map(|utterance| align_word_timings(utterance, &pcm.words))
+                                .unwrap_or_default();
+                            if timed.is_empty() {
+                                this.word_timings.remove(&index);
+                            } else {
+                                this.word_timings.insert(index, timed);
+                            }
+                            this.sink.append_chunk(token, pcm);
+                            cx.notify();
+                            true
+                        }
+                        Err(error) => {
+                            // A failed utterance is skipped, never retried, and
+                            // never allowed to block the ones behind it. A
+                            // failure partway through keeps the chunks that
+                            // already landed rather than cutting them off.
+                            log::warn!("read_aloud: synthesis failed, skipping: {error:#}");
+                            false
+                        }
+                    })
+                    .log_err();
+                match landed {
+                    Some(true) => {}
+                    // The utterance failed partway: stop pulling chunks for it.
+                    Some(false) => break,
+                    // The player entity is gone; nothing left to update.
+                    None => return,
+                }
+            }
 
             this.update(cx, |this, cx| {
                 this.synthesis = None;
                 this.next_to_synthesize = this.next_to_synthesize.max(index + 1);
-                match synthesized {
-                    Ok(pcm) => {
-                        let timed = this
-                            .utterances
-                            .get(index)
-                            .map(|utterance| align_word_timings(utterance, &pcm.words))
-                            .unwrap_or_default();
-                        if timed.is_empty() {
-                            this.word_timings.remove(&index);
-                        } else {
-                            this.word_timings.insert(index, timed);
-                        }
-                        this.sink.append(pcm)
-                    }
-                    Err(error) => {
-                        // A failed utterance is skipped, never retried, and never
-                        // allowed to block the ones behind it.
-                        log::warn!("read_aloud: synthesis failed, skipping: {error:#}");
-                    }
-                }
                 // `poll_position` re-pumps once the position settles.
                 this.poll_position(cx);
             })
@@ -680,6 +714,136 @@ mod tests {
             provider.spoken(),
             vec!["First.", "Second."],
             "streaming appends must not re-speak what was already queued"
+        );
+    }
+
+    /// The point of streaming: an utterance arrives as several buffers, but the
+    /// player still reasons about it as one. If the sink counted chunks
+    /// instead, `speaking_index` would run ahead of the audio and the highlight
+    /// would jump to the wrong sentence.
+    #[gpui::test]
+    async fn a_streamed_utterance_is_still_one_queue_slot(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        provider.stream_in_chunks(4);
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("Alpha beta gamma delta.", 0)], cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            sink.queued_chunks(),
+            4,
+            "the provider's chunks must reach the sink separately, not be buffered into one"
+        );
+        assert_eq!(
+            sink.queued(),
+            1,
+            "four chunks of one utterance are one queued utterance"
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0),
+        );
+
+        sink.finish_one();
+        player.update(cx, |player, cx| player.poll_position(cx));
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            None,
+            "finishing the utterance finishes all of its chunks"
+        );
+    }
+
+    /// The latency win itself: audio must be queued and playable while the
+    /// provider is still producing the rest of the utterance.
+    #[gpui::test]
+    async fn playback_can_start_before_the_utterance_finishes_streaming(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        provider.stream_in_chunks(3);
+        provider.hold();
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("One two three four.", 0)], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sink.queued_chunks(), 0, "nothing escapes a held synthesis");
+
+        provider.release_all();
+        cx.run_until_parked();
+        assert!(
+            sink.queued_chunks() > 1,
+            "the utterance must reach the sink in pieces, got {}",
+            sink.queued_chunks()
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0),
+            "the first chunk is enough to start speaking"
+        );
+    }
+
+    /// Word timings are relative to the whole utterance, but the underlying
+    /// player's clock restarts on every appended chunk. The sink has to carry
+    /// the finished chunks forward, or the highlight snaps back to the first
+    /// word at every chunk boundary.
+    ///
+    /// The magnitude of that offset is checked in `sink`'s own tests, where
+    /// chunk durations can be stated outright; `FakeTts` emits one sample per
+    /// character, so its chunks are sub-millisecond and could not move a
+    /// highlight spaced 100ms apart.
+    #[gpui::test]
+    async fn position_carries_across_a_chunk_boundary(cx: &mut TestAppContext) {
+        let (player, provider, sink) = setup(cx);
+        provider.emit_word_timings();
+        provider.stream_in_chunks(2);
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("Alpha beta gamma.", 0)], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sink.queued_chunks(), 2);
+
+        sink.set_position(Duration::from_millis(50));
+        assert_eq!(
+            player.read_with(cx, |player, _| player.current_word_source_range()),
+            Some(0..5),
+            "50ms into the first chunk, 'Alpha' is sounding"
+        );
+
+        // The first chunk finishes; the underlying clock restarts at zero.
+        sink.finish_chunk();
+        assert_eq!(
+            sink.queued(),
+            1,
+            "finishing one chunk must not retire the whole utterance"
+        );
+        assert!(
+            sink.position() > Duration::ZERO,
+            "the elapsed chunk must still count toward the utterance's position, \
+             otherwise the highlight restarts at every boundary"
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0),
+            "the utterance is still the one speaking after its first chunk ends"
+        );
+    }
+
+    /// A provider that dies partway through an utterance must not strand the
+    /// queue: the chunks that already landed keep their place and the next
+    /// utterance still gets synthesized.
+    #[gpui::test]
+    async fn a_failure_partway_through_does_not_stall_the_queue(cx: &mut TestAppContext) {
+        let (player, provider, _sink) = setup(cx);
+        provider.stream_in_chunks(3);
+        provider.fail_next();
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("Doomed.", 0), utterance("Survivor.", 8)], cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.spoken(),
+            vec!["Survivor."],
+            "the failed utterance is skipped and the queue keeps moving"
         );
     }
 

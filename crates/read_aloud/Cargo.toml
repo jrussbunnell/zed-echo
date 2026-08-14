@@ -25,7 +25,9 @@ log.workspace = true
 markdown.workspace = true
 rodio.workspace = true
 serde_json.workspace = true
+smol.workspace = true
 settings.workspace = true
+tempfile.workspace = true
 util.workspace = true
 
 [dev-dependencies]
