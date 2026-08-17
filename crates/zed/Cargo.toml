@@ -281,7 +281,7 @@ repl = { workspace = true, features = ["test-support"] }
 [package.metadata.bundle]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
 identifier = "dev.jrb.ZedEcho"
-name = "Zed Echo"
+name = "Echo"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zedecho"]

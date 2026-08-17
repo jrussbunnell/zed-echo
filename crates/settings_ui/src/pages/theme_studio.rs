@@ -510,7 +510,7 @@ fn exported_theme_family(
     let exported_name = format!("{theme_name} (Customized)");
     ThemeFamilyContent {
         name: exported_name.clone(),
-        author: "Zed Echo Theme Studio".to_string(),
+        author: "Echo Theme Studio".to_string(),
         themes: vec![ThemeContent {
             name: exported_name,
             appearance: match appearance {

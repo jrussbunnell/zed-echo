@@ -1294,6 +1294,10 @@ mod mac_os {
         // channel, so a hardcoded name breaks every rebranded bundle.
         #[serde(rename = "CFBundleExecutable")]
         bundle_executable: String,
+        // Reported instead of a hardcoded "Zed" so `--version` names whichever
+        // bundle it was pointed at. This CLI is happily run against several.
+        #[serde(rename = "CFBundleName")]
+        bundle_name: String,
     }
 
     enum Bundle {
@@ -1349,7 +1353,12 @@ mod mac_os {
 
     impl InstalledApp for Bundle {
         fn zed_version_string(&self) -> String {
-            format!("Zed {} – {}", self.version(), self.path().display(),)
+            format!(
+                "{} {} – {}",
+                self.bundle_name(),
+                self.version(),
+                self.path().display(),
+            )
         }
 
         fn launch(&self, url: String, user_data_dir: Option<&str>) -> anyhow::Result<()> {
@@ -1445,6 +1454,13 @@ mod mac_os {
             match self {
                 Self::App { plist, .. } => plist.bundle_short_version_string.clone(),
                 Self::LocalPath { .. } => "<development>".to_string(),
+            }
+        }
+
+        fn bundle_name(&self) -> String {
+            match self {
+                Self::App { plist, .. } => plist.bundle_name.clone(),
+                Self::LocalPath { .. } => "Zed".to_string(),
             }
         }
 

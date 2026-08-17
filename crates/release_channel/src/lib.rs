@@ -205,7 +205,7 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Echo",
+            ReleaseChannel::Dev => "Echo",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn dev_channel_is_zed_echo() {
-        assert_eq!(ReleaseChannel::Dev.display_name(), "Zed Echo");
+        assert_eq!(ReleaseChannel::Dev.display_name(), "Echo");
         assert_eq!(ReleaseChannel::Dev.app_id(), "dev.jrb.ZedEcho");
     }
 
