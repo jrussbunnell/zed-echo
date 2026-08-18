@@ -6697,10 +6697,10 @@ impl Sidebar {
             .group("subagent-item")
             .w_full()
             .min_w_0()
-            .h(rems_from_px(22.))
+            .h(rems_from_px(22_f32))
             .cursor_pointer()
             // Indented to line up under the parent's title, past its agent icon.
-            .pl(rems_from_px(18.))
+            .pl(rems_from_px(18_f32))
             .pr_1p5()
             .gap_1p5()
             .justify_between()
@@ -6718,7 +6718,7 @@ impl Sidebar {
                         div()
                             .flex_none()
                             .w(px(2.))
-                            .h(rems_from_px(14.))
+                            .h(rems_from_px(14_f32))
                             .rounded_full()
                             .bg(rail_color),
                     )
