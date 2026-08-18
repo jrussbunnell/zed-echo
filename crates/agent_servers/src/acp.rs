@@ -1,6 +1,6 @@
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, ElicitationStore, SteerOutcome,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -43,6 +43,10 @@ use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
+/// Extension method that delivers a message into the turn already running, per
+/// the ACP steering wire protocol. Agents advertise support for it in the
+/// initialize response's `_meta.steering.supported`.
+const STEER_METHOD: &str = "_session/steering";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,6 +468,10 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    /// Whether the agent advertised the ACP steering extension at initialize,
+    /// which is what lets a follow-up message join the running turn instead of
+    /// interrupting it. See [`AcpConnection::steer`].
+    supports_steering: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -1106,6 +1114,16 @@ impl AcpConnection {
             }
         });
 
+        // Advertised as a top-level `_meta` extension rather than a capability,
+        // per the agreed ACP steering wire protocol.
+        let supports_steering = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("steering"))
+            .and_then(|steering| steering.get("supported"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         let agent_info = response.agent_info;
         let telemetry_id = agent_info
             .as_ref()
@@ -1174,6 +1192,7 @@ impl AcpConnection {
             derived_subagents,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
+            supports_steering,
             request_elicitations,
             defaults,
             session_list,
@@ -1218,6 +1237,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            supports_steering: false,
             request_elicitations,
             defaults,
             child: None,
@@ -2148,6 +2168,58 @@ impl AgentConnection for AcpConnection {
         }
         let params = acp::CancelNotification::new(session_id);
         self.connection.send_notification(params).log_err();
+    }
+
+    /// Sends the follow-up as a steering request, which the agent injects into
+    /// the turn it is already running.
+    ///
+    /// `idleBehavior: promptRequired` opts out of the extension's default of
+    /// silently starting a detached turn: when there is nothing left to steer,
+    /// the caller has to know so it can send an ordinary prompt whose response
+    /// it can await.
+    fn steer(
+        &self,
+        session_id: &acp::SessionId,
+        content: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) -> Option<Task<Result<SteerOutcome>>> {
+        if !self.supports_steering {
+            return None;
+        }
+        // A derived subagent has no session the agent knows about; its work runs
+        // inside the parent's turn, which is what a steer has to address.
+        let session_id = self
+            .derived_subagents
+            .borrow()
+            .sessions
+            .get(session_id)
+            .map(|session| session.parent_session_id.clone())
+            .unwrap_or_else(|| session_id.clone());
+        let conn = self.connection.clone();
+        Some(cx.foreground_executor().spawn(async move {
+            let params = serde_json::to_string(&serde_json::json!({
+                "sessionId": session_id,
+                "prompt": content,
+                "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+            }))?;
+            let response = conn
+                .send_request(acp::ClientRequest::ExtMethodRequest(acp::ExtRequest::new(
+                    STEER_METHOD,
+                    serde_json::value::RawValue::from_string(params)?.into(),
+                )))
+                .block_task()
+                .await?;
+            // Every outcome other than an injection leaves the message
+            // undelivered, and an unknown one has to be read that way too:
+            // dropping the message would lose what the user typed.
+            let injected =
+                response.get("outcome").and_then(serde_json::Value::as_str) == Some("injected");
+            Ok(if injected {
+                SteerOutcome::Injected
+            } else {
+                SteerOutcome::NeedsPrompt
+            })
+        }))
     }
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {

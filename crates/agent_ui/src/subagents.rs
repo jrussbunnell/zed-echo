@@ -64,6 +64,44 @@ impl SubagentStatus {
     }
 }
 
+/// What the client has observed about a subagent that its spawning tool call
+/// cannot say.
+///
+/// Claude Code runs a subagent in the background by default: the `Agent` call
+/// returns as soon as the subagent is started, so the call reads `completed`
+/// for the whole time the subagent is working. Nothing on the wire marks an
+/// individual background subagent as finished — the adapter drops the SDK's
+/// task frames, and the plain-text task notification the CLI feeds the parent
+/// is filtered out too. What is observable is the parent's turn: it is held
+/// open until every background subagent it spawned settles. So the parent going
+/// idle is the end of *all* of them, and a cancel of that turn tears *all* of
+/// them down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubagentActivity {
+    /// Nothing observed beyond the spawning tool call; trust it.
+    #[default]
+    Unobserved,
+    /// The subagent produced output after its spawning tool call had already
+    /// completed, and nothing since has said it ended — so it was still working
+    /// the last time anything was heard from it.
+    Live,
+    /// The agent reported this subagent finished.
+    Finished,
+    /// The agent reported this subagent failed.
+    Failed,
+    /// Stopped: reported killed or stopped by the agent, or the parent's turn
+    /// was canceled while it was live, which tears it down agent-side.
+    Canceled,
+}
+
+impl SubagentActivity {
+    /// Whether this is the last word on the subagent, as opposed to a guess that
+    /// a later observation can overturn.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed | Self::Canceled)
+    }
+}
+
 /// A subagent spawned by a parent thread, flattened into what the UI needs to
 /// render one row or chip for it.
 #[derive(Clone, Debug)]
@@ -102,14 +140,29 @@ impl SubagentSummary {
         tool_call_status: &ToolCallStatus,
         subagent_thread: Option<&Entity<AcpThread>>,
         pending_permission_count: usize,
+        activity: SubagentActivity,
         cx: &App,
     ) -> Self {
         let status = if pending_permission_count > 0 {
             SubagentStatus::AwaitingApproval
+        } else if activity.is_terminal() {
+            // The agent said how this one ended, which outranks a spawning call
+            // that says only that the subagent was started.
+            match activity {
+                SubagentActivity::Failed => SubagentStatus::Failed,
+                SubagentActivity::Canceled => SubagentStatus::Canceled,
+                _ => SubagentStatus::Completed,
+            }
         } else {
             match tool_call_status {
                 ToolCallStatus::Failed => SubagentStatus::Failed,
                 ToolCallStatus::Rejected | ToolCallStatus::Canceled => SubagentStatus::Canceled,
+                // A background spawn's call completes as soon as the subagent
+                // starts, so "completed" only means finished when nothing has
+                // been heard from the subagent since.
+                ToolCallStatus::Completed if activity == SubagentActivity::Live => {
+                    SubagentStatus::Running
+                }
                 ToolCallStatus::Completed => SubagentStatus::Completed,
                 ToolCallStatus::Pending
                 | ToolCallStatus::InProgress

@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
+    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, SteerOutcome,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -26,7 +27,7 @@ use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 use crate::agent_panel_styling::AgentPanelStylingSettings;
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::message_editor::SharedSessionCapabilities;
-use crate::subagents::{SubagentCounts, SubagentStatus, SubagentSummary};
+use crate::subagents::{SubagentActivity, SubagentCounts, SubagentStatus, SubagentSummary};
 use crate::ui::{
     SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip, TerminalSandboxWarning,
     TerminalToolHeader,
@@ -1566,6 +1567,7 @@ impl ThreadView {
                     let mut read_aloud = read_aloud::ReadAloud::new(
                         provider.clone(),
                         Box::new(read_aloud::RodioSink::new(player)),
+                        Some(Self::read_aloud_sink_recovery()),
                         cx,
                     );
                     read_aloud.set_speed(speaking_rate, cx);
@@ -1584,6 +1586,17 @@ impl ThreadView {
             })
             .log_err();
         }));
+    }
+
+    /// Lets narration follow the system's output device: the sink it is playing
+    /// through is bound to whichever device was current when it opened, so a
+    /// switch to headphones (or away from them) otherwise leaves the audio
+    /// rendering somewhere the listener is not.
+    fn read_aloud_sink_recovery() -> read_aloud::SinkRecovery {
+        Arc::new(|cx: &mut App, stalled: bool| {
+            let player = audio::Audio::reconnect_player(cx, stalled)?;
+            Some(Box::new(read_aloud::RodioSink::new(player)) as Box<dyn read_aloud::AudioSink>)
+        })
     }
 
     /// Brings up read aloud on the platform's own synthesizer.
@@ -1612,6 +1625,7 @@ impl ThreadView {
             let mut read_aloud = read_aloud::ReadAloud::new(
                 provider.clone(),
                 Box::new(read_aloud::RodioSink::new(player)),
+                Some(Self::read_aloud_sink_recovery()),
                 cx,
             );
             read_aloud.set_speed(speaking_rate, cx);
@@ -4210,6 +4224,69 @@ impl ThreadView {
         }
     }
 
+    /// Delivers `content` into the turn already running, when the agent
+    /// supports steering and there is a turn to steer.
+    ///
+    /// Returns whether the message was handed off. `false` leaves the caller to
+    /// interrupt the turn and prompt, which is the only option for agents
+    /// without the extension.
+    ///
+    /// This is what keeps a follow-up from stopping the thread's background
+    /// subagents: they run inside the turn an interrupt would tear down.
+    fn steer_queued_entry(
+        &mut self,
+        content: &[acp::ContentBlock],
+        tracked_buffers: Vec<Entity<Buffer>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.thread.read(cx).status() != ThreadStatus::Generating {
+            return false;
+        }
+        let content = content.to_vec();
+        let Some(steer) = self
+            .thread
+            .update(cx, |thread, cx| thread.steer(content.clone(), cx))
+        else {
+            return false;
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = steer.await;
+            this.update_in(cx, |this, window, cx| match outcome {
+                Ok(SteerOutcome::Injected) => {
+                    this.thread.update(cx, |thread, cx| {
+                        thread.action_log().update(cx, |action_log, cx| {
+                            for buffer in tracked_buffers {
+                                action_log.buffer_read(buffer, cx)
+                            }
+                        });
+                    });
+                    this.list_state.scroll_to_end();
+                    cx.notify();
+                }
+                // The turn ended while the request was in flight, or steering
+                // failed outright: either way the message was never delivered,
+                // so send it as an ordinary prompt rather than losing it.
+                outcome => {
+                    if let Err(error) = outcome {
+                        log::error!("failed to steer turn, sending as a prompt: {error:#}");
+                    }
+                    this.send_content(
+                        Task::ready(Ok(Some((content, tracked_buffers)))),
+                        false,
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .log_err();
+        })
+        .detach();
+
+        true
+    }
+
     /// The shared "actually send this entry" path, used by fast-track,
     /// auto-processing on Stopped, and "Send Now". The entry must already have
     /// been removed from the queue.
@@ -4242,6 +4319,15 @@ impl ThreadView {
                 leading_native_command(text, self.session_capabilities.read().available_commands())
             })
             .is_some();
+
+        // Steering delivers the message into the turn already running. Falling
+        // back to interrupting it is what used to stop the thread's background
+        // subagents, whose work the agent runs inside that turn.
+        if !is_native_command
+            && self.steer_queued_entry(&content, tracked_buffers.clone(), window, cx)
+        {
+            return;
+        }
 
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
@@ -6602,7 +6688,25 @@ impl ThreadView {
         }
     }
 
+    /// What the conversation has observed about this subagent beyond its
+    /// spawning tool call, which for a background subagent is the only thing
+    /// that says whether it is still working. See [`SubagentActivity`].
+    fn subagent_activity(&self, cx: &App) -> SubagentActivity {
+        self.subagent_activity_for(&self.session_id, cx)
+    }
+
+    /// The same, for a subagent this view is *rendering* rather than being.
+    fn subagent_activity_for(&self, session_id: &acp::SessionId, cx: &App) -> SubagentActivity {
+        self.server_view
+            .upgrade()
+            .map(|server_view| server_view.read(cx).subagent_activity(session_id, cx))
+            .unwrap_or_default()
+    }
+
     fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
+        if self.subagent_activity(cx) == SubagentActivity::Canceled {
+            return true;
+        }
         self.with_subagent_tool_call(cx, |tool_call| {
             matches!(
                 tool_call.status,
@@ -6618,6 +6722,9 @@ impl ThreadView {
         // agent is working on the reply. Awaiting a relay is the only signal
         // that it is busy again.
         if self.awaiting_subagent_reply {
+            return true;
+        }
+        if self.subagent_activity(cx) == SubagentActivity::Live {
             return true;
         }
         self.with_subagent_tool_call(cx, |tool_call| {
@@ -13062,19 +13169,33 @@ impl ThreadView {
         let files_changed = changed_buffers.len();
         let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
-        let is_running = matches!(
-            tool_call.status,
-            ToolCallStatus::Pending
-                | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation { .. }
-        );
+        // A background spawn's call completes as soon as the subagent starts, so
+        // the call's own status cannot say whether the subagent is still working
+        // — what the conversation has heard from it since can. See
+        // [`SubagentActivity`].
+        let subagent_activity = thread_view
+            .as_ref()
+            .map(|thread_view| {
+                let session_id = thread_view.read(cx).thread.read(cx).session_id().clone();
+                self.subagent_activity_for(&session_id, cx)
+            })
+            .unwrap_or_default();
+
+        let is_running = subagent_activity == SubagentActivity::Live
+            || matches!(
+                tool_call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+            );
 
         let is_failed = matches!(
             tool_call.status,
             ToolCallStatus::Failed | ToolCallStatus::Rejected
         );
 
-        let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
+        let is_cancelled = subagent_activity == SubagentActivity::Canceled
+            || matches!(tool_call.status, ToolCallStatus::Canceled)
             || tool_call.content.iter().any(|c| match c {
                 ToolCallContent::ContentBlock(block) => {
                     block.text_content(cx) == Some("User canceled")

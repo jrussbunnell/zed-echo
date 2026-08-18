@@ -234,6 +234,22 @@ pub trait AgentConnection {
 
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App);
 
+    /// Delivers a follow-up message into the turn that is already running,
+    /// instead of interrupting it, for agents that support the ACP steering
+    /// extension. `None` when the agent does not.
+    ///
+    /// This is what lets a user keep talking to a thread whose turn is being
+    /// held open by background subagents: interrupting that turn is what tears
+    /// the subagents down agent-side.
+    fn steer(
+        &self,
+        _session_id: &acp::SessionId,
+        _content: Vec<acp::ContentBlock>,
+        _cx: &mut App,
+    ) -> Option<Task<Result<SteerOutcome>>> {
+        None
+    }
+
     /// Request-scoped elicitations are connection-level because they can arrive before a session
     /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
     /// `ElicitationStore` for shared processing.
@@ -296,6 +312,16 @@ impl dyn AgentConnection {
     pub fn downcast<T: 'static + AgentConnection + Sized>(self: Rc<Self>) -> Option<Rc<T>> {
         self.into_any().downcast().ok()
     }
+}
+
+/// What became of a steered message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// Delivered into the running turn.
+    Injected,
+    /// There was no turn to steer, so nothing was delivered and the message
+    /// still needs an ordinary prompt.
+    NeedsPrompt,
 }
 
 pub trait AgentSessionTruncate {
@@ -796,6 +822,10 @@ mod test_support {
         local_threads: Arc<Mutex<HashMap<acp::SessionId, Entity<AcpThread>>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
+        /// Messages delivered through [`AgentConnection::steer`], for asserting
+        /// that a follow-up joined the running turn instead of interrupting it.
+        steered: Arc<Mutex<Vec<Vec<acp::ContentBlock>>>>,
+        supports_steering: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
     }
@@ -820,9 +850,20 @@ mod test_support {
                 local_threads: Arc::default(),
                 supports_load_session: false,
                 supports_session_additional_directories: false,
+                steered: Arc::default(),
+                supports_steering: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
             }
+        }
+
+        pub fn with_steering(mut self) -> Self {
+            self.supports_steering = true;
+            self
+        }
+
+        pub fn steered(&self) -> Vec<Vec<acp::ContentBlock>> {
+            self.steered.lock().clone()
         }
 
         /// Registers `thread` as a session that exists only on the client, the
@@ -1090,6 +1131,29 @@ mod test_support {
             Some(Rc::new(StubAgentSessionClientUserMessageIds {
                 connection: self.clone(),
             }))
+        }
+
+        fn steer(
+            &self,
+            session_id: &acp::SessionId,
+            content: Vec<acp::ContentBlock>,
+            _cx: &mut App,
+        ) -> Option<Task<Result<SteerOutcome>>> {
+            if !self.supports_steering {
+                return None;
+            }
+            // Only a running turn can be steered, which is what makes the
+            // caller fall back to an ordinary prompt.
+            let has_turn = self
+                .sessions
+                .lock()
+                .get(session_id)
+                .is_some_and(|session| session.response_tx.is_some());
+            if !has_turn {
+                return Some(Task::ready(Ok(SteerOutcome::NeedsPrompt)));
+            }
+            self.steered.lock().push(content);
+            Some(Task::ready(Ok(SteerOutcome::Injected)))
         }
 
         fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {

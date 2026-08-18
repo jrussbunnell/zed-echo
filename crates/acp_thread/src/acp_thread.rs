@@ -4030,6 +4030,52 @@ impl AcpThread {
         self.send_inner(message, false, cx)
     }
 
+    /// Delivers `message` into the turn that is already running rather than
+    /// interrupting it, when the agent supports steering.
+    ///
+    /// `None` means the agent cannot steer and the caller must interrupt and
+    /// prompt as before. A [`SteerOutcome::NeedsPrompt`] result means the agent
+    /// had no turn left to steer, so the message was not delivered.
+    ///
+    /// The message is shown only once the agent confirms it was injected, and
+    /// carries no checkpoint: it lands in the middle of a turn, which is not a
+    /// state the working tree can be restored to.
+    pub fn steer(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<SteerOutcome>>> {
+        let steer = self
+            .connection
+            .steer(&self.session_id, message.clone(), cx)?;
+        Some(cx.spawn(async move |this, cx| {
+            let outcome = steer.await?;
+            if outcome == SteerOutcome::Injected {
+                this.update(cx, |this, cx| {
+                    let block = ContentBlock::new_combined(
+                        message.clone(),
+                        this.project.read(cx).languages().clone(),
+                        this.project.read(cx).path_style(cx),
+                        cx,
+                    );
+                    this.push_entry(
+                        AgentThreadEntry::UserMessage(UserMessage {
+                            protocol_id: None,
+                            client_id: None,
+                            is_optimistic: true,
+                            content: block,
+                            chunks: message,
+                            checkpoint: None,
+                            indented: false,
+                        }),
+                        cx,
+                    );
+                })?;
+            }
+            Ok(outcome)
+        }))
+    }
+
     fn send_inner(
         &mut self,
         message: Vec<acp::ContentBlock>,

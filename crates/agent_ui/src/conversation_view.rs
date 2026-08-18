@@ -45,9 +45,11 @@ use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use crate::message_editor::SessionCapabilities;
-use crate::subagents::SubagentSummary;
+use crate::subagent_notifications;
+use crate::subagents::{SubagentActivity, SubagentSummary};
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
+use notifications::status_toast::StatusToast;
 use rope::Point;
 use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
 use std::num::NonZeroUsize;
@@ -263,11 +265,33 @@ impl ProfileProvider for Entity<agent::Thread> {
     }
 }
 
+/// How often the agent's session transcript is checked for reports that an
+/// individual background subagent finished. Fast enough that a finished
+/// subagent stops reading as running while the user is looking at it, slow
+/// enough to be a rounding error against everything else a turn does.
+const SUBAGENT_NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
 #[derive(Default)]
 pub(crate) struct Conversation {
     threads: HashMap<acp::SessionId, Entity<AcpThread>>,
     permission_requests: IndexMap<acp::SessionId, Vec<acp::ToolCallId>>,
     elicitation_requests: IndexMap<acp::SessionId, Vec<ElicitationEntryId>>,
+    /// What has been observed about each subagent beyond its spawning tool call,
+    /// which for a background subagent is the only thing that says whether it is
+    /// still working. See [`SubagentActivity`].
+    subagent_activity: HashMap<acp::SessionId, SubagentActivity>,
+    /// Per parent session, how far its transcript — where an individual
+    /// background subagent's completion is reported — has been read. Kept
+    /// outside the polling task so a poll that stops for want of live subagents
+    /// and starts again does not re-read what it already has. See
+    /// [`subagent_notifications`].
+    subagent_notification_tails: HashMap<acp::SessionId, subagent_notifications::TranscriptTail>,
+    /// The polling tasks feeding [`Self::subagent_notification_tails`], one per
+    /// session, running only while that session has a subagent to learn about.
+    subagent_notification_polls: HashMap<acp::SessionId, Task<()>>,
+    /// Where to raise the toast that says a cancel took subagents with it.
+    /// `None` in tests, which have no workspace.
+    workspace: Option<WeakEntity<Workspace>>,
     subscriptions: Vec<Subscription>,
     updated_at: Option<Instant>,
 }
@@ -277,7 +301,7 @@ impl Conversation {
         let session_id = thread.read(cx).session_id().clone();
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
-            move |this, _thread, event, _cx| {
+            move |this, _thread, event, cx| {
                 this.updated_at = Some(Instant::now());
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
@@ -308,16 +332,26 @@ impl Conversation {
                             }
                         }
                     }
-                    AcpThreadEvent::NewEntry
-                    | AcpThreadEvent::StatusChanged
+                    AcpThreadEvent::NewEntry => {
+                        this.note_subagent_output(&session_id, cx);
+                    }
+                    AcpThreadEvent::Stopped(stop_reason) => {
+                        this.settle_live_subagents(
+                            &session_id,
+                            *stop_reason == acp::StopReason::Cancelled,
+                            cx,
+                        );
+                    }
+                    AcpThreadEvent::Error => {
+                        this.settle_live_subagents(&session_id, false, cx);
+                    }
+                    AcpThreadEvent::StatusChanged
                     | AcpThreadEvent::TitleUpdated
                     | AcpThreadEvent::TokenUsageUpdated
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
-                    | AcpThreadEvent::Stopped(_)
-                    | AcpThreadEvent::Error
                     | AcpThreadEvent::LoadError(_)
                     | AcpThreadEvent::PromptCapabilitiesUpdated
                     | AcpThreadEvent::Refusal
@@ -331,6 +365,256 @@ impl Conversation {
         });
         self.subscriptions.push(subscription);
         self.threads.insert(session_id, thread);
+    }
+
+    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
+        self.workspace = Some(workspace);
+    }
+
+    /// What has been observed about a subagent beyond its spawning tool call.
+    pub fn subagent_activity(&self, session_id: &acp::SessionId) -> SubagentActivity {
+        self.subagent_activity
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Records that a subagent produced an entry after its spawning tool call
+    /// had already completed, which is the one thing that proves a background
+    /// subagent is still working (see [`SubagentActivity`]).
+    ///
+    /// Gated on new entries rather than every update: one entry is enough to
+    /// establish it, and the check has to find the spawning call in the
+    /// parent's transcript.
+    fn note_subagent_output(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        if self.subagent_activity(session_id) == SubagentActivity::Live {
+            return;
+        }
+        let Some(parent_session_id) = self
+            .threads
+            .get(session_id)
+            .and_then(|thread| thread.read(cx).parent_session_id().cloned())
+        else {
+            return;
+        };
+        let spawn_completed = self
+            .threads
+            .get(&parent_session_id)
+            .and_then(|parent| parent.read(cx).tool_call_for_subagent(session_id))
+            .is_some_and(|tool_call| matches!(tool_call.status, ToolCallStatus::Completed));
+        if spawn_completed {
+            // Output after the spawning call completed means it is working again
+            // even if it was reported finished before — which is what a relayed
+            // message does to a subagent whose call completed long ago.
+            self.subagent_activity
+                .insert(session_id.clone(), SubagentActivity::Live);
+            self.watch_subagent_notifications(&parent_session_id, cx);
+        }
+    }
+
+    /// Tails the agent's own transcript for this session, which is where an
+    /// individual background subagent's completion is reported — the wire never
+    /// carries it. See [`subagent_notifications`].
+    ///
+    /// Runs while the session has a subagent whose ending is still unknown, and
+    /// stops when it does not, so an idle thread polls nothing. Silently does
+    /// nothing for agents that keep no such transcript, leaving the turn's end as
+    /// the only settling signal.
+    fn watch_subagent_notifications(
+        &mut self,
+        parent_session_id: &acp::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .subagent_notification_polls
+            .contains_key(parent_session_id)
+        {
+            return;
+        }
+        let parent_session_id = parent_session_id.clone();
+        if !self
+            .subagent_notification_tails
+            .contains_key(&parent_session_id)
+        {
+            let Some(path) = subagent_notifications::transcript_path(&parent_session_id) else {
+                return;
+            };
+            self.subagent_notification_tails.insert(
+                parent_session_id.clone(),
+                subagent_notifications::TranscriptTail::new(path),
+            );
+        }
+        let task = cx.spawn({
+            let parent_session_id = parent_session_id.clone();
+            async move |this, cx| {
+                loop {
+                    let Ok(Some(mut tail)) = this.update(cx, |this, _cx| {
+                        this.subagent_notification_tails.remove(&parent_session_id)
+                    }) else {
+                        return;
+                    };
+                    let (tail, outcomes) = cx
+                        .background_spawn(async move {
+                            let outcomes = tail.read_new();
+                            (tail, outcomes)
+                        })
+                        .await;
+                    let keep_polling = this.update(cx, |this, cx| {
+                        this.subagent_notification_tails
+                            .insert(parent_session_id.clone(), tail);
+                        this.apply_subagent_outcomes(&parent_session_id, &outcomes, cx);
+                        let has_live = this.subagent_activity.iter().any(|(subagent, activity)| {
+                            *activity == SubagentActivity::Live
+                                && this.turn_owner(subagent, cx) == parent_session_id
+                        });
+                        if !has_live {
+                            this.subagent_notification_polls.remove(&parent_session_id);
+                        }
+                        has_live
+                    });
+                    if !matches!(keep_polling, Ok(true)) {
+                        return;
+                    }
+                    cx.background_executor()
+                        .timer(SUBAGENT_NOTIFICATION_POLL_INTERVAL)
+                        .await;
+                }
+            }
+        });
+        self.subagent_notification_polls
+            .insert(parent_session_id, task);
+    }
+
+    /// Applies what the agent reported about individual subagents of
+    /// `parent_session_id`.
+    ///
+    /// The same notification covers background work that is not a subagent at
+    /// all — a backgrounded shell command — so only tool call ids that name a
+    /// subagent of this session are taken.
+    fn apply_subagent_outcomes(
+        &mut self,
+        parent_session_id: &acp::SessionId,
+        outcomes: &[(acp::ToolCallId, subagent_notifications::SubagentOutcome)],
+        cx: &mut Context<Self>,
+    ) {
+        let mut canceled_labels = Vec::new();
+        for (tool_call_id, outcome) in outcomes {
+            let session_id =
+                acp_thread::derived_subagent_session_id(parent_session_id, tool_call_id);
+            if !self.threads.contains_key(&session_id) {
+                continue;
+            }
+            let activity = match outcome {
+                subagent_notifications::SubagentOutcome::Completed => SubagentActivity::Finished,
+                subagent_notifications::SubagentOutcome::Failed => SubagentActivity::Failed,
+                subagent_notifications::SubagentOutcome::Canceled => SubagentActivity::Canceled,
+            };
+            let previous = self.subagent_activity.insert(session_id.clone(), activity);
+            if activity == SubagentActivity::Canceled
+                && previous != Some(SubagentActivity::Canceled)
+            {
+                canceled_labels.push(self.subagent_label(&session_id, cx));
+            }
+        }
+        if !canceled_labels.is_empty() {
+            self.notify_subagents_canceled(&canceled_labels, cx);
+        }
+        if !outcomes.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// Ends the "still working" state for the subagents running inside
+    /// `session_id`'s turn, because the agent holds that turn open until every
+    /// one of them settles.
+    ///
+    /// A canceled turn takes its subagents down with it — the agent interrupts
+    /// the whole query — so say so rather than letting them read as finished.
+    fn settle_live_subagents(
+        &mut self,
+        session_id: &acp::SessionId,
+        canceled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let settled: Vec<acp::SessionId> = self
+            .subagent_activity
+            .iter()
+            .filter(|(subagent, activity)| {
+                **activity == SubagentActivity::Live && &self.turn_owner(subagent, cx) == session_id
+            })
+            .map(|(subagent, _)| subagent.clone())
+            .collect();
+        let mut canceled_labels = Vec::new();
+        for subagent in settled {
+            let activity = if canceled {
+                canceled_labels.push(self.subagent_label(&subagent, cx));
+                SubagentActivity::Canceled
+            } else {
+                // The agent holds the turn open until every background subagent
+                // it spawned settles, so the turn ending means this one is done
+                // — the fallback for when its own notification was missed.
+                SubagentActivity::Finished
+            };
+            self.subagent_activity.insert(subagent, activity);
+        }
+        if !canceled_labels.is_empty() {
+            self.notify_subagents_canceled(&canceled_labels, cx);
+        }
+    }
+
+    /// The thread whose turn `session_id`'s work runs inside: itself for a real
+    /// session, and the top of the chain for a derived subagent, whose updates
+    /// all arrive on the root's turn.
+    fn turn_owner(&self, session_id: &acp::SessionId, cx: &App) -> acp::SessionId {
+        let mut current = session_id.clone();
+        loop {
+            let parent = self
+                .threads
+                .get(&current)
+                .and_then(|thread| thread.read(cx).parent_session_id().cloned());
+            match parent {
+                Some(parent) => current = parent,
+                None => return current,
+            }
+        }
+    }
+
+    /// The task the parent gave this subagent, for messages about it.
+    fn subagent_label(&self, session_id: &acp::SessionId, cx: &App) -> SharedString {
+        self.threads
+            .get(session_id)
+            .and_then(|thread| thread.read(cx).parent_session_id().cloned())
+            .and_then(|parent_session_id| self.threads.get(&parent_session_id))
+            .and_then(|parent| parent.read(cx).tool_call_for_subagent(session_id))
+            .map(|tool_call| tool_call.label.read(cx).source().trim().to_string())
+            .filter(|label| !label.is_empty())
+            .map_or_else(|| SharedString::from("Subagent"), SharedString::from)
+    }
+
+    /// Canceling a turn stops its subagents agent-side, which is otherwise
+    /// invisible: their spawning tool calls already read "completed" and their
+    /// transcripts simply stop.
+    fn notify_subagents_canceled(&self, labels: &[SharedString], cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let message = match labels {
+            [label] => format!("Stopped subagent: {label}"),
+            labels => format!("Stopped {} subagents", labels.len()),
+        };
+        let status_toast = StatusToast::new(message, cx, |this, _cx| {
+            this.icon(
+                Icon::new(IconName::Stop)
+                    .size(IconSize::Small)
+                    .color(Color::Error),
+            )
+            .dismiss_button(true)
+        });
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(status_toast, cx);
+            })
+            .log_err();
     }
 
     /// Every subagent spawned by `parent_thread`, in spawn order.
@@ -363,6 +647,7 @@ impl Conversation {
                     &tool_call.status,
                     self.threads.get(&info.session_id),
                     self.pending_tool_call_count_for_session(&info.session_id),
+                    self.subagent_activity(&info.session_id),
                     cx,
                 )
             })
@@ -738,6 +1023,23 @@ impl ConversationView {
                     .conversation
                     .read(cx)
                     .subagent_summaries_for_parent(parent_thread, cx)
+            })
+            .unwrap_or_default()
+    }
+
+    /// What has been observed about `session_id` as a subagent beyond its
+    /// spawning tool call. See [`SubagentActivity`].
+    pub(crate) fn subagent_activity(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> SubagentActivity {
+        self.as_connected()
+            .map(|connected| {
+                connected
+                    .conversation
+                    .read(cx)
+                    .subagent_activity(session_id)
             })
             .unwrap_or_default()
     }
@@ -1278,6 +1580,7 @@ impl ConversationView {
 
                         let conversation = cx.new(|cx| {
                             let mut conversation = Conversation::default();
+                            conversation.set_workspace(this.workspace.clone());
                             conversation.register_thread(thread.clone(), cx);
                             conversation
                         });
@@ -4488,6 +4791,79 @@ pub(crate) mod tests {
         assert_eq!(
             queue_len, 0,
             "queued message should be auto-sent after the user re-engages"
+        );
+    }
+
+    /// Interrupting a turn to send a follow-up is what tore down the
+    /// background subagents running inside it, so a steering-capable agent gets
+    /// the message delivered into the turn instead.
+    #[gpui::test]
+    async fn test_sending_a_queued_message_steers_instead_of_interrupting(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_steering();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("delegate the work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let thread = conversation_view.read_with(cx, |view, cx| {
+            view.active_thread().unwrap().read(cx).thread.clone()
+        });
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "and also this".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+            let id = view.message_queue.first().unwrap().id;
+            view.send_queued_message_now(id, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection
+                .steered()
+                .iter()
+                .map(|content| match content.first() {
+                    Some(acp::ContentBlock::Text(text)) => text.text.clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>(),
+            vec!["and also this".to_string()]
+        );
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating,
+            "the turn the subagents run inside must still be alive"
+        );
+        assert!(
+            thread.read_with(cx, |thread, _| {
+                thread.entries().iter().any(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => {
+                        message.chunks.iter().any(|chunk| {
+                            matches!(chunk, acp::ContentBlock::Text(text) if text.text == "and also this")
+                        })
+                    }
+                    _ => false,
+                })
+            }),
+            "the steered message should be shown in the transcript"
         );
     }
 
@@ -12759,6 +13135,138 @@ pub(crate) mod tests {
                 "opening a subagent from the tray should navigate into it"
             );
         });
+    }
+
+    /// A background subagent's spawning tool call completes as soon as the
+    /// subagent starts, so the call alone would report every one of them as
+    /// finished for the whole time they work. What settles an individual one is
+    /// the agent's own report of it, which arrives in the session transcript.
+    #[gpui::test]
+    async fn test_background_subagent_status_tracks_its_own_reported_ending(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        // The id the connection derives for a subagent, which is also what a
+        // completion report's tool call id resolves to.
+        let subagent_session_id = acp_thread::derived_subagent_session_id(
+            &parent_session_id,
+            &acp::ToolCallId::new("task-1"),
+        );
+
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                &subagent_session_id.0,
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            )
+        });
+        connection.add_local_session_thread(subagent_session_id.clone(), subagent_thread.clone());
+
+        // A turn is running: the agent holds it open while the subagent works.
+        let _turn = cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.send(vec!["Delegate the work".into()], cx)
+            })
+        });
+        upsert_spawn_tool_call(
+            &parent_thread,
+            "task-1",
+            "Research alternatives",
+            &subagent_session_id,
+            acp::ToolCallStatus::Completed,
+            cx,
+        );
+        cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.subagent_spawned(subagent_session_id.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let status = |cx: &mut gpui::VisualTestContext| {
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                view.subagent_summaries(cx)
+                    .first()
+                    .expect("the spawn call should list a subagent")
+                    .status
+            })
+        };
+
+        assert_eq!(
+            status(cx),
+            SubagentStatus::Completed,
+            "with nothing heard from it, the completed spawn call is all there is to go on"
+        );
+
+        // Output arriving after the spawn call completed is the subagent still
+        // working, which is the case that used to read as "Done".
+        cx.update(|_window, cx| {
+            subagent_thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "Do the thing".into(), cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(status(cx), SubagentStatus::Running);
+
+        // The agent reports each background subagent's own ending in its
+        // session transcript; that is what settles this one, with its siblings
+        // still working and the turn still open.
+        let conversation = conversation_view.read_with(cx, |view, _cx| {
+            view.as_connected().unwrap().conversation.clone()
+        });
+        conversation.update(cx, |conversation, cx| {
+            conversation.apply_subagent_outcomes(
+                &parent_session_id,
+                &[(
+                    acp::ToolCallId::new("task-1"),
+                    subagent_notifications::SubagentOutcome::Completed,
+                )],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(cx),
+            SubagentStatus::Completed,
+            "a reported completion should settle this subagent on its own"
+        );
+
+        // Output after that means it is working again — a relayed follow-up.
+        cx.update(|_window, cx| {
+            subagent_thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_tool_call(
+                        acp::ToolCall::new(acp::ToolCallId::new("child-read"), "Read main.rs")
+                            .status(acp::ToolCallStatus::InProgress),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(status(cx), SubagentStatus::Running);
+
+        // Canceling the turn stops the subagent agent-side, so it must not
+        // settle as finished.
+        cx.update(|_window, cx| parent_thread.update(cx, |thread, cx| thread.cancel(cx)))
+            .await;
+        cx.run_until_parked();
+        assert_eq!(status(cx), SubagentStatus::Canceled);
     }
 
     #[gpui::test]
