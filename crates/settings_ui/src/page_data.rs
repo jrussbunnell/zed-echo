@@ -1366,9 +1366,7 @@ pub(crate) fn buffer_font_section() -> [SettingsPageItem; 7] {
                 SettingField {
                     organization_override: None,
                     json_path: Some("buffer_font_features"),
-                    pick: |settings_content| {
-                        settings_content.theme.buffer_font_features.as_ref()
-                    },
+                    pick: |settings_content| settings_content.theme.buffer_font_features.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.theme.buffer_font_features = value;
                     },
@@ -1385,9 +1383,7 @@ pub(crate) fn buffer_font_section() -> [SettingsPageItem; 7] {
                 SettingField {
                     organization_override: None,
                     json_path: Some("buffer_font_fallbacks"),
-                    pick: |settings_content| {
-                        settings_content.theme.buffer_font_fallbacks.as_ref()
-                    },
+                    pick: |settings_content| settings_content.theme.buffer_font_fallbacks.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.theme.buffer_font_fallbacks = value;
                     },
