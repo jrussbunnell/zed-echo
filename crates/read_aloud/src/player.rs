@@ -2,11 +2,11 @@ use crate::provider::{TtsProvider, WordTiming};
 use crate::segmenter::Utterance;
 use crate::sink::AudioSink;
 use futures::StreamExt as _;
-use gpui::{Context, EventEmitter, Task};
+use gpui::{App, Context, EventEmitter, Task};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use util::ResultExt as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,9 +15,38 @@ pub enum PlayerEvent {
     Finished,
 }
 
+/// Builds a replacement sink when the one in use has stopped being audible —
+/// the output device moved, or its stream broke. `None` means the sink in use
+/// is still the right one.
+///
+/// The `bool` forces a replacement even when the output looks fine from the
+/// outside, for when playback itself can tell it is not sounding.
+///
+/// Injected rather than reached for directly so this crate keeps knowing
+/// nothing about sound cards, which is what lets its tests run without one.
+pub type SinkRecovery = Arc<dyn Fn(&mut App, bool) -> Option<Box<dyn AudioSink>>>;
+
+/// How long playback may make no progress — audio queued, not paused, and
+/// neither the position nor the queue moving — before the output stream is
+/// treated as wedged and reopened.
+///
+/// Long enough that a slow first chunk or a scheduling hiccup never trips it,
+/// short enough that a listener hears a gap rather than the rest of the
+/// message in silence.
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many times playback may reopen a stalled output stream before giving up.
+///
+/// Reopening re-speaks the current utterance, so a device that is silent no
+/// matter what would otherwise loop: a gap, a resynthesis (a billed TTS
+/// request), silence again. Two retries covers a stream that broke; past that,
+/// the problem is not the stream.
+const MAX_STALL_RECOVERIES: usize = 2;
+
 pub struct Player {
     provider: Arc<dyn TtsProvider>,
     sink: Box<dyn AudioSink>,
+    recover_sink: Option<SinkRecovery>,
     utterances: Vec<Utterance>,
     /// Index of the next utterance to synthesize.
     next_to_synthesize: usize,
@@ -34,6 +63,17 @@ pub struct Player {
     /// utterance's chunks from the next one's. Monotonic rather than the
     /// utterance index, which repeats across seeks and resets.
     next_utterance_token: u64,
+    /// Whether the listener paused, as opposed to the sink being left stopped
+    /// by an abandoned playback. Appending to a stopped sink is silent, so the
+    /// two have to be told apart before re-arming it.
+    paused_by_user: bool,
+    /// Last (queued utterances, position) seen to differ, and when — the basis
+    /// for noticing that the output stream has stopped sounding. See
+    /// [`STALL_TIMEOUT`].
+    last_progress: Option<((usize, Duration), Instant)>,
+    /// Stalls recovered from without playback moving since, bounded by
+    /// [`MAX_STALL_RECOVERIES`].
+    stall_recoveries: usize,
 }
 
 /// A word timing resolved against the utterance's spoken text. `source_range`
@@ -50,11 +90,13 @@ impl Player {
     pub fn new(
         provider: Arc<dyn TtsProvider>,
         sink: Box<dyn AudioSink>,
+        recover_sink: Option<SinkRecovery>,
         _cx: &mut Context<Self>,
     ) -> Self {
         Self {
             provider,
             sink,
+            recover_sink,
             utterances: Vec::new(),
             next_to_synthesize: 0,
             last_reported: None,
@@ -62,6 +104,9 @@ impl Player {
             word_timings: HashMap::new(),
             speed: 1.0,
             next_utterance_token: 0,
+            paused_by_user: false,
+            last_progress: None,
+            stall_recoveries: 0,
         }
     }
 
@@ -117,6 +162,8 @@ impl Player {
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.synthesis = None;
+        self.paused_by_user = false;
+        self.last_progress = None;
         self.sink.stop();
         self.next_to_synthesize = self.utterances.len();
         self.last_reported = None;
@@ -142,11 +189,15 @@ impl Player {
     }
 
     pub fn pause(&mut self) {
+        self.paused_by_user = true;
         self.sink.pause();
     }
 
     pub fn resume(&mut self) {
+        self.paused_by_user = false;
         self.sink.resume();
+        // A paused stretch is not a stalled one; start the stall window over.
+        self.last_progress = None;
     }
 
     pub fn is_paused(&self) -> bool {
@@ -210,10 +261,83 @@ impl Player {
         words.get(started.checked_sub(1)?)?.source_range.clone()
     }
 
+    /// Moves playback onto a fresh sink when the one in use has gone silent
+    /// under us, in either of the two shapes that has:
+    ///
+    /// - the output device moved, leaving the old stream bound to a device the
+    ///   listener is no longer on — it keeps draining, so the highlights keep
+    ///   advancing over audio nobody can hear;
+    /// - the stream stopped sounding at all, which cpal does not always report
+    ///   as an error, and which no other code path here would ever undo — the
+    ///   state that only quitting the app used to clear.
+    ///
+    /// The audio already handed to the old sink cannot be moved, so the
+    /// utterance that was sounding is spoken again from its start on the new
+    /// device rather than resuming mid-sentence.
+    fn recover_sink_if_silent(&mut self, cx: &mut Context<Self>) {
+        let Some(recover_sink) = self.recover_sink.clone() else {
+            return;
+        };
+        // Nothing playing: leave the switch to the next utterance, which opens
+        // the current device anyway.
+        if self.is_idle() {
+            return;
+        }
+        let stalled = self.playback_has_stalled(cx);
+        let resume_at = self.speaking_index().unwrap_or(self.next_to_synthesize);
+        let Some(sink) = recover_sink(cx, stalled) else {
+            return;
+        };
+        if stalled {
+            self.stall_recoveries += 1;
+            log::warn!(
+                "read_aloud: output stream stopped sounding; reopening and resuming from utterance {resume_at}"
+            );
+        } else {
+            log::info!("read_aloud: moving playback onto a new output device");
+        }
+        self.sink = sink;
+        self.sink.set_speed(self.speed);
+        self.synthesis = None;
+        self.last_reported = None;
+        self.last_progress = None;
+        self.seek_to(resume_at, cx);
+    }
+
+    /// Whether audio that should be sounding has stopped moving: queued, not
+    /// paused, and neither the position nor the queue changing for
+    /// [`STALL_TIMEOUT`].
+    ///
+    /// This is the shape of a wedged output stream, which cpal does not always
+    /// report as an error — a device that went away behind an unchanged id, or a
+    /// virtual device that accepts samples and plays nothing. Waiting on
+    /// synthesis looks nothing like it: the queue is empty then.
+    fn playback_has_stalled(&mut self, cx: &Context<Self>) -> bool {
+        if self.sink.is_paused() || self.sink.queued() == 0 {
+            self.last_progress = None;
+            return false;
+        }
+        let now = cx.background_executor().now();
+        let progress = (self.sink.queued(), self.sink.position());
+        match self.last_progress {
+            Some((last, since)) if last == progress => {
+                now.saturating_duration_since(since) >= STALL_TIMEOUT
+                    && self.stall_recoveries < MAX_STALL_RECOVERIES
+            }
+            _ => {
+                // Playback moved, so whatever went wrong before is behind us.
+                self.stall_recoveries = 0;
+                self.last_progress = Some((progress, now));
+                false
+            }
+        }
+    }
+
     /// Recomputes the speaking index from how far the sink has drained, and
     /// keeps synthesis running ahead of it. Called on a timer by the owning
     /// entity, and directly in tests.
     pub fn poll_position(&mut self, cx: &mut Context<Self>) {
+        self.recover_sink_if_silent(cx);
         let speaking = self.speaking_index();
         if speaking != self.last_reported {
             self.last_reported = speaking;
@@ -247,6 +371,12 @@ impl Player {
         let Some(utterance) = self.utterances.get(index) else {
             return;
         };
+        // `stop` leaves the sink paused, and appending to a paused sink is
+        // silent. Anything the listener did not pause has to be re-armed here
+        // or the next message plays to nobody.
+        if !self.paused_by_user && self.sink.is_paused() {
+            self.sink.resume();
+        }
         let text = utterance.spoken_text.clone();
         let provider = self.provider.clone();
         // A token rather than the index: seeking and resetting can queue the
@@ -462,9 +592,108 @@ mod tests {
         let player = cx.new({
             let provider = provider.clone();
             let sink = sink.clone();
-            |cx| Player::new(Arc::new(provider), Box::new(sink), cx)
+            |cx| Player::new(Arc::new(provider), Box::new(sink), None, cx)
         });
         (player, provider, sink)
+    }
+
+    #[gpui::test]
+    async fn recovering_a_silent_sink_respeaks_the_current_utterance(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let replacement = FakeSink::new();
+        // Stands in for the output device having moved: until it is armed, the
+        // real recovery reports that the sink in use is still the right one.
+        let device_moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let player = cx.new({
+            let provider = provider.clone();
+            let replacement = replacement.clone();
+            let device_moved = device_moved.clone();
+            |cx| {
+                let recover: SinkRecovery = Arc::new(move |_cx, _stalled| {
+                    if !device_moved.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        return None;
+                    }
+                    Some(Box::new(replacement.clone()) as Box<dyn AudioSink>)
+                });
+                Player::new(Arc::new(provider), Box::new(sink), Some(recover), cx)
+            }
+        });
+
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("One.", 0), utterance("Two.", 5)], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["One.", "Two."]);
+        assert_eq!(replacement.queued_chunks(), 0);
+
+        device_moved.store(true, std::sync::atomic::Ordering::Relaxed);
+        player.update(cx, |player, cx| player.poll_position(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.spoken(),
+            vec!["One.", "Two.", "One.", "Two."],
+            "the utterance that was sounding should be spoken again, on the new device"
+        );
+        assert_eq!(
+            player.read_with(cx, |player, _| player.speaking_index()),
+            Some(0)
+        );
+        assert!(
+            replacement.queued_chunks() > 0,
+            "the replacement sink should be the one playing"
+        );
+    }
+
+    /// A wedged output stream is the shape of the bug where audio stops for the
+    /// rest of the session: samples are accepted, nothing is heard, and cpal
+    /// reports no error.
+    #[gpui::test]
+    async fn a_stalled_output_stream_is_reopened(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let replacement = FakeSink::new();
+        let forced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let player = cx.new({
+            let provider = provider.clone();
+            let replacement = replacement.clone();
+            let forced = forced.clone();
+            |cx| {
+                let recover: SinkRecovery = Arc::new(move |_cx, stalled| {
+                    // The device never moves in this test, so only the stall
+                    // can produce a replacement.
+                    if !stalled {
+                        return None;
+                    }
+                    forced.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Some(Box::new(replacement.clone()) as Box<dyn AudioSink>)
+                });
+                Player::new(Arc::new(provider), Box::new(sink), Some(recover), cx)
+            }
+        });
+
+        player.update(cx, |player, cx| {
+            player.set_utterances(vec![utterance("One.", 0), utterance("Two.", 5)], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["One.", "Two."]);
+
+        // Audio is queued but the sink never advances: the stream is not
+        // sounding. Nothing should happen until the stall window elapses.
+        player.update(cx, |player, cx| player.poll_position(cx));
+        cx.run_until_parked();
+        assert!(!forced.load(std::sync::atomic::Ordering::Relaxed));
+
+        cx.executor().advance_clock(STALL_TIMEOUT);
+        player.update(cx, |player, cx| player.poll_position(cx));
+        cx.run_until_parked();
+
+        assert!(
+            forced.load(std::sync::atomic::Ordering::Relaxed),
+            "a stream that stops sounding should be reopened rather than left silent"
+        );
+        assert!(replacement.queued_chunks() > 0);
     }
 
     #[gpui::test]

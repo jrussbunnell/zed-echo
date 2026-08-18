@@ -17,7 +17,7 @@ pub use narration::{
     files_changed, step_prompt, summary_prompt, tool_output, wrap_up_prompt,
 };
 
-pub use player::{Player, PlayerEvent};
+pub use player::{Player, PlayerEvent, SinkRecovery};
 pub use provider::{Pcm, TtsProvider, TtsVoice, WordTiming, collect_utterance};
 pub use segmenter::{Utterance, segment};
 pub use settings::{NarrationDetail, ReadAloudMode};
@@ -627,23 +627,28 @@ impl ReadAloud {
         sink: Box<dyn AudioSink>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(provider, sink, cx)
+        Self::build(provider, sink, None, cx)
     }
 
+    /// `recover_sink` is consulted while speaking, so playback can move to
+    /// another output device when the one it is on stops being audible. See
+    /// [`SinkRecovery`].
     pub fn new(
         provider: Arc<dyn TtsProvider>,
         sink: Box<dyn AudioSink>,
+        recover_sink: Option<SinkRecovery>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(provider, sink, cx)
+        Self::build(provider, sink, recover_sink, cx)
     }
 
     fn build(
         provider: Arc<dyn TtsProvider>,
         sink: Box<dyn AudioSink>,
+        recover_sink: Option<SinkRecovery>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let player = cx.new(|cx| Player::new(provider, sink, cx));
+        let player = cx.new(|cx| Player::new(provider, sink, recover_sink, cx));
         let subscription = cx.subscribe(&player, |this, _player, event, cx| match event {
             PlayerEvent::Speaking(index) => this.highlight_utterance(Some(*index), cx),
             PlayerEvent::Finished => this.highlight_utterance(None, cx),

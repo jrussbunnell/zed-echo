@@ -11,6 +11,9 @@ pub(super) use cpal::Sample;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, mixer::Mixer, source::Buffered};
 use settings::Settings;
 use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use util::ResultExt;
 
 mod echo_canceller;
@@ -44,9 +47,32 @@ pub fn ensure_devices_initialized(cx: &mut App) {
     .detach();
 }
 
+/// How often the default output device is looked up while playback is running.
+/// The lookup is a CoreAudio/WASAPI property read, and a device switch is a
+/// human action, so once a second is both cheap and immediate enough.
+const DEVICE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The open output stream, plus what it takes to notice it is no longer the
+/// right one to be playing through.
+struct Output {
+    _handle: MixerDeviceSink,
+    mixer: Mixer,
+    /// The device this stream is bound to. cpal binds a stream to the device it
+    /// was opened on, so when the OS moves the default output — headphones in,
+    /// Bluetooth connecting, a display waking up — this stream keeps rendering
+    /// to the old device: audible on the wrong speakers at best, and silent
+    /// while still consuming samples at worst.
+    device_id: Option<DeviceId>,
+    /// Raised by cpal's error callback when the stream breaks under us, which
+    /// is what a device being unplugged looks like from here.
+    failed: Arc<AtomicBool>,
+    /// Throttles [`Audio::output_is_stale`], which playback polls.
+    last_checked: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct Audio {
-    output: Option<(MixerDeviceSink, Mixer)>,
+    output: Option<Output>,
     pub echo_canceller: EchoCanceller,
     source_cache: HashMap<Sound, Buffered<Decoder<Cursor<Vec<u8>>>>>,
 }
@@ -61,16 +87,87 @@ impl Audio {
         );
 
         if self.output.is_none() {
-            let (output_handle, output_mixer) =
-                open_output_stream(output_audio_device, self.echo_canceller.clone())?;
-            self.output = Some((output_handle, output_mixer));
+            let failed = Arc::new(AtomicBool::new(false));
+            let (output_handle, output_mixer, device_id) = open_output_stream(
+                output_audio_device,
+                self.echo_canceller.clone(),
+                failed.clone(),
+            )?;
+            self.output = Some(Output {
+                _handle: output_handle,
+                mixer: output_mixer,
+                device_id,
+                failed,
+                last_checked: None,
+            });
         }
 
-        Ok(self
+        Ok(&self
             .output
             .as_ref()
-            .map(|(_, mixer)| mixer)
-            .expect("we only get here if opening the outputstream succeeded"))
+            .expect("we only get here if opening the outputstream succeeded")
+            .mixer)
+    }
+
+    /// Whether what the app is playing through has stopped being the right
+    /// stream, either because it broke or because the system moved the default
+    /// output away from the device it is bound to.
+    fn output_is_stale(&mut self, requested_device: Option<&DeviceId>) -> bool {
+        let Some(output) = self.output.as_mut() else {
+            return false;
+        };
+        if output.failed.load(Ordering::Relaxed) {
+            return true;
+        }
+        // Only the default follows the system. An explicitly chosen device is
+        // the user's decision, and reopening it elsewhere would override that.
+        if requested_device.is_some() {
+            return false;
+        }
+        if output
+            .last_checked
+            .is_some_and(|checked_at| checked_at.elapsed() < DEVICE_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        output.last_checked = Some(Instant::now());
+        let current = default_host()
+            .default_output_device()
+            .and_then(|device| device.id().ok());
+        // A momentary "no default device" (mid-switch) is not a move to
+        // anywhere; reopening then would just fail.
+        current.is_some() && current != output.device_id
+    }
+
+    /// A player on the current output device, for when the stream the app has
+    /// been playing through is no longer the right one. `None` while it still
+    /// is, or when no device could be opened.
+    ///
+    /// `force` reopens even when the device looks unchanged, for callers that
+    /// can tell the stream is not sounding: a stream can stop being audible
+    /// without cpal reporting anything — an endpoint that went away under a
+    /// still-current device id, or a virtual device that swallows what it is
+    /// handed. Nothing else ever reopened this stream, which is why such a
+    /// stream stayed silent for the life of the process.
+    ///
+    /// Reopening builds a new mixer, which leaves every player handed out
+    /// earlier attached to the old one. Callers therefore have to move their
+    /// playback onto the returned player; whatever was queued on the old one is
+    /// gone.
+    pub fn reconnect_player(cx: &mut App, force: bool) -> Option<rodio::Player> {
+        let output_audio_device = AudioSettings::get_global(cx).output_audio_device.clone();
+        cx.update_default_global(|this: &mut Self, _cx| {
+            if !force && !this.output_is_stale(output_audio_device.as_ref()) {
+                return None;
+            }
+            log::info!("Audio output stream is stale; reopening on the current device");
+            this.output.take();
+            let output_mixer = this
+                .ensure_output_exists(output_audio_device)
+                .context("Could not reopen output stream")
+                .log_err()?;
+            Some(rodio::Player::connect_new(output_mixer))
+        })
     }
 
     pub fn play_sound(sound: Sound, cx: &mut App) {
@@ -193,9 +290,18 @@ pub fn open_test_output(device_id: Option<DeviceId>) -> anyhow::Result<MixerDevi
 pub fn open_output_stream(
     device_id: Option<DeviceId>,
     mut echo_canceller: EchoCanceller,
-) -> anyhow::Result<(MixerDeviceSink, Mixer)> {
+    failed: Arc<AtomicBool>,
+) -> anyhow::Result<(MixerDeviceSink, Mixer, Option<DeviceId>)> {
     let device = resolve_device(device_id.as_ref(), false)?;
+    // Recorded from the resolved device rather than from `device_id`, which is
+    // `None` for "whatever the system default is" — the case that has to be
+    // noticed when the default moves.
+    let opened_device_id = device.id().ok();
     let mut output_handle = DeviceSinkBuilder::from_device(device)?
+        .with_error_callback(move |error| {
+            log::error!("Audio output stream error: {error}");
+            failed.store(true, Ordering::Relaxed);
+        })
         .open_stream()
         .context("Could not open output stream")?;
     output_handle.log_on_drop(false);
@@ -211,7 +317,7 @@ pub fn open_output_stream(
         });
     output_handle.mixer().add(echo_cancelling_source);
 
-    Ok((output_handle, output_mixer))
+    Ok((output_handle, output_mixer, opened_device_id))
 }
 
 #[derive(Clone, Debug)]
