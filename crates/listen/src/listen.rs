@@ -1,9 +1,15 @@
 mod intent;
+mod listener;
 mod provider;
 
 #[cfg(any(test, feature = "test-support"))]
+pub use listener::FakeWake;
+#[cfg(any(test, feature = "test-support"))]
 pub use provider::FakeStt;
 pub use intent::{VoiceCommand, parse_intent};
+pub use listener::{
+    COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSignal, WakeSource,
+};
 pub use provider::{SttProvider, Transcript};
 
 use settings::{RegisterSetting, Settings};
