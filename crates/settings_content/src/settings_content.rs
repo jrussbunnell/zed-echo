@@ -209,6 +209,9 @@ pub struct SettingsContent {
     /// Configuration for reading agent responses aloud.
     pub read_aloud: Option<ReadAloudSettingsContent>,
 
+    /// Configuration for listening for spoken commands.
+    pub listen: Option<ListenSettingsContent>,
+
     /// Custom styling for content types rendered in the agent panel.
     pub agent_panel_styling: Option<AgentPanelStylingContent>,
 
@@ -654,6 +657,36 @@ pub struct ReadAloudSettingsContent {
     /// inline assistant model, and then to speaking the message's first
     /// sentences with no model call at all.
     pub summary_model: Option<LanguageModelSelection>,
+}
+
+/// Configuration for listening for spoken commands.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ListenSettingsContent {
+    /// Whether to listen for spoken commands.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Which speech-to-text provider transcribes a spoken command.
+    ///
+    /// "inworld" needs an API key in `INWORLD_API_KEY` or the keychain.
+    /// "system" (macOS only) transcribes with the same on-device recognizer
+    /// that listens for the wake word, so no audio leaves the machine.
+    ///
+    /// Any other value disables listening with a notice rather than silently
+    /// falling back to Inworld.
+    ///
+    /// Default: inworld
+    pub provider: Option<String>,
+    /// The word that marks what follows as addressed to the agent.
+    ///
+    /// Default: echo
+    pub wake_word: Option<String>,
+    /// Whether a spoken approval of a tool call is read back and confirmed
+    /// before it is granted. Denials are never confirmed.
+    ///
+    /// Default: true
+    pub confirm_approvals: Option<bool>,
 }
 
 /// How much of an assistant response read-aloud speaks.

@@ -651,6 +651,20 @@
     // uses the inline assistant model, and with no model at all narration
     // falls back to speaking each message's first sentences.
   },
+  // Listening for spoken commands, so a narrated session can be answered
+  // without touching the keyboard.
+  "listen": {
+    "enabled": false,
+    // "inworld" needs an API key (INWORLD_API_KEY or the keychain).
+    // "system" (macOS) transcribes with the same on-device recognizer that
+    // listens for the wake word, so no audio leaves the machine.
+    "provider": "inworld",
+    // The word that marks what follows as addressed to the agent.
+    "wake_word": "echo",
+    // Whether a spoken approval is read back and confirmed before it is
+    // granted. Denials are never confirmed — they are the safe direction.
+    "confirm_approvals": true
+  },
   // Custom styling for the agent panel's content types: "assistant_prose",
   // "thinking", "tool_output" (tool cards, terminal output labels, diff
   // text), "user_message", and "code_blocks" (fenced code in assistant
