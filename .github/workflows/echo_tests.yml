@@ -24,7 +24,7 @@ on:
   push:
     branches:
       - main
-      - read-aloud
+      - echo
 
 permissions:
   contents: read
@@ -63,6 +63,7 @@ jobs:
             -p acp_thread \
             -p agent_servers \
             -p agent_ui \
+            -p listen \
             -p read_aloud \
             -p settings_ui \
             -p sidebar
