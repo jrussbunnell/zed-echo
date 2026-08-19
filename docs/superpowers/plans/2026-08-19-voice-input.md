@@ -1644,106 +1644,33 @@ git commit -m "listen: Hear a command through Inworld"
 
 ---
 
-### Task 7: The on-device wake listener
+### Task 7: The on-device wake listener — PARTIALLY LANDED
 
-**Files:**
-- Create: `crates/listen/src/wake.rs`
-- Modify: `crates/listen/src/listen.rs`
-- Modify: `crates/listen/Cargo.toml`
-- Modify: root `Cargo.toml` (add `objc2-speech` to `[workspace.dependencies]` matching the `objc2 = "0.6"` generation)
+**Landed:** `crates/listen/src/wake.rs` holds `contains_wake_word` with four
+tests, and a module doc recording the verified `objc2-speech` API surface.
 
-**Interfaces:**
-- Consumes: `WakeSource`, `WakeSignal`.
-- Produces: `SpeechWake::new(wake_word: String) -> Result<Self>` behind `#[cfg(target_os = "macos")]`.
+**Not landed:** the `SFSpeechRecognizer` binding itself.
 
-This is the only task that cannot be verified headless. It lands last so nothing else waits on it.
+It is unsafe FFI that cannot be exercised without a live microphone and two
+granted permissions. An untested `unsafe` block in the editor's audio path is
+worse than an absent feature, so it stops here rather than shipping blind.
+Everything above it runs on `FakeWake`, so nothing else waits on it.
 
-- [ ] **Step 1: Add the dependency and confirm it resolves**
+The research is done and recorded in the module doc: `objc2-speech` depends on
+`objc2 >=0.6.2, <0.8.0` and so is compatible with the workspace's `objc2 =
+"0.6"`; the needed methods and their feature gates are listed; and the one real
+design fork is named — `appendAudioPCMBuffer` takes an `AVAudioPCMBuffer`
+rather than a slice, so either the rodio frames get wrapped through
+`objc2-avf-audio`, or `AVAudioEngine::installTapOnBus` owns the input instead.
+That choice wants a live machine to settle.
 
-Add to root `Cargo.toml` `[workspace.dependencies]`:
+**Remaining steps:**
 
-```toml
-objc2-speech = "0.3"
-```
-
-Run: `~/.cargo/bin/cargo tree -p listen 2>&1 | head -20` after adding `objc2-speech.workspace = true` under a `[target.'cfg(target_os = "macos")'.dependencies]` section in `crates/listen/Cargo.toml`.
-Expected: the version resolves against `objc2 0.6`. If it does not, pin the version that does — check `cargo search objc2-speech` and the `objc2` version in its manifest. A mismatched objc2 generation produces type errors that look like unrelated trait failures, so resolve this before writing any binding code.
-
-- [ ] **Step 2: Write the authorization and wake-word logic that can be tested**
-
-The framework calls cannot run in a test, but the wake-word match over a partial transcript can:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_wake_word_is_found_at_the_start_of_a_partial_transcript() {
-        assert!(contains_wake_word("Echo check the tests", "echo"));
-        assert!(contains_wake_word("echo, approve", "echo"));
-    }
-
-    /// The recognizer emits a growing transcript, so the wake word appears
-    /// mid-string once the user keeps talking.
-    #[test]
-    fn a_wake_word_is_found_after_earlier_speech() {
-        assert!(contains_wake_word("so anyway echo approve", "echo"));
-    }
-
-    /// Otherwise "echoing the change" wakes the listener.
-    #[test]
-    fn a_word_that_merely_starts_with_the_wake_word_does_not_wake() {
-        assert!(!contains_wake_word("echoing the change", "echo"));
-        assert!(!contains_wake_word("recheck the echoes", "echo"));
-    }
-}
-```
-
-- [ ] **Step 3: Implement `contains_wake_word`**
-
-```rust
-/// Whether `transcript` contains `wake_word` as a whole word.
-///
-/// Whole-word rather than prefix: "echoing" and "echoes" are ordinary English
-/// in a conversation about a program named Echo, and each false wake costs
-/// the listener a narration pause.
-fn contains_wake_word(transcript: &str, wake_word: &str) -> bool {
-    let wake_word = wake_word.trim().to_lowercase();
-    if wake_word.is_empty() {
-        return false;
-    }
-    transcript
-        .to_lowercase()
-        .split(|character: char| !character.is_alphanumeric())
-        .any(|word| word == wake_word)
-}
-```
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `~/.cargo/bin/cargo test -p listen wake`
-Expected: PASS — 3 tests.
-
-- [ ] **Step 5: Implement `SpeechWake`**
-
-Behind `#[cfg(target_os = "macos")]`, holding an `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true` on an `SFSpeechAudioBufferRecognitionRequest`, fed from `audio::open_input_stream`. On each partial result, `contains_wake_word` decides whether to emit `WakeSignal::Woke`; the recognizer's own endpointing emits `WakeSignal::UtteranceEnded`. Authorization is requested through `SFSpeechRecognizer::requestAuthorization`; a denial emits `WakeSignal::Failed` naming the permission rather than parking silently.
-
-A `ponytail:` comment records that the recognition request is restarted on a
-~50s timer because the framework enforces a per-request audio duration limit,
-and that macOS 26's `SpeechAnalyzer` removes the limit and improves accuracy
-but is Swift-only, so it needs a helper binary rather than an objc2 binding.
-
-- [ ] **Step 6: Verify by hand**
-
-Build and run the app, enable `listen.enabled`, grant both permissions when prompted, and confirm: the wake word pauses narration, a command dispatches, and silence after a wake resumes narration within five seconds.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/listen Cargo.toml
-git commit -m "listen: Hear the wake word without sending anything anywhere"
-```
+- [ ] Add `objc2-speech` to the workspace and a macOS-only dependency block in `crates/listen/Cargo.toml`, with the `block2`, `SFSpeechRecognitionRequest`, `SFSpeechRecognitionResult`, and `SFSpeechRecognitionTask` features
+- [ ] Pick between wrapping rodio frames and `AVAudioEngine`, on hardware
+- [ ] Implement `SpeechWake` behind `#[cfg(target_os = "macos")]`, emitting `WakeSignal::Failed` naming the permission on a denial
+- [ ] Restart the recognition request on a ~50s timer, with the `ponytail:` comment naming `SpeechAnalyzer` as the upgrade
+- [ ] Verify by hand: wake pauses narration, a command dispatches, silence resumes narration within five seconds
 
 ---
 
@@ -1777,4 +1704,4 @@ git commit -m "ci: Run the fork's tests on the branch it actually uses"
 
 ## Deferred
 
-Wiring the `Listener` into `AgentPanel` — constructing it from settings, subscribing to `ListenEvent`, building the `VoiceCandidate` snapshot from `ConversationView::threads`, and performing steer/send/authorize/narration-control — is Task 5b and depends on Tasks 4, 5, and 7 all landing. It is deliberately not specified in code here: the panel's ownership of conversation views is the part of this fork most likely to have moved by the time it is written, so it gets its own pass with fresh reading rather than a plan written against today's line numbers.
+**Task 5b — panel wiring.** Wiring the `Listener` into `AgentPanel` — constructing it from settings, subscribing to `ListenEvent`, building the `VoiceCandidate` snapshot from `ConversationView::threads`, and performing steer/send/authorize/narration-control — is Task 5b and depends on Tasks 4, 5, and 7 all landing. It is deliberately not specified in code here: the panel's ownership of conversation views is the part of this fork most likely to have moved by the time it is written, so it gets its own pass with fresh reading rather than a plan written against today's line numbers.

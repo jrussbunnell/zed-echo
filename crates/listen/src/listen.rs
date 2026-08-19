@@ -2,6 +2,7 @@ mod intent;
 mod inworld_stt;
 mod listener;
 mod provider;
+mod wake;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use listener::FakeWake;
@@ -13,6 +14,7 @@ pub use listener::{
     COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSignal, WakeSource,
 };
 pub use provider::{SttProvider, Transcript};
+pub use wake::contains_wake_word;
 
 use settings::{RegisterSetting, Settings};
 
