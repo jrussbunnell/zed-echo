@@ -1,4 +1,5 @@
 mod intent;
+mod inworld_stt;
 mod listener;
 mod provider;
 
@@ -7,6 +8,7 @@ pub use listener::FakeWake;
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::FakeStt;
 pub use intent::{VoiceCommand, parse_intent};
+pub use inworld_stt::{INWORLD_STT_URL, InworldStt};
 pub use listener::{
     COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSignal, WakeSource,
 };
