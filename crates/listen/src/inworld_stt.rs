@@ -246,6 +246,10 @@ mod tests {
         assert_eq!(config["sampleRateHertz"], SAMPLE_RATE);
         assert_eq!(config["numberOfChannels"], 1);
         assert_eq!(config["modelId"], DEFAULT_MODEL_ID);
-        assert!(body["audioData"]["content"].as_str().is_some_and(|content| !content.is_empty()));
+        assert!(
+            body["audioData"]["content"]
+                .as_str()
+                .is_some_and(|content| !content.is_empty())
+        );
     }
 }

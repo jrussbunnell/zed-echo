@@ -4,15 +4,13 @@ mod listener;
 mod provider;
 mod wake;
 
-#[cfg(any(test, feature = "test-support"))]
-pub use listener::FakeWake;
-#[cfg(any(test, feature = "test-support"))]
-pub use provider::FakeStt;
 pub use intent::{VoiceCommand, parse_intent};
 pub use inworld_stt::{INWORLD_STT_URL, InworldStt};
-pub use listener::{
-    COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSignal, WakeSource,
-};
+#[cfg(any(test, feature = "test-support"))]
+pub use listener::FakeWake;
+pub use listener::{COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSignal, WakeSource};
+#[cfg(any(test, feature = "test-support"))]
+pub use provider::FakeStt;
 pub use provider::{SttProvider, Transcript};
 pub use wake::contains_wake_word;
 
@@ -57,7 +55,9 @@ impl Settings for ListenSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let listen = content.listen.as_ref();
         ListenSettings {
-            enabled: listen.and_then(|settings| settings.enabled).unwrap_or(false),
+            enabled: listen
+                .and_then(|settings| settings.enabled)
+                .unwrap_or(false),
             provider: listen
                 .and_then(|settings| settings.provider.clone())
                 .unwrap_or_else(|| INWORLD_STT_PROVIDER.to_string()),
