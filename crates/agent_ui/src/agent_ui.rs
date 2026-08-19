@@ -39,7 +39,7 @@ pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
-mod voice_dispatch;
+pub mod voice_dispatch;
 
 use std::rc::Rc;
 use std::sync::Arc;

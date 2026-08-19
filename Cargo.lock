@@ -10315,6 +10315,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
+name = "listen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "serde_json",
+ "settings",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23396,6 +23410,7 @@ dependencies = [
  "language_tools",
  "languages",
  "line_ending_selector",
+ "listen",
  "log",
  "lsp_locations",
  "markdown",

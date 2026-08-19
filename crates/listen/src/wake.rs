@@ -25,7 +25,7 @@
 //!   `appendAudioPCMBuffer(&AVAudioPCMBuffer)`, `endAudio()`.
 //!
 //! The sharp edge is `appendAudioPCMBuffer`: it takes an `AVAudioPCMBuffer`,
-//! not a slice, so the frames from [`audio::open_input_stream`] cannot be
+//! not a slice, so the frames from `audio::open_input_stream` cannot be
 //! handed over directly. Two ways out, and the choice wants a live machine to
 //! settle:
 //!
