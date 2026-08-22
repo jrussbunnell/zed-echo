@@ -1,3 +1,4 @@
+use crate::voice_dispatch::VoiceCandidate;
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     agent_configuration::configure_context_server_modal::default_markdown_style,
@@ -4583,6 +4584,63 @@ impl ThreadView {
 
     pub fn reject_once(&mut self, _: &RejectOnce, window: &mut Window, cx: &mut Context<Self>) {
         self.authorize_pending_with_granularity(false, window, cx);
+    }
+
+    /// This thread's standing at the moment a spoken command lands.
+    pub fn voice_candidate(&self, is_active: bool, cx: &App) -> VoiceCandidate {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let blocked_on_approval = self
+            .conversation
+            .read(cx)
+            .pending_tool_call_for_session(&session_id, cx)
+            .is_some();
+        let last_spoke_at = self
+            .read_aloud
+            .as_ref()
+            .and_then(|read_aloud| read_aloud.read(cx).last_spoke_at());
+        VoiceCandidate {
+            session_id,
+            blocked_on_approval,
+            last_spoke_at,
+            is_active,
+        }
+    }
+
+    pub fn read_aloud_entity(&self) -> Option<&Entity<read_aloud::ReadAloud>> {
+        self.read_aloud.as_ref()
+    }
+
+    /// Delivers spoken text to the agent, steering the turn already running
+    /// rather than interrupting it when there is one.
+    ///
+    /// Interrupting is what used to stop a thread's background subagents,
+    /// whose work the agent runs inside that turn, so the ordinary typed path
+    /// prefers steering too; this follows it.
+    pub fn send_voice_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let content = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+        if self.steer_queued_entry(&content, Vec::new(), window, cx) {
+            return;
+        }
+        self.send_content(
+            Task::ready(Ok(Some((content, Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// What this thread is blocked on, phrased for speech.
+    ///
+    /// `None` when nothing is waiting, which is how the caller tells "there is
+    /// nothing to approve" from "there is, and here is what it is".
+    pub fn pending_tool_call_description(&self, cx: &App) -> Option<String> {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let tool_call_id = self
+            .conversation
+            .read(cx)
+            .pending_tool_call_for_session(&session_id, cx)?;
+        let (_, tool_call) = self.thread.read(cx).tool_call(&tool_call_id)?;
+        Some(tool_call.label.read(cx).source().to_string())
     }
 
     pub fn authorize_pending_tool_call(

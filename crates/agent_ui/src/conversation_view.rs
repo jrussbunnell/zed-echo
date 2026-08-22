@@ -1005,6 +1005,17 @@ impl ConversationView {
             .and_then(|id| self.thread_view(id))
     }
 
+    /// Every live thread view, parents and subagents alike.
+    ///
+    /// Voice routing needs all of them: the thread a spoken reply is
+    /// addressed to is often not the one on screen.
+    pub fn thread_views(&self) -> Vec<Entity<ThreadView>> {
+        match &self.server_state {
+            ServerState::Connected(connected) => connected.threads.values().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn thread_view(&self, session_id: &acp::SessionId) -> Option<Entity<ThreadView>> {
         let connected = self.as_connected()?;
         connected.threads.get(session_id).cloned()

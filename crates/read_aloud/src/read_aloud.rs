@@ -74,7 +74,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use util::ResultExt as _;
 
 gpui::actions!(
@@ -615,6 +615,7 @@ pub struct ReadAloud {
     /// Once per reader, like the log line.
     reported_model_failing: bool,
     poll_task: Option<Task<()>>,
+    last_spoke_at: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -691,6 +692,7 @@ impl ReadAloud {
             consecutive_model_failures: 0,
             reported_model_failing: false,
             poll_task: None,
+            last_spoke_at: None,
             _subscriptions: vec![subscription, player_observation],
         }
     }
@@ -2617,6 +2619,14 @@ impl ReadAloud {
         self.poll_task.is_some()
     }
 
+    /// When this reader last had audio sounding.
+    ///
+    /// Used to decide which thread a spoken reply is addressed to: the one the
+    /// listener most recently heard is the one they are answering.
+    pub fn last_spoke_at(&self) -> Option<Instant> {
+        self.last_spoke_at
+    }
+
     /// The message the reader is holding, whether or not it is sounding right
     /// now. Callers use this to tell "restart what is loaded" from "load
     /// something else".
@@ -2636,6 +2646,10 @@ impl ReadAloud {
                         (player.current_word_source_range(), player.is_idle())
                     });
                     this.highlight_word(word_range, cx);
+                    // Stamped here rather than where speech starts because
+                    // what a spoken reply is answering is whichever reader was
+                    // talking most recently, not whichever started first.
+                    this.last_spoke_at = Some(Instant::now());
                     // The loop lives as long as the player has *work* — audio
                     // queued, synthesis in flight, or utterances awaiting
                     // synthesis — not merely audio. A momentarily-empty sink

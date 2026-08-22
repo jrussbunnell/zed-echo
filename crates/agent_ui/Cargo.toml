@@ -86,6 +86,7 @@ project.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 rand.workspace = true
+listen.workspace = true
 read_aloud.workspace = true
 release_channel.workspace = true
 remote.workspace = true

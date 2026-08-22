@@ -506,6 +506,7 @@ dependencies = [
  "language_model",
  "language_models",
  "languages",
+ "listen",
  "log",
  "lru",
  "lsp",

@@ -1151,7 +1151,7 @@ impl BaseView {
 }
 
 pub struct AgentPanel {
-    workspace: WeakEntity<Workspace>,
+    pub(crate) workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
     user_store: Entity<UserStore>,
@@ -1186,6 +1186,8 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+    /// The wake listener and its dispatch state, when `listen.enabled`.
+    pub(crate) voice: Option<crate::voice_dispatch::VoiceSession>,
 }
 
 impl AgentPanel {
@@ -1482,7 +1484,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1554,7 +1556,7 @@ impl AgentPanel {
         })
         .detach();
 
-        let panel = Self {
+        let mut panel = Self {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
@@ -1589,9 +1591,11 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
+            voice: None,
         };
 
         panel.ensure_native_agent_connection(cx);
+        panel.start_listening(window, cx);
         panel
     }
 
