@@ -729,6 +729,23 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
     "std",
 ] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVAudioBuffer",
+    "AVAudioFormat",
+    "AVAudioTypes",
+    "objc2-core-audio-types",
+] }
+objc2-speech = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-avf-audio",
+    "SFSpeechRecognizer",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFTranscription",
+] }
 objc2-user-notifications = "0.3"
 open = "5.0.0"
 ordered-float = "2.1.1"

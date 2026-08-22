@@ -1,4 +1,6 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+#[cfg(any(test, feature = "test-support"))]
+use anyhow::anyhow;
 #[cfg(any(test, feature = "test-support"))]
 use futures::StreamExt as _;
 use futures::channel::mpsc;

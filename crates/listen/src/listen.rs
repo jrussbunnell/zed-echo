@@ -12,6 +12,8 @@ pub use listener::{COMMAND_TIMEOUT, ListenEvent, Listener, ListenerState, WakeSi
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::FakeStt;
 pub use provider::{SttProvider, Transcript};
+#[cfg(target_os = "macos")]
+pub use wake::SpeechWake;
 pub use wake::contains_wake_word;
 
 use settings::{RegisterSetting, Settings};

@@ -25,6 +25,15 @@ log.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+audio.workspace = true
+block2.workspace = true
+objc2.workspace = true
+objc2-avf-audio.workspace = true
+objc2-foundation.workspace = true
+objc2-speech.workspace = true
+rodio.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }

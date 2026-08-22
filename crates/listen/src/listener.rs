@@ -4,7 +4,9 @@ use anyhow::Result;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{App, Context, EventEmitter, SharedString, Task};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// How long a wake may go unanswered before the listener hands narration back.
@@ -26,12 +28,20 @@ pub enum WakeSignal {
 /// without one.
 pub trait WakeSource: Send + Sync + 'static {
     fn wake_events(&self, cx: &App) -> mpsc::UnboundedReceiver<WakeSignal>;
+
+    /// Mono `f32` frames at the rate the command provider expects.
+    ///
+    /// The same microphone feeds both the wake listener and the command
+    /// provider, so it is opened once here rather than twice by two owners
+    /// that would then compete for the device.
+    fn audio_frames(&self, cx: &App) -> mpsc::UnboundedReceiver<Vec<f32>>;
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct FakeWakeState {
     senders: Vec<mpsc::UnboundedSender<WakeSignal>>,
+    frames: Vec<mpsc::UnboundedSender<Vec<f32>>>,
 }
 
 /// Test double for the wake listener.
@@ -59,6 +69,17 @@ impl FakeWake {
         self.emit(WakeSignal::Failed(message.to_string()));
     }
 
+    /// Delivers one frame of captured audio, as the real listener does
+    /// continuously whether or not anything is being captured.
+    pub fn push_frame(&self, frame: Vec<f32>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state
+            .frames
+            .retain(|sender| sender.unbounded_send(frame.clone()).is_ok());
+    }
+
     fn emit(&self, signal: WakeSignal) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -75,6 +96,14 @@ impl WakeSource for FakeWake {
         let (sender, receiver) = mpsc::unbounded();
         if let Ok(mut state) = self.state.lock() {
             state.senders.push(sender);
+        }
+        receiver
+    }
+
+    fn audio_frames(&self, _cx: &App) -> mpsc::UnboundedReceiver<Vec<f32>> {
+        let (sender, receiver) = mpsc::unbounded();
+        if let Ok(mut state) = self.state.lock() {
+            state.frames.push(sender);
         }
         receiver
     }
@@ -108,6 +137,7 @@ pub struct Listener {
     transcription: Option<Task<()>>,
     timeout: Option<Task<()>>,
     _wake: Task<()>,
+    _audio_pump: Task<()>,
 }
 
 impl EventEmitter<ListenEvent> for Listener {}
@@ -130,6 +160,15 @@ impl Listener {
             }
         });
 
+        let mut frames = wake.audio_frames(cx);
+        let audio_task = cx.spawn(async move |this, cx| {
+            while let Some(frame) = frames.next().await {
+                if this.update(cx, |this, _| this.push_audio(frame)).is_err() {
+                    return;
+                }
+            }
+        });
+
         Self {
             provider,
             state: ListenerState::Idle,
@@ -138,6 +177,7 @@ impl Listener {
             transcription: None,
             timeout: None,
             _wake: wake_task,
+            _audio_pump: audio_task,
         }
     }
 
@@ -155,7 +195,7 @@ impl Listener {
     /// while nothing is being captured are dropped, which is what makes the
     /// wake word a gate rather than a label on a stream that was being
     /// uploaded anyway.
-    pub fn push_audio(&self, frame: Vec<f32>) {
+    fn push_audio(&self, frame: Vec<f32>) {
         if let Some(audio) = &self.audio {
             audio.unbounded_send(frame).ok();
         }
@@ -422,14 +462,37 @@ mod tests {
         assert_eq!(harness.events(), vec![ListenEvent::Abandoned]);
     }
 
+    /// The mirror of the gate: once woken, the frames the microphone was
+    /// already producing must actually reach the provider, or the command is
+    /// transcribed from silence.
+    #[gpui::test]
+    async fn frames_pushed_while_capturing_reach_the_provider(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.stt.queue_transcript("approve");
+        harness.wake.wake();
+        cx.run_until_parked();
+
+        harness.wake.push_frame(vec![0.1; 128]);
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        assert_eq!(harness.stt.heard(), 1);
+        assert_eq!(
+            harness.events(),
+            vec![
+                ListenEvent::Woke,
+                ListenEvent::Command(VoiceCommand::Approve),
+            ]
+        );
+    }
+
     /// Audio captured before a wake must not reach a provider. The wake word
     /// is the gate, not a label on a stream that was being uploaded anyway.
     #[gpui::test]
     async fn frames_pushed_while_idle_reach_no_provider(cx: &mut TestAppContext) {
         let harness = harness(cx);
-        harness
-            .listener
-            .read_with(cx, |listener, _| listener.push_audio(vec![0.1; 128]));
+        harness.wake.push_frame(vec![0.1; 128]);
         cx.run_until_parked();
 
         assert_eq!(harness.stt.heard(), 0);
