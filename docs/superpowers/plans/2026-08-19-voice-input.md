@@ -1644,33 +1644,25 @@ git commit -m "listen: Hear a command through Inworld"
 
 ---
 
-### Task 7: The on-device wake listener — PARTIALLY LANDED
+### Task 7: The on-device wake listener — LANDED
 
-**Landed:** `crates/listen/src/wake.rs` holds `contains_wake_word` with four
-tests, and a module doc recording the verified `objc2-speech` API surface.
+`crates/listen/src/wake.rs`. `objc2-speech` and `objc2-avf-audio` sit behind a
+macOS-only dependency block; the binding runs `SFSpeechRecognizer` with
+`requiresOnDeviceRecognition` set, restarting its request every fifty seconds
+because the framework bounds a request's audio duration.
 
-**Not landed:** the `SFSpeechRecognizer` binding itself.
+Of the two audio paths the design left open, the rodio one won: the wake source
+opens the microphone through `audio::open_input_stream`, wraps each frame in an
+`AVAudioPCMBuffer` for the recognizer, and hands the same frames to the command
+provider. One owner for the device, and it reuses the device selection and
+resampling the audio crate already does.
 
-It is unsafe FFI that cannot be exercised without a live microphone and two
-granted permissions. An untested `unsafe` block in the editor's audio path is
-worse than an absent feature, so it stops here rather than shipping blind.
-Everything above it runs on `FakeWake`, so nothing else waits on it.
+`contains_wake_word` matches whole words, with four tests.
 
-The research is done and recorded in the module doc: `objc2-speech` depends on
-`objc2 >=0.6.2, <0.8.0` and so is compatible with the workspace's `objc2 =
-"0.6"`; the needed methods and their feature gates are listed; and the one real
-design fork is named — `appendAudioPCMBuffer` takes an `AVAudioPCMBuffer`
-rather than a slice, so either the rodio frames get wrapped through
-`objc2-avf-audio`, or `AVAudioEngine::installTapOnBus` owns the input instead.
-That choice wants a live machine to settle.
-
-**Remaining steps:**
-
-- [ ] Add `objc2-speech` to the workspace and a macOS-only dependency block in `crates/listen/Cargo.toml`, with the `block2`, `SFSpeechRecognitionRequest`, `SFSpeechRecognitionResult`, and `SFSpeechRecognitionTask` features
-- [ ] Pick between wrapping rodio frames and `AVAudioEngine`, on hardware
-- [ ] Implement `SpeechWake` behind `#[cfg(target_os = "macos")]`, emitting `WakeSignal::Failed` naming the permission on a denial
-- [ ] Restart the recognition request on a ~50s timer, with the `ponytail:` comment naming `SpeechAnalyzer` as the upgrade
-- [ ] Verify by hand: wake pauses narration, a command dispatches, silence resumes narration within five seconds
+**Not verified by machine:** the binding needs a live microphone and two
+permission grants. It compiles, and the one bug found by reading it — a
+subscriber list snapshotted at session start, which would have delivered no
+signal to anything that subscribed later — is fixed. Hand-verification remains.
 
 ---
 
@@ -1702,6 +1694,25 @@ git commit -m "ci: Run the fork's tests on the branch it actually uses"
 
 ---
 
+## Task 5b: Panel wiring — LANDED
+
+`crates/agent_ui/src/voice_dispatch.rs` holds it, as an `impl AgentPanel` in its
+own module rather than more lines in `agent_panel.rs`.
+
+The panel owns the `Listener`, because `ReadAloud` is per-`ThreadView` and
+anything routing between threads has to sit above them. A wake pauses every
+reader; an abandoned wake resumes them. Commands route through
+`pick_voice_target` over a snapshot built from every conversation view's
+threads.
+
+Approval confirmation is `answer_to_confirmation`, extracted as a pure function
+so the safety property has a test: only an affirmative grants, and every other
+command — including valid ones — withholds.
+
+`ReadAloud` gained `last_spoke_at`, stamped in the position poll, so routing can
+tell which reader the listener most recently heard.
+
 ## Deferred
 
-**Task 5b — panel wiring.** Wiring the `Listener` into `AgentPanel` — constructing it from settings, subscribing to `ListenEvent`, building the `VoiceCandidate` snapshot from `ConversationView::threads`, and performing steer/send/authorize/narration-control — is Task 5b and depends on Tasks 4, 5, and 7 all landing. It is deliberately not specified in code here: the panel's ownership of conversation views is the part of this fork most likely to have moved by the time it is written, so it gets its own pass with fresh reading rather than a plan written against today's line numbers.
+**Nothing from the original scope.** For the record, the shape that was
+deferred and then built: wiring the `Listener` into `AgentPanel` — constructing it from settings, subscribing to `ListenEvent`, building the `VoiceCandidate` snapshot from `ConversationView::threads`, and performing steer/send/authorize/narration-control — is Task 5b and depends on Tasks 4, 5, and 7 all landing. It is deliberately not specified in code here: the panel's ownership of conversation views is the part of this fork most likely to have moved by the time it is written, so it gets its own pass with fresh reading rather than a plan written against today's line numbers.
