@@ -83,20 +83,24 @@ Voice activity comes from the recognizer's partial transcript: growth means spee
 
 ---
 
-### Task 4: Streaming transcription
+### Task 4: Streaming transcription — FORMAT ONLY
 
-**Files:** `crates/listen/src/inworld_streaming_stt.rs` (new), `crates/listen/Cargo.toml`
+`crates/listen/src/inworld_streaming.rs`. The config frame, the audio frame,
+and the transcript parser are complete, with 7 tests.
 
-`wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional` over `async-tungstenite`. First frame is `transcribeConfig`, then audio frames, then transcripts stream back.
+**The socket is deliberately not wired.** No API key here, so nothing about the
+exchange can be checked against the real endpoint; `async_tungstenite`'s
+connector in this workspace runs on tokio, which `listen` does not have and
+which every other user reaches through `gpui_tokio`; and what it buys over the
+buffered provider that already works is the tail of one utterance.
 
-The `SttProvider` trait already takes a frame stream and returns refining transcripts, so this is a provider, not a redesign. The buffered one stays as the fallback.
+Unverifiable protocol code behind a new runtime dependency, for half a second,
+was not a trade worth making unattended. Pinning the format means wiring it is
+an afternoon against a known-good encoding rather than reverse-engineering.
 
-- [ ] Provider over `async-tungstenite`
-- [ ] Tests on the frame encoders and the transcript parser, as the buffered provider has
-- [ ] Fall back to buffered when the socket will not open, logged once
-- [ ] Commit
-
-**Unverifiable here:** no Inworld key on this machine, so the live wire shape is untested. Parsing is isolated and table-tested so a correction is contained.
+**Remaining:** open the socket through `gpui_tokio`, send `config_frame` then
+`audio_frame`s, feed `parse_frame` output into the existing `SttProvider`
+stream, and fall back to the buffered provider when the socket will not open.
 
 ---
 
@@ -156,7 +160,16 @@ Every one absent leaves today's behavior unchanged.
 
 ---
 
-### Task 8: Verify
+### Task 8: Verify — DONE
+
+`agent_ui` 494, `listen` 50, `read_aloud` 273. `./script/clippy` exit 0 after
+four runs — this workspace **denies** `redundant_clone` rather than warning, so
+code whose tests pass will still fail the lint gate. `cargo build -p zed` exit 0.
+
+The flaky `thread_metadata_store` migration test bit twice; passed alone both
+times, as its own note says it will.
+
+### Original task 8: Verify
 
 - [ ] `cargo test -p listen -p agent_ui -p read_aloud`
 - [ ] `./script/clippy` with a real exit-code capture — `status` is read-only in zsh, do not name a variable that
