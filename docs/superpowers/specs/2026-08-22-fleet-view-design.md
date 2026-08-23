@@ -75,15 +75,23 @@ of v1.
 
 ## Decisions locked
 
-- **Daemon-backed, not ACP-backed.** The fleet is background sessions under the
-  supervisor. This is the only path that supports agent teams, and it means Echo
-  writes no scheduler, no process manager, and no worktree logic.
+- **Daemon-backed, not ACP-backed.** A *fleet session* is what Claude Code calls
+  a `background` session: a complete Claude session hosted by the supervisor,
+  with its own process, worktree, context, and transcript. "Background" names
+  only the absence of an attached terminal — it is not a subagent and not a
+  reduced session. This is the only path that supports agent teams, and it means
+  Echo writes no scheduler, no process manager, and no worktree logic.
 - **Two planes.** Live sessions are read from disk, read-only. A session becomes
   a real, interactive Echo thread only by being *adopted* — stopped, then loaded
   over ACP. There is no third state.
-- **Background sessions only in v1.** `claude agents --json` also lists the
-  user's interactive terminal sessions. Those are not Echo's fleet, and excluding
-  them keeps the refresh loop to pure disk reads with no subprocess.
+- **Dispatched sessions only in v1.** `claude agents --json` reports two kinds:
+  `background` (daemon-hosted — the fleet) and `interactive` (a `claude` the user
+  started in a terminal). Only the first is included. The second is the user's
+  own terminal windows, which Echo cannot drive and which would be noise in the
+  list; excluding them also keeps the refresh loop to pure disk reads with no
+  subprocess. This bounds *what appears in the list*, not how much runs in
+  parallel: the fleet is N sessions, each of which may run its own team of
+  teammates and its own subagents.
 - **A new `fleet` crate for the mechanism, sidebar for the surface.** Same shape
   as `listen`: the crate is pure and testable, the UI wiring lives where the UI
   already is. `sidebar.rs` is 8,591 lines and gets rows, not readers.
