@@ -53,7 +53,8 @@ Ratified in brainstorming; do not redesign.
   working session receives only instructions that change the work.
 - **The sidecar is a real agent session**, not a second retrieval stack. It has
   the same tools, so it cannot develop a different view of the repository than
-  the agent has.
+  the agent has — and it can act on what it finds, because being told what is
+  wrong without being able to fix it sends the listener back to the keyboard.
 - **Reuse `read_aloud.summary_model`** for the local answerer rather than
   introducing a second model setting.
 
@@ -155,18 +156,27 @@ Created on the first question that needs it, from
 `AgentConnection::new_session` against the same project. Kept warm for the life
 of the conversation mode.
 
-It is told, in its first prompt, that it is answering questions about work
-another session is doing, that it must not edit anything, and where that
-session's transcript is on disk — the path `subagent_notifications.rs` already
-derives.
+It is told, in its first prompt, that it works alongside a session that is
+mid-task, that it can read and change things, that the exchange will continue,
+and where that session's transcript is on disk — the path
+`subagent_notifications.rs` already derives.
 
 It never appears in the thread list. Its answers are spoken and dropped; the
 working session never sees them.
 
-**Read-only is asked for, not enforced.** Enforcing it means a permission
-policy this design does not build. The mitigation is that the sidecar is a
-separate session with no working context to damage, and the user still sees
-tool-call approvals for anything it tries.
+**It is a second pair of hands, not a lookup service.** Read-only was
+considered and rejected: a voice assistant that can tell you what is wrong but
+not fix it sends you back to the keyboard at exactly the moment you did not
+want to be there.
+
+The cost is two sessions writing one working tree. Nothing prevents that. What
+stands in its place: the briefing tells the sidecar the other session is
+editing right now, to name a file before changing it, to prefer somewhere the
+agent is not working, and to say so rather than fight over a file the agent is
+holding — and its tool calls still surface for approval before they run.
+
+If advisory turns out to be too loose in use, the fork's git-worktree machinery
+would make the isolation real. That is the upgrade, not a v1 requirement.
 
 ### Ducking
 

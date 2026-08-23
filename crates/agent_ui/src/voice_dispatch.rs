@@ -629,25 +629,43 @@ pub fn parse_route(reply: &str) -> Option<Route> {
 /// The state block is small on purpose: everything in it is already in memory,
 /// and a router that has to be told the whole transcript is no longer the fast
 /// path it exists to be.
-pub fn router_prompt(utterance: &str, state: &str, exchanges: &[(String, String)]) -> String {
+pub fn router_prompt(
+    utterance: &str,
+    state: &str,
+    exchanges: &[(String, String)],
+    mid_sidecar: bool,
+) -> String {
     let mut history = String::new();
     for (question, answer) in exchanges {
         history.push_str(&format!("Q: {question}\nA: {answer}\n"));
     }
+
+    // Without this, "and can you fix that?" routes as a fresh instruction to
+    // the working session — which is the one place it must not go, since the
+    // thing being talked about is the second session's last answer.
+    let continuing = if mid_sidecar {
+        "\n- They are mid-conversation with the second agent. A follow-up, or asking \
+         to act on what it just said, is SIDECAR. Only send AGENT when they have \
+         clearly turned back to the session doing the work."
+    } else {
+        ""
+    };
 
     format!(
         "You route what somebody watching a coding agent just said out loud. \
          Your reply is spoken by a text-to-speech voice.\n\n\
          Reply with exactly one line, starting with one of:\n\
          ANSWER: <the answer, one or two spoken sentences>\n\
-         SIDECAR: <the question, rephrased for a second agent that can read the code>\n\
+         SIDECAR: <what to pass to a second agent that can read and change the code>\n\
          AGENT: <the instruction, as they said it>\n\n\
          Rules:\n\
          - ANSWER when the state below already answers it. Prefer this; it is instant.\n\
          - SIDECAR for anything needing the code, the files, or what was said earlier \
-         in the session.\n\
-         - AGENT only when they are telling the agent to do or change something.\n\
-         - Never guess. If it needs looking at, that is SIDECAR, not ANSWER.\n\
+         in the session — and for work they want done without disturbing the session \
+         already running.\n\
+         - AGENT only when they are telling the running session itself to do or \
+         change something.\n\
+         - Never guess. If it needs looking at, that is SIDECAR, not ANSWER.{continuing}\n\
          - Spoken English. No markdown, no code, no file paths read out in full.\n\n\
          Current state:\n{state}\n\n\
          {history}\
@@ -709,11 +727,24 @@ mod route_tests {
             "what is it doing",
             "running: cargo test",
             &[("earlier".to_string(), "an answer".to_string())],
+            false,
         );
         assert!(prompt.contains("running: cargo test"));
         assert!(prompt.contains("Q: earlier"));
         assert!(prompt.contains("A: an answer"));
         assert!(prompt.contains("They said: what is it doing"));
+    }
+
+    /// "And can you fix that?" is about the second agent's last answer. Routed
+    /// as a fresh instruction it would land on the session doing the work,
+    /// which is the one place it must not go.
+    #[test]
+    fn a_conversation_in_flight_keeps_follow_ups_with_the_second_agent() {
+        let mid = router_prompt("and can you fix that", "idle", &[], true);
+        assert!(mid.contains("mid-conversation with the second agent"));
+
+        let fresh = router_prompt("and can you fix that", "idle", &[], false);
+        assert!(!fresh.contains("mid-conversation with the second agent"));
     }
 }
 
@@ -731,9 +762,13 @@ pub struct Sidecar {
 
 /// What the sidecar is told before its first question.
 ///
-/// Read-only is asked for, not enforced — enforcing it would need a permission
-/// policy this does not build. The mitigations are that it holds no working
-/// context to damage and that its tool calls still surface for approval.
+/// It is a second pair of hands, not a lookup service: it can change things,
+/// and the exchange is meant to continue rather than end at one answer.
+///
+/// The hazard that buys is two sessions writing one working tree. Nothing
+/// here prevents that — the briefing steers around it by telling the sidecar
+/// what the other session is holding and to say so rather than fight over a
+/// file, and its tool calls still surface for approval before they run.
 pub fn sidecar_briefing(transcript: Option<&std::path::Path>) -> String {
     let transcript = match transcript {
         Some(path) => format!(
@@ -745,13 +780,18 @@ pub fn sidecar_briefing(transcript: Option<&std::path::Path>) -> String {
     };
 
     format!(
-        "You answer questions about work another agent session is doing in this \
-         project, for somebody listening rather than reading. That session is \
-         mid-task; you are not it.\n\n\
+        "You work alongside another agent session in this project, for somebody \
+         listening rather than reading. They are talking to you by voice while \
+         that other session works. It is mid-task; you are not it.\n\n\
+         You can read, search, and change things, and the conversation \
+         continues — expect follow-ups, and expect to be asked to act on what \
+         you just said.\n\n\
          Rules:\n\
-         - Do not edit, create, or delete anything. Read only.\n\
          - Answer in one or two spoken sentences. Your reply is read aloud.\n\
          - Look before answering. If you did not check, say you did not.\n\
+         - The other session is editing files right now. Before you change one, \
+         say which, and prefer somewhere it is not working. If it is holding \
+         the file, say so instead of fighting over it.\n\
          - No markdown, no code blocks, no paths read out in full — say \"the \
          listener\" rather than \"crates/listen/src/listener.rs\".{transcript}"
     )
@@ -766,7 +806,26 @@ mod sidecar_tests {
     fn the_briefing_says_it_is_not_the_session_doing_the_work() {
         let briefing = sidecar_briefing(None);
         assert!(briefing.contains("you are not it"));
-        assert!(briefing.contains("Read only"));
+    }
+
+    /// It is a second pair of hands, not a lookup service.
+    #[test]
+    fn the_briefing_lets_it_act_and_expects_the_exchange_to_continue() {
+        let briefing = sidecar_briefing(None);
+        assert!(briefing.contains("change things"));
+        assert!(briefing.contains("follow-ups"));
+        assert!(
+            !briefing.contains("Read only"),
+            "read-only was lifted deliberately"
+        );
+    }
+
+    /// Two sessions writing one tree is the cost of letting it act. Nothing
+    /// prevents it, so the briefing has to steer around it.
+    #[test]
+    fn the_briefing_warns_it_off_files_the_other_session_is_holding() {
+        let briefing = sidecar_briefing(None);
+        assert!(briefing.contains("editing files right now"));
     }
 
     /// Without the path the sidecar cannot answer "what did it decide
@@ -781,7 +840,7 @@ mod sidecar_tests {
     fn a_missing_transcript_leaves_the_briefing_otherwise_intact() {
         let briefing = sidecar_briefing(None);
         assert!(!briefing.contains("transcript to"));
-        assert!(briefing.contains("Read only"));
+        assert!(briefing.contains("Answer in one or two spoken sentences"));
     }
 }
 
@@ -812,7 +871,11 @@ impl AgentPanel {
             .as_ref()
             .map(|voice| voice.exchanges.clone())
             .unwrap_or_default();
-        let prompt = router_prompt(&utterance, &state, &exchanges);
+        let mid_sidecar = self
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.sidecar.as_ref().is_some_and(|s| s.briefed));
+        let prompt = router_prompt(&utterance, &state, &exchanges, mid_sidecar);
 
         cx.spawn(async move |this, cx| {
             let reply = cx.update(|cx| model.complete(prompt, cx)).await;
