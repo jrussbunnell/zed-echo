@@ -20,6 +20,12 @@ pub trait AudioSink: 'static {
     /// Number of utterances still queued, including the one playing.
     fn queued(&self) -> usize;
     fn set_speed(&self, speed: f32);
+    /// Scales playback loudness without touching the queue or the position.
+    ///
+    /// Separate from `pause` because ducking under a speaker is not the same
+    /// decision as stopping for one: a listener who cleared their throat
+    /// should not lose the sentence.
+    fn set_volume(&self, volume: f32);
     fn stop(&self);
     /// Holds playback in place. The queue and position are untouched, unlike
     /// `stop`, which discards both.
@@ -226,6 +232,10 @@ impl AudioSink for RodioSink {
         self.player.set_speed(speed);
     }
 
+    fn set_volume(&self, volume: f32) {
+        self.player.set_volume(volume.clamp(0.0, 1.0));
+    }
+
     fn stop(&self) {
         // `Player::stop()` sets a `stopped` flag; a later `append()` then
         // blocks (waiting for the flush its own doc comment describes)
@@ -275,6 +285,7 @@ struct FakeSinkState {
     /// Chunks of the head utterance that have finished playing.
     finished_chunks: usize,
     speed: f32,
+    volume: f32,
     stopped: bool,
     paused: bool,
     position: Duration,
@@ -293,11 +304,18 @@ impl FakeSink {
                 last_token: None,
                 finished_chunks: 0,
                 speed: 1.0,
+                volume: 1.0,
                 stopped: false,
                 paused: false,
                 position: Duration::ZERO,
             })),
         }
+    }
+
+    /// The loudness the reader last asked for, so a test can tell ducking
+    /// from stopping.
+    pub fn volume(&self) -> f32 {
+        self.state.lock().map(|state| state.volume).unwrap_or(1.0)
     }
 
     /// Simulates the head *utterance* finishing playback, however many chunks
@@ -394,6 +412,12 @@ impl AudioSink for FakeSink {
     fn set_speed(&self, speed: f32) {
         if let Ok(mut state) = self.state.lock() {
             state.speed = speed;
+        }
+    }
+
+    fn set_volume(&self, volume: f32) {
+        if let Ok(mut state) = self.state.lock() {
+            state.volume = volume;
         }
     }
 

@@ -244,6 +244,10 @@ pub fn init(cx: &mut gpui::App) {
     ReadAloudSettings::register(cx);
 }
 
+/// How far narration drops under a speaking user. Low enough to talk over,
+/// high enough to still be following along.
+pub const DUCKED_VOLUME: f32 = 0.2;
+
 /// How often the player's position is sampled to advance the highlights.
 /// rodio reports position but emits no completion callback, so this is
 /// polled — fast enough that the word highlight tracks speech smoothly
@@ -616,6 +620,7 @@ pub struct ReadAloud {
     reported_model_failing: bool,
     poll_task: Option<Task<()>>,
     last_spoke_at: Option<Instant>,
+    ducked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -693,6 +698,7 @@ impl ReadAloud {
             reported_model_failing: false,
             poll_task: None,
             last_spoke_at: None,
+            ducked: false,
             _subscriptions: vec![subscription, player_observation],
         }
     }
@@ -2615,6 +2621,33 @@ impl ReadAloud {
             .update(cx, |player, _cx| player.set_speed(speed));
     }
 
+    /// Drops narration under a speaking user rather than stopping it.
+    ///
+    /// A listener who cleared their throat, or said something to somebody else
+    /// in the room, should not lose the sentence they were being told. Only an
+    /// explicit stop stops.
+    pub fn duck(&mut self, cx: &mut Context<Self>) {
+        if self.ducked {
+            return;
+        }
+        self.ducked = true;
+        self.player
+            .update(cx, |player, _cx| player.set_volume(DUCKED_VOLUME));
+    }
+
+    /// Restores full loudness. Safe to call when nothing was ducked.
+    pub fn unduck(&mut self, cx: &mut Context<Self>) {
+        if !self.ducked {
+            return;
+        }
+        self.ducked = false;
+        self.player.update(cx, |player, _cx| player.set_volume(1.0));
+    }
+
+    pub fn is_ducked(&self) -> bool {
+        self.ducked
+    }
+
     pub fn is_speaking(&self) -> bool {
         self.poll_task.is_some()
     }
@@ -2941,6 +2974,52 @@ mod tests {
             !markdown.read_with(cx, |markdown, _| markdown.speakable_ranges().is_empty()),
             "re-enabling restores the affordance without a new enqueue"
         );
+    }
+
+    /// The distinction ducking exists for. A listener who cleared their throat
+    /// should come back to the sentence still running, not to a stopped
+    /// player and a lost place.
+    #[gpui::test]
+    async fn ducking_lowers_the_voice_without_stopping_it(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let observed = sink.clone();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.duck(cx));
+        assert_eq!(observed.volume(), DUCKED_VOLUME);
+        assert!(
+            !AudioSink::is_paused(&observed),
+            "ducking must not pause; a duck and a stop are different decisions"
+        );
+        assert!(read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_ducked()));
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.unduck(cx));
+        assert_eq!(observed.volume(), 1.0);
+        assert!(!read_aloud.read_with(cx, |read_aloud, _| read_aloud.is_ducked()));
+    }
+
+    /// Unducking something that was never ducked must not shout.
+    #[gpui::test]
+    async fn unducking_what_was_not_ducked_changes_nothing(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let observed = sink.clone();
+        let read_aloud = cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.unduck(cx));
+        assert_eq!(observed.volume(), 1.0);
     }
 
     #[gpui::test]

@@ -188,6 +188,14 @@ impl Player {
         self.sink.set_speed(self.speed);
     }
 
+    /// Scales loudness without touching the queue, the position, or the
+    /// paused flag — a duck is not a pause, and must not be mistaken for one
+    /// by anything that later asks whether playback is held.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.sink
+            .set_volume(if volume.is_finite() { volume } else { 1.0 });
+    }
+
     pub fn pause(&mut self) {
         self.paused_by_user = true;
         self.sink.pause();
