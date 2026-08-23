@@ -205,9 +205,12 @@ impl AgentPanel {
                     Arc::new(listen::InworldStt::new(http_client, api_key));
 
                 let wake_word = settings.wake_word.clone();
+                let conversation = settings.conversation;
+                let conversation_window = settings.conversation_window;
                 let listener = cx.new(|cx| {
                     let mut listener = Listener::new(stt, wake, cx);
                     listener.set_wake_word(wake_word);
+                    listener.set_conversation(conversation, conversation_window);
                     listener
                 });
                 let subscription = cx.subscribe(&listener, Self::handle_listen_event);
@@ -231,15 +234,15 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            // Pausing here is what lets the command be captured against a
-            // silent speaker, which is the whole reason no echo canceller is
-            // needed yet.
-            ListenEvent::Woke => self.pause_all_narration(cx),
-            ListenEvent::Abandoned => self.resume_all_narration(cx),
+            // Ducked rather than paused: the canceller removes Echo's own
+            // voice from what the microphone hears, so narration can keep
+            // going underneath somebody who is talking.
+            ListenEvent::Woke | ListenEvent::Speaking => self.duck_all_narration(cx),
+            ListenEvent::Abandoned | ListenEvent::WindowClosed => self.unduck_all_narration(cx),
             ListenEvent::Failed(message) => {
                 log::error!("listen: {message}");
                 self.say_to_the_user("I didn't catch that.", cx);
-                self.resume_all_narration(cx);
+                self.unduck_all_narration(cx);
             }
             ListenEvent::Command(command) => self.dispatch_voice_command(command.clone(), cx),
         }
@@ -280,7 +283,7 @@ impl AgentPanel {
 
         match command {
             VoiceCommand::Say(text) => {
-                self.resume_all_narration(cx);
+                self.unduck_all_narration(cx);
                 self.with_window(cx, move |window, cx| {
                     thread_view.update(cx, |thread_view, cx| {
                         thread_view.send_voice_text(text, window, cx);
@@ -317,7 +320,7 @@ impl AgentPanel {
                     window.dispatch_action(read_aloud::SummarizeSession.boxed_clone(), cx);
                 });
             }
-            VoiceCommand::Never => self.resume_all_narration(cx),
+            VoiceCommand::Never => self.unduck_all_narration(cx),
         }
     }
 
@@ -367,7 +370,7 @@ impl AgentPanel {
             });
         });
         self.say_to_the_user(if granted { "Approved." } else { "Denied." }, cx);
-        self.resume_all_narration(cx);
+        self.unduck_all_narration(cx);
     }
 }
 
@@ -401,8 +404,18 @@ impl AgentPanel {
             .find_map(|view| view.read(cx).thread_view(session_id))
     }
 
-    /// Every reader, not just the active thread's: the point of pausing is
-    /// that the room goes quiet so a command can be heard.
+    /// Every reader, not just the active thread's: somebody talking is talking
+    /// over all of them.
+    fn duck_all_narration(&self, cx: &mut Context<Self>) {
+        self.for_each_reader(cx, |read_aloud, cx| read_aloud.duck(cx));
+    }
+
+    fn unduck_all_narration(&self, cx: &mut Context<Self>) {
+        self.for_each_reader(cx, |read_aloud, cx| read_aloud.unduck(cx));
+    }
+
+    /// An explicit stop still stops. Ducking is for somebody talking over
+    /// narration; pausing is for somebody who asked it to be quiet.
     fn pause_all_narration(&self, cx: &mut Context<Self>) {
         self.for_each_reader(cx, |read_aloud, cx| {
             let paused = read_aloud
@@ -422,6 +435,7 @@ impl AgentPanel {
             if paused {
                 read_aloud.toggle_pause(cx);
             }
+            read_aloud.unduck(cx);
         });
     }
 
@@ -564,5 +578,131 @@ mod confirmation_tests {
                 "{command:?}"
             );
         }
+    }
+}
+
+/// Where an utterance that the intent table did not claim should go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Echo answers it, and the text is the answer.
+    Answer(String),
+    /// A question needing tools, sent to the sidecar session.
+    Sidecar(String),
+    /// An instruction that changes the work, sent to the working session.
+    Agent(String),
+}
+
+/// The reply shape asked of the router.
+///
+/// One line, not JSON: a small fast model asked for one spoken sentence should
+/// not also be spending tokens and latency on braces. A reply that does not
+/// parse is a failure rather than a guess, because guessing here means sending
+/// a question to the session doing the work — the exact thing this routing
+/// exists to avoid.
+pub fn parse_route(reply: &str) -> Option<Route> {
+    let reply = reply.trim();
+    let (destination, text) = reply.split_once(':')?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    match destination.trim().to_ascii_uppercase().as_str() {
+        "ANSWER" => Some(Route::Answer(text)),
+        "SIDECAR" => Some(Route::Sidecar(text)),
+        "AGENT" => Some(Route::Agent(text)),
+        _ => None,
+    }
+}
+
+/// What the router is asked.
+///
+/// The state block is small on purpose: everything in it is already in memory,
+/// and a router that has to be told the whole transcript is no longer the fast
+/// path it exists to be.
+pub fn router_prompt(utterance: &str, state: &str, exchanges: &[(String, String)]) -> String {
+    let mut history = String::new();
+    for (question, answer) in exchanges {
+        history.push_str(&format!("Q: {question}\nA: {answer}\n"));
+    }
+
+    format!(
+        "You route what somebody watching a coding agent just said out loud. \
+         Your reply is spoken by a text-to-speech voice.\n\n\
+         Reply with exactly one line, starting with one of:\n\
+         ANSWER: <the answer, one or two spoken sentences>\n\
+         SIDECAR: <the question, rephrased for a second agent that can read the code>\n\
+         AGENT: <the instruction, as they said it>\n\n\
+         Rules:\n\
+         - ANSWER when the state below already answers it. Prefer this; it is instant.\n\
+         - SIDECAR for anything needing the code, the files, or what was said earlier \
+         in the session.\n\
+         - AGENT only when they are telling the agent to do or change something.\n\
+         - Never guess. If it needs looking at, that is SIDECAR, not ANSWER.\n\
+         - Spoken English. No markdown, no code, no file paths read out in full.\n\n\
+         Current state:\n{state}\n\n\
+         {history}\
+         They said: {utterance}"
+    )
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn each_destination_parses() {
+        assert_eq!(
+            parse_route("ANSWER: It is running the tests."),
+            Some(Route::Answer("It is running the tests.".to_string()))
+        );
+        assert_eq!(
+            parse_route("SIDECAR: what does listener.rs do"),
+            Some(Route::Sidecar("what does listener.rs do".to_string()))
+        );
+        assert_eq!(
+            parse_route("AGENT: check the tests first"),
+            Some(Route::Agent("check the tests first".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_destination_is_matched_whatever_its_casing_or_spacing() {
+        assert_eq!(
+            parse_route("  answer :  fine  "),
+            Some(Route::Answer("fine".to_string()))
+        );
+    }
+
+    /// Guessing here means sending a question into the session doing the work,
+    /// which is the exact disruption the routing exists to prevent.
+    #[test]
+    fn an_unparsable_reply_is_no_route_rather_than_a_guess() {
+        assert_eq!(parse_route("It is running the tests."), None);
+        assert_eq!(parse_route(""), None);
+        assert_eq!(parse_route("MAYBE: something"), None);
+        assert_eq!(parse_route("ANSWER:"), None);
+        assert_eq!(parse_route("ANSWER:    "), None);
+    }
+
+    /// A colon inside the answer must not truncate it.
+    #[test]
+    fn only_the_first_colon_separates() {
+        assert_eq!(
+            parse_route("ANSWER: it failed: exit code 1"),
+            Some(Route::Answer("it failed: exit code 1".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_prompt_carries_the_state_the_history_and_the_utterance() {
+        let prompt = router_prompt(
+            "what is it doing",
+            "running: cargo test",
+            &[("earlier".to_string(), "an answer".to_string())],
+        );
+        assert!(prompt.contains("running: cargo test"));
+        assert!(prompt.contains("Q: earlier"));
+        assert!(prompt.contains("A: an answer"));
+        assert!(prompt.contains("They said: what is it doing"));
     }
 }

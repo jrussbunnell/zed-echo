@@ -663,7 +663,20 @@
     "wake_word": "echo",
     // Whether a spoken approval is read back and confirmed before it is
     // granted. Denials are never confirmed — they are the safe direction.
-    "confirm_approvals": true
+    "confirm_approvals": true,
+    // Whether the listener keeps listening after an exchange, so a follow-up
+    // needs no wake word. Off, the wake word buys exactly one utterance.
+    "conversation": false,
+    // How long the conversation window stays open after an exchange.
+    "conversation_window_seconds": 15,
+    // How far narration drops while somebody is speaking, as a fraction of
+    // full volume. Narration ducks rather than stopping, so clearing your
+    // throat does not cost you the sentence.
+    "duck_to": 0.2,
+    // Whether questions needing the code or the session's history are
+    // answered by a separate agent session rather than by interrupting the
+    // one doing the work.
+    "sidecar": true
   },
   // Custom styling for the agent panel's content types: "assistant_prose",
   // "thinking", "tool_output" (tool cards, terminal output labels, diff

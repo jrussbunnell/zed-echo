@@ -36,6 +36,10 @@ pub struct ListenSettings {
     pub provider: String,
     pub wake_word: String,
     pub confirm_approvals: bool,
+    pub conversation: bool,
+    pub conversation_window: std::time::Duration,
+    pub duck_to: f32,
+    pub sidecar: bool,
 }
 
 impl ListenSettings {
@@ -72,6 +76,21 @@ impl Settings for ListenSettings {
             confirm_approvals: listen
                 .and_then(|settings| settings.confirm_approvals)
                 .unwrap_or(true),
+            conversation: listen
+                .and_then(|settings| settings.conversation)
+                .unwrap_or(false),
+            conversation_window: listen
+                .and_then(|settings| settings.conversation_window_seconds)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(conversation::DEFAULT_WINDOW),
+            // Clamped because it scales playback volume, and a value outside
+            // the range arrives unvalidated from a hand-written settings file.
+            duck_to: listen
+                .and_then(|settings| settings.duck_to)
+                .filter(|duck_to| duck_to.is_finite())
+                .map(|duck_to| duck_to.clamp(0.0, 1.0))
+                .unwrap_or(0.2),
+            sidecar: listen.and_then(|settings| settings.sidecar).unwrap_or(true),
         }
     }
 }
@@ -90,6 +109,10 @@ mod tests {
             provider: provider.to_string(),
             wake_word: "echo".to_string(),
             confirm_approvals: true,
+            conversation: false,
+            conversation_window: conversation::DEFAULT_WINDOW,
+            duck_to: 0.2,
+            sidecar: true,
         }
     }
 

@@ -687,6 +687,28 @@ pub struct ListenSettingsContent {
     ///
     /// Default: true
     pub confirm_approvals: Option<bool>,
+    /// Whether the listener keeps listening after an exchange, so a follow-up
+    /// needs no wake word. Off leaves the wake word buying exactly one
+    /// utterance.
+    ///
+    /// Default: false
+    pub conversation: Option<bool>,
+    /// How long the conversation window stays open after an exchange.
+    ///
+    /// Default: 15
+    pub conversation_window_seconds: Option<u64>,
+    /// How far narration drops while somebody is speaking, as a fraction of
+    /// full volume. Narration is ducked rather than stopped, so clearing your
+    /// throat does not cost you the sentence.
+    ///
+    /// Default: 0.2
+    pub duck_to: Option<f32>,
+    /// Whether questions that need the code or the session's history are
+    /// answered by a separate agent session rather than by interrupting the
+    /// one doing the work.
+    ///
+    /// Default: true
+    pub sidecar: Option<bool>,
 }
 
 /// How much of an assistant response read-aloud speaks.
