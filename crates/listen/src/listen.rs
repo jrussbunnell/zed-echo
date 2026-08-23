@@ -1,5 +1,6 @@
 mod conversation;
 mod intent;
+mod inworld_streaming;
 mod inworld_stt;
 mod listener;
 mod provider;
@@ -7,6 +8,7 @@ mod wake;
 
 pub use conversation::{Activity, DEFAULT_WINDOW, SILENCE_ENDS_UTTERANCE, Window, activity};
 pub use intent::{VoiceCommand, parse_intent};
+pub use inworld_streaming::{audio_frame, config_frame, parse_frame};
 pub use inworld_stt::{INWORLD_STT_URL, InworldStt};
 #[cfg(any(test, feature = "test-support"))]
 pub use listener::FakeWake;
