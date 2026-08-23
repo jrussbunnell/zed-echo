@@ -109,9 +109,12 @@ and the phase each agent belongs to is not. See [Phase attribution](#phase-attri
   subagent and not a reduced session. This is the only path that supports agent
   teams, and it means Echo writes no scheduler, no process manager, and no
   worktree logic.
-- **Two planes for a fleet session.** Live sessions are read from disk,
-  read-only. A session becomes a real, interactive Echo thread only by being
-  *adopted* — stopped, then loaded over ACP. There is no third state.
+- **Three levels of access to a fleet session, not two.** *Read* tails the
+  transcript on disk. *Attach* runs `claude attach` in a terminal Echo owns —
+  interactive, and the session keeps running. *Adopt* stops the session and loads
+  it over ACP, which is the only way it becomes a real Echo thread. Attach exists
+  because talking to a session should not require killing it, and adopt exists
+  because Echo's own thread UI cannot be had any other way.
 - **Dispatched sessions only in v1.** `claude agents --json` reports two kinds:
   `background` (daemon-hosted — the fleet) and `interactive` (a `claude` the user
   started in a terminal). Only the first is included. The second is the user's
@@ -227,15 +230,51 @@ Teams stay behind a setting, default off: the variable changes delegation for th
 whole session — any subagent Claude names becomes a teammate — and teams are
 experimental, with no session resumption and a fixed lead.
 
-### Adopt
+### Talking to a session
 
-Turning a fleet session into a real Echo thread requires stopping it first, so it
-is explicit and never automatic:
+Three levels of access, because a running session and a finished one admit
+different things. All three are offered; none is a fallback for a failure of
+another.
+
+| Level | Mechanism | Session keeps running |
+|---|---|---|
+| **Read** | Tail the transcript at `linkScanPath` | Yes |
+| **Attach** | `claude attach <short_id>` in a terminal Echo owns | Yes |
+| **Adopt** | `claude stop`, then ACP `load_session` | No |
+
+**Attach** is the answer to *"can I talk to one of these?"*, and it is the only
+one that is both interactive and non-destructive. There is no `claude send` or
+`claude message`: the CLI's hidden subcommands are exactly `attach`, `logs`,
+`stop`, `respawn`, and `rm`, so `attach` is the sole supported way to put a turn
+into a live session from outside it.
+
+Echo is well placed for it. It is a Zed fork with a first-class terminal
+(`crates/terminal_view`, `TerminalPanel::spawn_task`), and the sidebar already
+renders `ListEntry::Terminal` rows beside threads and subagents
+(`crates/sidebar/src/sidebar.rs:430`). So attaching opens a terminal entry
+**nested under the session's own row**, next to its teammates — the session's
+real interface, in place, without leaving Echo and without stopping anything.
+
+What it is not: Echo's own thread UI. The attached view is Claude Code's TUI, so
+it does not get Echo's transcript rendering, narration, or voice. That is the
+honest trade for talking to a session that is still working, and it is why adopt
+still exists.
+
+**Adopt** turns a session into a real Echo thread, and requires stopping it
+first, so it is explicit and never automatic:
 
 | Session state | Offered |
 |---|---|
 | `done`, `stopped`, `failed` | **Open in Echo** — `claude stop` (no-op if exited), then ACP `load_session` |
-| `working`, `blocked` | Read-only view only. Adopting is offered as **Stop and open**, with the stop named in the button. |
+| `working`, `blocked` | **Attach** for a live conversation. Adopting is offered as **Stop and open**, with the stop named in the button. |
+
+Writing directly into a teammate's mailbox at
+`~/.claude/teams/<team>/inboxes/<agent>.json` would be a second way to reach a
+running session, and is rejected for v1: Claude Code tells the recipient the
+message came from another agent rather than from the user, so it cannot approve
+a permission prompt or carry consent, and a malformed entry is a private-format
+corruption Echo would be causing. `attach` delivers a real user turn; the mailbox
+delivers a nudge.
 
 `--fork-session` would allow adopting a live session by branching a copy, at the
 cost of two divergent transcripts for one piece of work. Not in v1.
@@ -363,6 +402,7 @@ than faked.
 | `state.json` schema changed by a CLI upgrade | Per-field tolerance: an unparsable field is `None`, an unknown state is `Unknown`. A session missing `state.json` still renders from `roster.json`. |
 | `jobs/<id>` left after `claude rm` | Rows come from `roster.json` ∪ `jobs/`; an entry in neither the roster nor with a terminal state older than the retention sweep is dropped. |
 | Session stopped outside Echo | Next poll reconciles. No cached authority. |
+| Attach to a session whose process already exited | `claude attach` fails; the terminal shows its error. Offer **Open in Echo** instead, which works on an exited session. |
 | Adopt races the daemon | `load_session` is the source of truth: if it returns the bg-guard error, the session did not stop; report it and stay read-only. |
 | Transcript is megabytes | Same bounded-window tail as `subagent_notifications.rs`. |
 | Workflow tool call arrives without a `toolResponse` | The run is unlocatable; render the tool call as it renders today and do not fabricate a run. |
@@ -419,20 +459,21 @@ order, or in parallel.
 3. Sidebar fleet section, read-only: rows, grouping, blocked-first ordering.
 4. Read-only transcript view, reusing the existing tail.
 5. Dispatch, stop, respawn.
-6. Adopt.
-7. Teams: the env var at dispatch, `config.json` members as nested rows,
+6. Attach: a terminal entry running `claude attach`, nested under the session.
+7. Adopt.
+8. Teams: the env var at dispatch, `config.json` members as nested rows,
    teammate transcripts.
-8. Task graph under a session.
-9. `workflow.rs`: script parsing, journal/transcript join, phase attribution.
-   Fixtures only, no UI.
-10. Detect the `Workflow` tool call, capture script and `toolResponse`, persist
+9. Task graph under a session.
+10. `workflow.rs`: script parsing, journal/transcript join, phase attribution.
+    Fixtures only, no UI.
+11. Detect the `Workflow` tool call, capture script and `toolResponse`, persist
     with the thread.
-11. Run card in the thread, replacing the bare tool-call row.
-12. Run view: phases, agents, per-agent transcript.
-13. **Run as workflow** toggle on the message editor.
+12. Run card in the thread, replacing the bare tool-call row.
+13. Run view: phases, agents, per-agent transcript.
+14. **Run as workflow** toggle on the message editor.
 
 Steps 1–4 are a complete, useful, read-only fleet view and ship alone. Steps
-9–12 are a complete workflow viewer and ship alone.
+10–13 are a complete workflow viewer and ship alone.
 
 ## Not in v1
 
