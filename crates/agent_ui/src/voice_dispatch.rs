@@ -122,6 +122,7 @@ mod tests {
 }
 
 use crate::agent_panel::AgentPanel;
+use acp_thread::AcpThread;
 use gpui::{
     Action as _, AnyWindowHandle, App, AppContext as _, Context, Entity, SharedString,
     Subscription, Window,
@@ -147,6 +148,12 @@ pub struct VoiceSession {
     /// Voice arrives outside any window's event loop, but sending and
     /// authorizing both need one, so the panel's own window is kept here.
     window: AnyWindowHandle,
+    /// Question and answer pairs from this window, so a follow-up like "and
+    /// the tests?" means something.
+    exchanges: Vec<(String, String)>,
+    /// The session that answers questions, made on the first one that needs
+    /// it and kept warm after.
+    sidecar: Option<Sidecar>,
     _subscription: Subscription,
 }
 
@@ -219,6 +226,8 @@ impl AgentPanel {
                     listener,
                     awaiting_confirmation: None,
                     window,
+                    exchanges: Vec::new(),
+                    sidecar: None,
                     _subscription: subscription,
                 });
             })
@@ -238,7 +247,15 @@ impl AgentPanel {
             // voice from what the microphone hears, so narration can keep
             // going underneath somebody who is talking.
             ListenEvent::Woke | ListenEvent::Speaking => self.duck_all_narration(cx),
-            ListenEvent::Abandoned | ListenEvent::WindowClosed => self.unduck_all_narration(cx),
+            ListenEvent::Abandoned => self.unduck_all_narration(cx),
+            // A closed window starts clean: the next conversation should not
+            // inherit half of the last one.
+            ListenEvent::WindowClosed => {
+                self.unduck_all_narration(cx);
+                if let Some(voice) = self.voice.as_mut() {
+                    voice.exchanges.clear();
+                }
+            }
             ListenEvent::Failed(message) => {
                 log::error!("listen: {message}");
                 self.say_to_the_user("I didn't catch that.", cx);
@@ -282,14 +299,7 @@ impl AgentPanel {
         };
 
         match command {
-            VoiceCommand::Say(text) => {
-                self.unduck_all_narration(cx);
-                self.with_window(cx, move |window, cx| {
-                    thread_view.update(cx, |thread_view, cx| {
-                        thread_view.send_voice_text(text, window, cx);
-                    });
-                });
-            }
+            VoiceCommand::Say(text) => self.route_utterance(text, thread_view, cx),
             VoiceCommand::Approve => self.begin_approval(&target.session_id, cx),
             VoiceCommand::Deny => {
                 // Never confirmed. Denial is the safe direction, and a
@@ -704,5 +714,324 @@ mod route_tests {
         assert!(prompt.contains("Q: earlier"));
         assert!(prompt.contains("A: an answer"));
         assert!(prompt.contains("They said: what is it doing"));
+    }
+}
+
+/// A second agent session, so a question does not cost the session doing the
+/// work.
+///
+/// The whole point is isolation: it never enters the thread list, its answers
+/// are spoken and dropped, and the working session never sees that it exists.
+pub struct Sidecar {
+    thread: Entity<AcpThread>,
+    /// Set once the opening instructions have been delivered, so they are not
+    /// repeated on every question.
+    briefed: bool,
+}
+
+/// What the sidecar is told before its first question.
+///
+/// Read-only is asked for, not enforced — enforcing it would need a permission
+/// policy this does not build. The mitigations are that it holds no working
+/// context to damage and that its tool calls still surface for approval.
+pub fn sidecar_briefing(transcript: Option<&std::path::Path>) -> String {
+    let transcript = match transcript {
+        Some(path) => format!(
+            "\n\nThe session you are answering about writes its transcript to {}. \
+             Read it when the question is about what was already said or decided.",
+            path.display()
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        "You answer questions about work another agent session is doing in this \
+         project, for somebody listening rather than reading. That session is \
+         mid-task; you are not it.\n\n\
+         Rules:\n\
+         - Do not edit, create, or delete anything. Read only.\n\
+         - Answer in one or two spoken sentences. Your reply is read aloud.\n\
+         - Look before answering. If you did not check, say you did not.\n\
+         - No markdown, no code blocks, no paths read out in full — say \"the \
+         listener\" rather than \"crates/listen/src/listener.rs\".{transcript}"
+    )
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_briefing_says_it_is_not_the_session_doing_the_work() {
+        let briefing = sidecar_briefing(None);
+        assert!(briefing.contains("you are not it"));
+        assert!(briefing.contains("Read only"));
+    }
+
+    /// Without the path the sidecar cannot answer "what did it decide
+    /// earlier?", which is half of what it exists for.
+    #[test]
+    fn the_briefing_carries_the_transcript_path_when_there_is_one() {
+        let briefing = sidecar_briefing(Some(Path::new("/tmp/session.jsonl")));
+        assert!(briefing.contains("/tmp/session.jsonl"));
+    }
+
+    #[test]
+    fn a_missing_transcript_leaves_the_briefing_otherwise_intact() {
+        let briefing = sidecar_briefing(None);
+        assert!(!briefing.contains("transcript to"));
+        assert!(briefing.contains("Read only"));
+    }
+}
+
+impl AgentPanel {
+    /// Decides where something spoken should go, and sends it there.
+    ///
+    /// Only reached for utterances the intent table did not claim, so the
+    /// commands said most often never wait on this.
+    fn route_utterance(
+        &mut self,
+        utterance: String,
+        thread_view: Entity<crate::conversation_view::ThreadView>,
+        cx: &mut Context<Self>,
+    ) {
+        let model = thread_view.update(cx, |thread_view, cx| {
+            thread_view.require_read_aloud_summary_model(cx)
+        });
+        let Some(model) = model else {
+            // No model to route with, so the utterance goes where an
+            // unrouted one has always gone.
+            self.send_to_agent(utterance, thread_view, cx);
+            return;
+        };
+
+        let state = self.voice_state_block(cx);
+        let exchanges = self
+            .voice
+            .as_ref()
+            .map(|voice| voice.exchanges.clone())
+            .unwrap_or_default();
+        let prompt = router_prompt(&utterance, &state, &exchanges);
+
+        cx.spawn(async move |this, cx| {
+            let reply = cx.update(|cx| model.complete(prompt, cx)).await;
+            let route = reply.ok().as_deref().and_then(parse_route);
+
+            this.update(cx, |panel, cx| {
+                panel.unduck_all_narration(cx);
+                match route {
+                    Some(Route::Answer(answer)) => {
+                        panel.remember_exchange(utterance, answer.clone());
+                        panel.say_to_the_user(answer, cx);
+                    }
+                    Some(Route::Sidecar(question)) => {
+                        panel.ask_sidecar(utterance, question, thread_view, cx);
+                    }
+                    Some(Route::Agent(instruction)) => {
+                        panel.send_to_agent(instruction, thread_view, cx);
+                    }
+                    // A router that failed or answered unparsably sends the
+                    // utterance where an unrouted one has always gone. Saying
+                    // nothing would be indistinguishable from not hearing it.
+                    None => panel.send_to_agent(utterance, thread_view, cx),
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn send_to_agent(
+        &mut self,
+        text: String,
+        thread_view: Entity<crate::conversation_view::ThreadView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.unduck_all_narration(cx);
+        self.with_window(cx, move |window, cx| {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.send_voice_text(text, window, cx);
+            });
+        });
+    }
+
+    fn remember_exchange(&mut self, question: String, answer: String) {
+        let Some(voice) = self.voice.as_mut() else {
+            return;
+        };
+        voice.exchanges.push((question, answer));
+        // Bounded by the window's own length in practice; this is the backstop
+        // for somebody who talks continuously for fifteen seconds.
+        if voice.exchanges.len() > MAX_REMEMBERED_EXCHANGES {
+            voice.exchanges.remove(0);
+        }
+    }
+
+    fn voice_state_block(&self, cx: &App) -> String {
+        let mut lines = Vec::new();
+        for view in self.conversation_views() {
+            for thread_view in view.read(cx).thread_views() {
+                let thread_view = thread_view.read(cx);
+                let candidate = thread_view.voice_candidate(false, cx);
+                let status = if candidate.blocked_on_approval {
+                    "waiting for approval"
+                } else {
+                    "running"
+                };
+                let doing = thread_view
+                    .pending_tool_call_description(cx)
+                    .unwrap_or_else(|| "no tool call in flight".to_string());
+                lines.push(format!("- a thread is {status}: {doing}"));
+            }
+        }
+        if lines.is_empty() {
+            return "Nothing is running.".to_string();
+        }
+        lines.join("\n")
+    }
+}
+
+/// How many question-and-answer pairs the router is reminded of.
+///
+/// Enough for "and the tests?" to make sense, few enough that the fast path
+/// stays fast.
+const MAX_REMEMBERED_EXCHANGES: usize = 4;
+
+impl AgentPanel {
+    /// Asks the question somewhere that is not the session doing the work.
+    fn ask_sidecar(
+        &mut self,
+        utterance: String,
+        question: String,
+        thread_view: Entity<crate::conversation_view::ThreadView>,
+        cx: &mut Context<Self>,
+    ) {
+        if !ListenSettings::get_global(cx).sidecar {
+            self.send_to_agent(utterance, thread_view, cx);
+            return;
+        }
+
+        // Said before the wait rather than after it, so several seconds of
+        // silence reads as "it is looking" instead of "it did not hear me".
+        self.say_to_the_user("Let me check.", cx);
+
+        let transcript = thread_view
+            .read(cx)
+            .voice_candidate(false, cx)
+            .session_id
+            .clone();
+        let briefing = self.voice.as_ref().is_some_and(|voice| {
+            voice
+                .sidecar
+                .as_ref()
+                .is_some_and(|sidecar| sidecar.briefed)
+        });
+        let opening = if briefing {
+            question.clone()
+        } else {
+            format!(
+                "{}\n\n{question}",
+                sidecar_briefing(
+                    crate::subagent_notifications::transcript_path(&transcript).as_deref()
+                )
+            )
+        };
+
+        let Some(thread) = self.ensure_sidecar(cx) else {
+            log::error!("listen: no sidecar session, so the question goes to the agent");
+            self.send_to_agent(utterance, thread_view, cx);
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let answered = thread
+                .update(cx, |thread, cx| {
+                    thread.send(
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(opening))],
+                        cx,
+                    )
+                })
+                .await
+                .is_ok();
+
+            this.update(cx, |panel, cx| {
+                if let Some(voice) = panel.voice.as_mut()
+                    && let Some(sidecar) = voice.sidecar.as_mut()
+                {
+                    sidecar.briefed = true;
+                }
+                if !answered {
+                    panel.say_to_the_user("I couldn't check that.", cx);
+                    return;
+                }
+                let Some(answer) = panel.last_sidecar_answer(cx) else {
+                    panel.say_to_the_user("I couldn't check that.", cx);
+                    return;
+                };
+                panel.remember_exchange(utterance, answer.clone());
+                panel.say_to_the_user(answer, cx);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// The sidecar's session, made once and reused.
+    fn ensure_sidecar(&mut self, cx: &mut Context<Self>) -> Option<Entity<AcpThread>> {
+        if let Some(voice) = self.voice.as_ref()
+            && let Some(sidecar) = voice.sidecar.as_ref()
+        {
+            return Some(sidecar.thread.clone());
+        }
+        // Creating one needs a connection and a turn of the executor, so the
+        // first question is answered by the agent while it warms up. Every
+        // question after this one has a session waiting.
+        self.spawn_sidecar(cx);
+        None
+    }
+
+    fn spawn_sidecar(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.active_conversation_view().cloned() else {
+            return;
+        };
+        let Some(connection) = view.read(cx).connection() else {
+            return;
+        };
+        let project = self.project.clone();
+
+        cx.spawn(async move |this, cx| {
+            let created = cx
+                .update(|cx| {
+                    connection.new_session(project, util::path_list::PathList::default(), cx)
+                })
+                .await;
+            let Ok(thread) = created else {
+                log::error!("listen: could not start a sidecar session");
+                return;
+            };
+            this.update(cx, |panel, _| {
+                if let Some(voice) = panel.voice.as_mut() {
+                    voice.sidecar = Some(Sidecar {
+                        thread,
+                        briefed: false,
+                    });
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// The sidecar's most recent assistant message, which is its answer.
+    fn last_sidecar_answer(&self, cx: &App) -> Option<String> {
+        let thread = self.voice.as_ref()?.sidecar.as_ref()?.thread.read(cx);
+        thread.entries().iter().rev().find_map(|entry| {
+            let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry else {
+                return None;
+            };
+            let text = message.to_markdown(cx);
+            (!text.trim().is_empty()).then(|| text.trim().to_string())
+        })
     }
 }

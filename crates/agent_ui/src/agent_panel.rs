@@ -1155,7 +1155,7 @@ pub struct AgentPanel {
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
     user_store: Entity<UserStore>,
-    project: Entity<Project>,
+    pub(crate) project: Entity<Project>,
     fs: Arc<dyn Fs>,
     language_registry: Arc<LanguageRegistry>,
     thread_store: Entity<ThreadStore>,

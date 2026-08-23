@@ -2463,7 +2463,7 @@ impl ThreadView {
     /// speculation runs on every streamed chunk and asks the same question
     /// long before anything is said, so toasting from there could fire while
     /// providers are still authenticating.
-    fn require_read_aloud_summary_model(
+    pub(crate) fn require_read_aloud_summary_model(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<Rc<dyn read_aloud::SummaryModel>> {

@@ -1007,6 +1007,14 @@ impl ConversationView {
 
     /// Every live thread view, parents and subagents alike.
     ///
+    /// The connection new sessions are made from, when there is one.
+    pub fn connection(&self) -> Option<Rc<dyn AgentConnection>> {
+        match &self.server_state {
+            ServerState::Connected(connected) => Some(connected.connection.clone()),
+            _ => None,
+        }
+    }
+
     /// Voice routing needs all of them: the thread a spoken reply is
     /// addressed to is often not the one on screen.
     pub fn thread_views(&self) -> Vec<Entity<ThreadView>> {
