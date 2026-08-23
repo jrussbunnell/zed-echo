@@ -182,6 +182,10 @@ impl AgentPanel {
         };
         let http_client = workspace.read(cx).client().http_client();
         let window = window.window_handle();
+        // Pulled here, on the main thread, because the wake listener runs on a
+        // thread with no context to reach the global from — and it has to be
+        // *this* canceller, the one the output mixer already feeds.
+        let echo_canceller = audio::Audio::echo_canceller(cx);
 
         cx.spawn(async move |this, cx| {
             let api_key = cx.update(|cx| read_aloud::resolve_api_key(cx)).await;
@@ -194,7 +198,7 @@ impl AgentPanel {
             };
 
             this.update(cx, |panel, cx| {
-                let Some(wake) = build_wake_source(&settings) else {
+                let Some(wake) = build_wake_source(&settings, echo_canceller) else {
                     return;
                 };
                 let stt: Arc<dyn listen::SttProvider> =
@@ -483,8 +487,11 @@ impl AgentPanel {
 }
 
 #[cfg(target_os = "macos")]
-fn build_wake_source(settings: &ListenSettings) -> Option<Arc<dyn listen::WakeSource>> {
-    match listen::SpeechWake::new(settings.wake_word.clone()) {
+fn build_wake_source(
+    settings: &ListenSettings,
+    echo_canceller: audio::EchoCanceller,
+) -> Option<Arc<dyn listen::WakeSource>> {
+    match listen::SpeechWake::new(settings.wake_word.clone(), echo_canceller) {
         Ok(wake) => Some(Arc::new(wake)),
         Err(error) => {
             log::error!("listen: could not start the wake listener: {error}");
@@ -494,7 +501,10 @@ fn build_wake_source(settings: &ListenSettings) -> Option<Arc<dyn listen::WakeSo
 }
 
 #[cfg(not(target_os = "macos"))]
-fn build_wake_source(_settings: &ListenSettings) -> Option<Arc<dyn listen::WakeSource>> {
+fn build_wake_source(
+    _settings: &ListenSettings,
+    _echo_canceller: audio::EchoCanceller,
+) -> Option<Arc<dyn listen::WakeSource>> {
     log::warn!("listen: a wake listener is only implemented on macOS; listening is off");
     None
 }

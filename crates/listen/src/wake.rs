@@ -57,6 +57,34 @@ pub fn contains_wake_word(transcript: &str, wake_word: &str) -> bool {
         .any(|word| word == wake_word)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod chain_tests {
+    use super::macos::{cancelled_input, for_recognizer};
+    use rodio::Source as _;
+
+    fn silence() -> rodio::source::SineWave {
+        rodio::source::SineWave::new(440.0)
+    }
+
+    /// The canceller must see the APM's own format. Downmixing first is not an
+    /// error — it is cancellation that quietly does nothing, which no amount of
+    /// listening to the result would reveal.
+    #[test]
+    fn cancellation_happens_in_the_processing_module_s_format() {
+        let cancelled = cancelled_input(silence(), audio::EchoCanceller::default());
+        assert_eq!(cancelled.channels(), audio::CHANNEL_COUNT);
+        assert_eq!(cancelled.sample_rate(), audio::SAMPLE_RATE);
+    }
+
+    /// And the recognizer must see its own, downstream of that.
+    #[test]
+    fn the_recognizer_is_handed_mono_at_its_own_rate() {
+        let chain = for_recognizer(cancelled_input(silence(), audio::EchoCanceller::default()));
+        assert_eq!(chain.channels(), rodio::nz!(1));
+        assert_eq!(chain.sample_rate(), super::macos::SAMPLE_RATE_HZ);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +146,7 @@ mod macos {
 
     /// What the recognizer is fed and what the command provider is handed.
     /// Inworld's transcribe endpoint is told the same number.
-    const SAMPLE_RATE_HZ: std::num::NonZeroU32 = rodio::nz!(16_000);
+    pub(super) const SAMPLE_RATE_HZ: std::num::NonZeroU32 = rodio::nz!(16_000);
     const SAMPLE_RATE: u32 = SAMPLE_RATE_HZ.get();
 
     /// Samples per buffer handed to the recognizer. About 64ms, which keeps
@@ -137,6 +165,7 @@ mod macos {
 
     pub struct SpeechWake {
         wake_word: Arc<Mutex<String>>,
+        echo_canceller: audio::EchoCanceller,
         signals: WakeSenders,
         frames: FrameSenders,
         stop: Arc<AtomicBool>,
@@ -145,9 +174,14 @@ mod macos {
     impl SpeechWake {
         /// Starts listening. The microphone opens immediately, but nothing
         /// leaves the machine until the wake word is heard.
-        pub fn new(wake_word: String) -> Result<Self> {
+        ///
+        /// `echo_canceller` must be the one the output mixer is already
+        /// feeding as its reference; a fresh one has nothing to cancel
+        /// against.
+        pub fn new(wake_word: String, echo_canceller: audio::EchoCanceller) -> Result<Self> {
             let this = Self {
                 wake_word: Arc::new(Mutex::new(wake_word)),
+                echo_canceller,
                 signals: Arc::default(),
                 frames: Arc::default(),
                 stop: Arc::new(AtomicBool::new(false)),
@@ -171,11 +205,14 @@ mod macos {
             let signals = self.signals.clone();
             let frames = self.frames.clone();
             let stop = self.stop.clone();
+            let echo_canceller = self.echo_canceller.clone();
 
             std::thread::Builder::new()
                 .name("listen-wake".into())
                 .spawn(move || {
-                    if let Err(error) = run_listener(wake_word, &signals, &frames, &stop) {
+                    if let Err(error) =
+                        run_listener(wake_word, echo_canceller, &signals, &frames, &stop)
+                    {
                         log::error!("listen: the wake listener stopped: {error}");
                         emit(&signals, WakeSignal::Failed(format!("{error}")));
                     }
@@ -257,6 +294,7 @@ mod macos {
 
     fn run_listener(
         wake_word: Arc<Mutex<String>>,
+        echo_canceller: audio::EchoCanceller,
         signals: &WakeSenders,
         frames: &FrameSenders,
         stop: &AtomicBool,
@@ -272,10 +310,7 @@ mod macos {
         }
 
         let format = build_format()?;
-        let mut microphone = audio::open_input_stream(None)
-            .map_err(|error| anyhow!("opening the microphone: {error}"))?
-            .possibly_disconnected_channels_to_mono()
-            .constant_samplerate(SAMPLE_RATE_HZ);
+        let mut microphone = cancelling_microphone(echo_canceller)?;
 
         // Each iteration is one recognition request, retired before it reaches
         // the framework's duration limit and immediately replaced.
@@ -303,6 +338,54 @@ mod macos {
         }
 
         Ok(())
+    }
+
+    /// The microphone, with the speaker's own sound removed.
+    ///
+    /// Order matters and is not obvious: the APM works in 48 kHz stereo over
+    /// 10 ms buffers, so cancellation has to happen before the downmix to the
+    /// 16 kHz mono the recognizer wants. Downmixing first destroys the
+    /// stereo relationship the canceller matches against, and the result is
+    /// not an error — it is cancellation that silently does nothing.
+    fn cancelling_microphone(echo_canceller: audio::EchoCanceller) -> Result<impl rodio::Source> {
+        let microphone = audio::open_input_stream(None)
+            .map_err(|error| anyhow!("opening the microphone: {error}"))?;
+        Ok(for_recognizer(cancelled_input(microphone, echo_canceller)))
+    }
+
+    /// Echo-cancelled audio, still in the APM's own format.
+    ///
+    /// Split from [`for_recognizer`] so each stage's format is a checkable
+    /// contract rather than a comment. Downmixing before this point destroys
+    /// the stereo relationship the canceller matches against, and the result
+    /// is not an error — it is cancellation that silently does nothing.
+    pub(super) fn cancelled_input<S: rodio::Source>(
+        source: S,
+        mut echo_canceller: audio::EchoCanceller,
+    ) -> impl rodio::Source {
+        use rodio::cpal::Sample as _;
+
+        source
+            .constant_params(audio::CHANNEL_COUNT, audio::SAMPLE_RATE)
+            .process_buffer::<{ audio::BUFFER_SIZE }, _>(move |buffer| {
+                let mut cancelled: [i16; audio::BUFFER_SIZE] =
+                    buffer.map(|sample| sample.to_sample());
+                if echo_canceller.process_stream(&mut cancelled).is_err() {
+                    // A failed frame leaves un-cancelled audio rather than
+                    // silence: the wake word still has to be heard through it.
+                    return;
+                }
+                for (sample, cancelled) in buffer.iter_mut().zip(cancelled) {
+                    *sample = cancelled.to_sample();
+                }
+            })
+    }
+
+    /// What the recognizer and the command provider both want.
+    pub(super) fn for_recognizer<S: rodio::Source>(source: S) -> impl rodio::Source {
+        source
+            .possibly_disconnected_channels_to_mono()
+            .constant_samplerate(SAMPLE_RATE_HZ)
     }
 
     fn build_format() -> Result<Retained<AVAudioFormat>> {

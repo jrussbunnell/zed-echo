@@ -17,7 +17,7 @@ use std::time::Instant;
 use util::ResultExt;
 
 mod echo_canceller;
-use echo_canceller::EchoCanceller;
+pub use echo_canceller::EchoCanceller;
 mod rodio_ext;
 pub use crate::audio_settings::AudioSettings;
 pub use rodio_ext::RodioExt;
@@ -198,6 +198,16 @@ impl Audio {
                 .log_err()?;
             Some(rodio::Player::connect_new(output_mixer))
         })
+    }
+
+    /// The echo canceller the output mixer is already feeding as its reference.
+    ///
+    /// Cancellation needs both halves in one APM: the speaker signal, which
+    /// `open_output_stream` supplies, and the microphone signal, which
+    /// whoever opens an input stream must run through `process_stream`. A
+    /// second APM would have nothing to cancel against.
+    pub fn echo_canceller(cx: &mut App) -> EchoCanceller {
+        cx.update_default_global(|this: &mut Self, _cx| this.echo_canceller.clone())
     }
 
     pub fn end_call(cx: &mut App) {

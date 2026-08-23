@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echo — fleet and workflows · spec review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ─────────────────────────────────────────────────────────────
+   Palette lifted verbatim from assets/themes/one/one.json (One Dark),
+   the theme Echo ships. Nothing here is invented.
+   ───────────────────────────────────────────────────────────── */
+:root{
+  --canvas:#282c33;        /* editor.background */
+  --panel:#2f343e;         /* panel.background */
+  --raised:#3b414d;        /* background / title_bar */
+  --element:#2e343e;       /* element.background */
+  --element-hover:#363c46; /* element.hover */
+  --line:#464b57;          /* border */
+  --line-soft:#363c46;     /* border.variant */
+  --ink:#dce0e5;           /* text */
+  --ink-muted:#a9afbc;     /* text.muted */
+  --accent:#74ade8;        /* text.accent / info */
+  --ok:#a1c181;            /* success */
+  --warn:#dec184;          /* warning */
+  --bad:#d07277;           /* error */
+
+  --sans:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+  --mono:"Lilex","IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+
+  --rail:264px;
+  --radius:4px;
+}
+
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+body{
+  margin:0;background:var(--canvas);color:var(--ink);
+  font:400 15px/1.65 var(--sans);
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+code,kbd{font-family:var(--mono);font-size:.88em}
+
+.skip{position:absolute;left:-9999px;top:0;background:var(--accent);color:var(--canvas);
+  padding:10px 16px;z-index:99;font-weight:600}
+.skip:focus{left:12px;top:12px}
+
+/* ── Rail: mirrors Echo's own sidebar, nested like its subagent rows ── */
+.rail{
+  position:fixed;inset:0 auto 0 0;width:var(--rail);background:var(--panel);
+  border-right:1px solid var(--line-soft);overflow-y:auto;padding:0 0 40px;
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent;
+}
+.rail-head{
+  padding:20px 18px 16px;border-bottom:1px solid var(--line-soft);
+  position:sticky;top:0;background:var(--panel);z-index:2;
+}
+.rail-mark{display:flex;align-items:center;gap:9px;font-weight:600;letter-spacing:-.01em}
+.rail-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent);flex:none}
+.rail-sub{font:500 10.5px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;
+  color:var(--ink-muted);margin-top:9px}
+
+.rail nav{padding:12px 10px 0}
+.rail-group{font:500 10.5px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;
+  color:var(--ink-muted);padding:16px 8px 7px}
+.rail a{
+  display:flex;align-items:baseline;gap:8px;padding:6px 9px;border-radius:var(--radius);
+  color:var(--ink-muted);font-size:13.5px;transition:background .12s,color .12s;
+}
+.rail a:hover{background:var(--element-hover);color:var(--ink);text-decoration:none}
+.rail a.on{background:var(--element-hover);color:var(--ink)}
+.rail a.on::before{content:"";position:absolute;left:0;width:2px;height:18px;
+  background:var(--accent);border-radius:0 2px 2px 0;margin-left:-10px}
+.rail a{position:relative}
+.rail a.nest{padding-left:26px;font-size:13px}
+.rail a.nest::after{content:"";position:absolute;left:15px;top:0;bottom:0;
+  border-left:1px solid var(--line-soft)}
+
+/* ── Main column ── */
+main{margin-left:var(--rail);max-width:1080px;padding:0 56px 140px}
+
+/* ── Hero: the signature. A live miniature of the surface being specced. ── */
+.hero{padding:76px 0 56px;border-bottom:1px solid var(--line-soft)}
+.eyebrow{font:500 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink-muted);display:flex;align-items:center;gap:10px}
+.eyebrow::after{content:"";flex:1;height:1px;background:var(--line-soft);max-width:180px}
+h1{font:600 46px/1.08 var(--sans);letter-spacing:-.028em;margin:20px 0 0}
+h1 em{font-style:normal;color:var(--accent)}
+.thesis{font-size:18.5px;line-height:1.55;color:var(--ink-muted);max-width:60ch;margin:20px 0 0}
+.thesis strong{color:var(--ink);font-weight:500}
+
+.meta-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+
+/* Window miniature */
+.mini{
+  margin-top:40px;border:1px solid var(--line);border-radius:6px;overflow:hidden;
+  background:var(--canvas);box-shadow:0 18px 44px -22px #0009;
+}
+.mini-bar{
+  background:var(--raised);border-bottom:1px solid var(--line);padding:9px 14px;
+  display:flex;align-items:center;gap:8px;
+}
+.tl{width:10px;height:10px;border-radius:50%;background:var(--line)}
+.mini-title{font:500 11.5px/1 var(--mono);color:var(--ink-muted);margin-left:8px}
+.mini-body{display:grid;grid-template-columns:236px 1fr;min-height:280px}
+.mini-side{background:var(--panel);border-right:1px solid var(--line-soft);padding:12px 0}
+.mini-sect{font:500 10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;
+  color:var(--ink-muted);padding:9px 14px 7px}
+.row{display:flex;align-items:center;gap:9px;padding:6px 14px;font-size:12.5px;color:var(--ink)}
+.row.sub{padding-left:32px;font-size:12px;color:var(--ink-muted);position:relative}
+.row.sub::before{content:"";position:absolute;left:21px;top:0;bottom:0;
+  border-left:1px solid var(--line-soft)}
+.row .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .tok{font:400 10.5px/1 var(--mono);color:var(--ink-muted);flex:none;
+  font-variant-numeric:tabular-nums}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+.d-work{background:var(--accent)}
+.d-block{background:var(--warn)}
+.d-done{background:var(--ok)}
+.d-idle{background:var(--line)}
+.pulse{animation:pulse 1.9s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.42;transform:scale(.82)}}
+
+.mini-main{padding:18px 20px;display:flex;flex-direction:column;gap:14px}
+.run-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.run-name{font:600 14px/1 var(--mono);color:var(--ink)}
+.run-sum{font-size:12.5px;color:var(--ink-muted)}
+.phase{border:1px solid var(--line-soft);border-radius:var(--radius);padding:10px 12px;background:var(--panel)}
+.phase-top{display:flex;align-items:center;gap:10px;font-size:12.5px}
+.phase-nm{font-weight:600;letter-spacing:-.005em}
+.phase-meta{font:400 11px/1 var(--mono);color:var(--ink-muted);margin-left:auto}
+.bar{height:3px;background:var(--line-soft);border-radius:2px;margin-top:9px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:2px;width:0}
+.bar.done i{background:var(--ok);width:100%}
+.bar.run i{animation:fill 4.2s cubic-bezier(.4,0,.2,1) infinite}
+@keyframes fill{0%{width:8%}70%{width:62%}100%{width:66%}}
+.agents{margin-top:10px;display:flex;flex-direction:column;gap:5px}
+.ag{display:grid;grid-template-columns:8px minmax(0,1fr) 42px;align-items:center;gap:9px;
+  font:400 11.5px/1.4 var(--mono);color:var(--ink-muted);font-variant-numeric:tabular-nums}
+.ag .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ag span:last-child{text-align:right}
+.unattr{border-style:dashed}
+
+/* ── Run view: the workflow surface, built as a component rather than drawn ── */
+.runview{
+  border:1px solid var(--line-soft);border-radius:var(--radius);background:var(--panel);
+  overflow:hidden;margin:20px 0 14px;
+}
+.rv-head{
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;padding:13px 16px;
+  background:var(--element);border-bottom:1px solid var(--line-soft);
+}
+.rv-name{font:600 13px/1 var(--mono);color:var(--ink);letter-spacing:-.01em}
+.rv-sum{font-size:12.8px;color:var(--ink-muted);flex:1;min-width:170px}
+.rv-tot{font:400 11.5px/1 var(--mono);color:var(--ink-muted);font-variant-numeric:tabular-nums}
+
+.rv-phase{border-bottom:1px solid var(--line-soft)}
+.rv-phase:last-child{border-bottom:0}
+.rv-phase-head{display:flex;align-items:center;gap:11px;padding:12px 16px 10px}
+.rv-tri{color:var(--ink-muted);font-size:8px;width:8px;flex:none;line-height:1}
+.rv-nm{font:600 13.5px/1.2 var(--sans);letter-spacing:-.01em;color:var(--ink);flex:none}
+.rv-meta{font:400 11.5px/1 var(--mono);color:var(--ink-muted);font-variant-numeric:tabular-nums}
+.rv-prog{margin-left:auto;display:flex;align-items:center;gap:11px;flex:none}
+.rv-bar{width:104px;height:4px;border-radius:2px;background:var(--line-soft);overflow:hidden}
+.rv-bar i{display:block;height:100%;border-radius:2px;background:var(--accent)}
+.rv-bar.is-done i{background:var(--ok)}
+.rv-state{font:500 10px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
+  width:46px;text-align:right;color:var(--ink-muted);font-variant-numeric:tabular-nums}
+.rv-state.is-done{color:var(--ok)}
+.rv-state.is-run{color:var(--accent)}
+
+.rv-agents{padding-bottom:9px}
+.rv-agent{
+  display:grid;grid-template-columns:14px minmax(0,1fr) 60px 50px 56px;align-items:center;
+  gap:11px;padding:5px 16px 5px 31px;position:relative;color:var(--ink-muted);
+  transition:background .12s,color .12s;
+}
+.rv-agent::before{content:"";position:absolute;left:22px;top:0;bottom:0;
+  border-left:1px solid var(--line-soft)}
+.rv-agent:hover,.rv-agent.sel{background:var(--element-hover);color:var(--ink)}
+.rv-agent.sel::after{content:"";position:absolute;left:0;top:2px;bottom:2px;width:2px;
+  background:var(--accent);border-radius:0 2px 2px 0}
+.rv-an{font:400 12px/1.4 var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rv-as{font:500 10px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase}
+.rv-as.is-done{color:var(--ok)}
+.rv-as.is-run{color:var(--accent)}
+.rv-num{font:400 11.5px/1 var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+
+.rv-phase.is-unattr{background:color-mix(in srgb,var(--warn) 4%,transparent)}
+.rv-phase.is-unattr .rv-nm{color:var(--ink-muted);font-weight:500}
+.rv-phase.is-unattr .rv-meta{color:var(--warn)}
+
+.rv-foot{
+  padding:10px 16px;border-top:1px solid var(--line-soft);background:var(--element);
+  font:400 11.5px/1.5 var(--mono);color:var(--ink-muted);
+}
+/* Narrow: the agent's name matters more than its status text or duration. */
+@media (max-width:640px){
+  .rv-agent{grid-template-columns:14px minmax(0,1fr) 48px;padding-left:26px;gap:9px}
+  .rv-agent::before{left:18px}
+  .rv-as,.rv-num+.rv-num{display:none}
+  .rv-bar{width:60px}
+  .rv-phase-head{flex-wrap:wrap;row-gap:8px}
+  .rv-prog{margin-left:0;width:100%}
+  .rv-state{margin-left:auto}
+}
+
+/* ── Chips: the structural device. Each encodes what the reader must do. ── */
+.chip{
+  display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:3px;
+  font:500 10.5px/1.5 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+  border:1px solid;white-space:nowrap;
+}
+.chip::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
+.c-verified{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 38%,transparent);
+  background:color-mix(in srgb,var(--ok) 9%,transparent)}
+.c-decided{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 38%,transparent);
+  background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.c-risk{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 38%,transparent);
+  background:color-mix(in srgb,var(--bad) 9%,transparent)}
+.c-open{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);
+  background:color-mix(in srgb,var(--warn) 9%,transparent)}
+.c-later{color:var(--ink-muted);border-color:var(--line);background:var(--element)}
+
+/* ── Sections ── */
+section{padding:58px 0;border-bottom:1px solid var(--line-soft)}
+section:last-of-type{border-bottom:0}
+.sec-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px}
+h2{font:600 27px/1.2 var(--sans);letter-spacing:-.022em;margin:0}
+h3{font:600 17px/1.3 var(--sans);letter-spacing:-.012em;margin:36px 0 10px}
+h4{font:600 13px/1.3 var(--mono);letter-spacing:.02em;margin:26px 0 8px;color:var(--ink)}
+p{margin:0 0 14px;max-width:74ch}
+ul{margin:0 0 14px;padding-left:20px;max-width:74ch}
+li{margin-bottom:7px}
+li::marker{color:var(--ink-muted)}
+strong{font-weight:600}
+.lede{font-size:16.5px;color:var(--ink-muted);max-width:68ch;margin-bottom:24px}
+
+/* ── Tables ── */
+.tw{overflow-x:auto;margin:18px 0 22px;border:1px solid var(--line-soft);border-radius:var(--radius)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th{
+  text-align:left;font:500 10.5px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;
+  color:var(--ink-muted);padding:11px 14px;background:var(--panel);
+  border-bottom:1px solid var(--line-soft);white-space:nowrap;
+}
+td{padding:11px 14px;border-bottom:1px solid var(--line-soft);vertical-align:top;line-height:1.55}
+tr:last-child td{border-bottom:0}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:var(--element-hover)}
+td code{color:var(--ink);background:var(--element);padding:1px 5px;border-radius:3px;
+  border:1px solid var(--line-soft);white-space:nowrap}
+.yes{color:var(--ok);font-weight:600}
+.no{color:var(--bad);font-weight:600}
+.partly{color:var(--warn);font-weight:600}
+
+/* ── Code ── */
+pre{
+  background:var(--panel);border:1px solid var(--line-soft);border-left:2px solid var(--accent);
+  border-radius:var(--radius);padding:15px 17px;overflow-x:auto;margin:16px 0 20px;
+  font:400 12.7px/1.62 var(--mono);color:var(--ink);
+}
+pre .k{color:var(--accent)}
+pre .s{color:var(--ok)}
+pre .c{color:var(--ink-muted);font-style:italic}
+pre .n{color:var(--warn)}
+
+blockquote{
+  margin:16px 0 20px;padding:13px 17px;background:var(--element);
+  border-left:2px solid var(--bad);border-radius:0 var(--radius) var(--radius) 0;
+  color:var(--ink-muted);font-size:13.8px;max-width:74ch;
+}
+blockquote code{color:var(--ink)}
+
+/* ── Call cards: the reviewer's actual job ── */
+.calls{display:grid;grid-template-columns:repeat(auto-fit,minmax(292px,1fr));gap:14px;margin:24px 0 8px}
+.call{
+  background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--radius);
+  padding:16px 17px;border-top:2px solid var(--accent);
+}
+.call h4{margin:0 0 8px;font:600 13.5px/1.35 var(--sans);letter-spacing:-.008em;color:var(--ink)}
+.call p{font-size:13.2px;color:var(--ink-muted);margin:0;max-width:none}
+.call .why{display:block;margin-top:9px;padding-top:9px;border-top:1px solid var(--line-soft);
+  font:400 12.4px/1.55 var(--mono);color:var(--ink-muted)}
+
+/* ── Evidence block ── */
+.ev{background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--radius);
+  padding:18px 20px;margin:18px 0 22px}
+.ev-head{display:flex;align-items:center;gap:11px;margin-bottom:10px;flex-wrap:wrap}
+.ev-head h4{margin:0;font:600 14.5px/1.35 var(--sans);letter-spacing:-.008em}
+.ev p:last-child{margin-bottom:0}
+.ev pre{margin-bottom:0}
+
+/* ── Build order: the only place numbering is honest ── */
+ol.build{list-style:none;counter-reset:s;padding:0;margin:18px 0;max-width:76ch}
+ol.build li{counter-increment:s;position:relative;padding:9px 0 9px 46px;
+  border-bottom:1px solid var(--line-soft);margin:0}
+ol.build li:last-child{border-bottom:0}
+ol.build li::before{
+  content:counter(s,decimal-leading-zero);position:absolute;left:0;top:10px;
+  font:500 11px/1.5 var(--mono);color:var(--ink-muted);
+}
+ol.build li.ship{color:var(--ink)}
+ol.build .mark{display:block;font:500 10.5px/1.6 var(--mono);color:var(--ok);letter-spacing:.06em}
+
+.foot{padding:46px 0 0;color:var(--ink-muted);font-size:13.2px}
+.foot code{color:var(--ink)}
+
+@media (max-width:980px){
+  .rail{position:static;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line-soft)}
+  .rail nav{display:flex;flex-wrap:wrap;gap:2px;padding:10px}
+  .rail-group{display:none}
+  .rail a.nest{padding-left:9px}
+  .rail a.nest::after{display:none}
+  .rail a.on::before{display:none}
+  main{margin-left:0;padding:0 22px 90px}
+  h1{font-size:34px}
+  .mini-body{grid-template-columns:1fr}
+  .mini-side{border-right:0;border-bottom:1px solid var(--line-soft)}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#top">Skip to content</a>
+
+<aside class="rail">
+  <div class="rail-head">
+    <div class="rail-mark"><span class="rail-dot"></span> Echo</div>
+    <div class="rail-sub">Spec review · 2026-08-22</div>
+  </div>
+  <nav id="nav">
+    <div class="rail-group">Review</div>
+    <a href="#top">Thesis</a>
+    <a href="#calls">Calls I made</a>
+    <a href="#evidence">Evidence</a>
+    <div class="rail-group">Design</div>
+    <a href="#architecture">Architecture</a>
+    <a href="#fleet">Part 1 · Fleet</a>
+    <a href="#fleet-data" class="nest">Data planes</a>
+    <a href="#fleet-surface" class="nest">Surface</a>
+    <a href="#fleet-adopt" class="nest">Talking to one</a>
+    <a href="#workflows">Part 2 · Workflows</a>
+    <a href="#wf-lifecycle" class="nest">Lifecycle</a>
+    <a href="#wf-phase" class="nest">Phase attribution</a>
+    <a href="#wf-surface" class="nest">Surface</a>
+    <div class="rail-group">Delivery</div>
+    <a href="#failure">Failure modes</a>
+    <a href="#testing">Testing</a>
+    <a href="#build">Build order</a>
+    <a href="#later">Not in v1</a>
+    <div class="rail-group">Appendix</div>
+    <a href="#preview">Live preview</a>
+  </nav>
+</aside>
+
+<main id="top">
+
+  <header class="hero">
+    <div class="eyebrow">Design spec · fleet and workflows</div>
+    <h1>Many agents at once,<br>in a window instead of <em>a terminal</em>.</h1>
+    <p class="thesis">Claude Code already ships four ways to parallelize work. What it doesn't ship is a GUI — <strong>rows hide after 30 seconds, four idle agents collapse into one line, and a 40-agent run is navigated with arrow keys</strong>. That's a terminal running out of room. Echo has a window.</p>
+
+    <div class="meta-row">
+      <span class="chip c-verified">Probed against 2.1.239</span>
+      <span class="chip c-decided">6 decisions locked</span>
+      <span class="chip c-risk">1 standing risk</span>
+      <span class="chip c-later">7 deferred</span>
+    </div>
+
+    <!-- Signature: the surface being specced, running. -->
+    <div class="mini" role="img" aria-label="Miniature of the proposed Echo interface: a fleet of parallel sessions in the sidebar with nested teammates, and a workflow run view showing phases, agents, and progress.">
+      <div class="mini-bar">
+        <span class="tl"></span><span class="tl"></span><span class="tl"></span>
+        <span class="mini-title">echo — zed · 3 sessions · 1 run</span>
+      </div>
+      <div class="mini-body">
+        <div class="mini-side">
+          <div class="mini-sect">Fleet</div>
+          <div class="row"><span class="dot d-block pulse"></span><span class="nm">auth-refactor</span><span class="tok">88k</span></div>
+          <div class="row sub"><span class="dot d-work pulse"></span><span class="nm">scout</span></div>
+          <div class="row sub"><span class="dot d-done"></span><span class="nm">reviewer</span></div>
+          <div class="row"><span class="dot d-work pulse"></span><span class="nm">migrate-tests</span><span class="tok">204k</span></div>
+          <div class="row sub"><span class="dot d-work pulse"></span><span class="nm">fixtures</span></div>
+          <div class="row"><span class="dot d-done"></span><span class="nm">audit-routes</span><span class="tok">61k</span></div>
+          <div class="mini-sect">Threads</div>
+          <div class="row"><span class="dot d-idle"></span><span class="nm">fleet spec</span></div>
+        </div>
+        <div class="mini-main">
+          <div class="run-head">
+            <span class="run-name">route-audit</span>
+            <span class="run-sum">Audit every handler for missing auth checks</span>
+          </div>
+          <div class="phase">
+            <div class="phase-top"><span class="phase-nm">Discover</span><span class="phase-meta">3 agents · 148k · 2m 14s</span></div>
+            <div class="bar done"><i></i></div>
+          </div>
+          <div class="phase">
+            <div class="phase-top"><span class="phase-nm">Audit</span><span class="phase-meta">12 agents · 610k · running</span></div>
+            <div class="bar run"><i></i></div>
+            <div class="agents">
+              <div class="ag"><span class="dot d-done"></span><span class="nm">routes/session.ts</span><span>41k</span></div>
+              <div class="ag"><span class="dot d-work pulse"></span><span class="nm">routes/billing.ts</span><span>—</span></div>
+              <div class="ag"><span class="dot d-work pulse"></span><span class="nm">routes/admin.ts</span><span>—</span></div>
+            </div>
+          </div>
+          <div class="phase unattr">
+            <div class="phase-top"><span class="phase-nm">Unattributed</span><span class="phase-meta">1 agent · prompt built at runtime</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <section id="calls">
+    <div class="sec-head"><h2>Calls I made</h2><span class="chip c-open">Override any</span></div>
+    <p class="lede">These are judgment calls, not findings. Each one narrows the build; say the word and any of them flips.</p>
+
+    <div class="calls">
+      <div class="call">
+        <h4>The fleet is dispatched sessions only</h4>
+        <p><code>claude agents --json</code> also lists the nine terminal sessions you have open right now. Those aren't Echo's fleet and Echo can't drive them.</p>
+        <span class="why">Bounds the list, not the parallelism. Also keeps the refresh loop to pure disk reads.</span>
+      </div>
+      <div class="call">
+        <h4>Talk to a live session by attaching, not adopting</h4>
+        <p><code>claude attach</code> runs in a terminal Echo owns, nested under the session's row — interactive, and nothing stops. Adopt is for when you want Echo's own thread UI, and it costs a stop.</p>
+        <span class="why">No <code>claude send</code> exists. Attach is the only supported live turn.</span>
+      </div>
+      <div class="call">
+        <h4>Agent teams stay behind a default-off setting</h4>
+        <p>The env var changes delegation for the whole session — any subagent Claude names becomes a teammate. Teams are experimental, with no resumption and a fixed lead.</p>
+        <span class="why">Turn it on per dispatch, not per install.</span>
+      </div>
+      <div class="call">
+        <h4>Phase attribution is a substring match</h4>
+        <p>The runtime never writes down which agent belongs to which phase. Echo finds the agent's prompt inside the script and takes the nearest preceding phase marker.</p>
+        <span class="why">Fails toward <strong>Unattributed</strong>, never toward a wrong phase.</span>
+      </div>
+      <div class="call">
+        <h4>Workflows are observe-only in v1</h4>
+        <p>Pause, resume, and restart-agent are keystrokes in the CLI's own view with no protocol equivalent. Stop works through the parent thread's cancel.</p>
+        <span class="why">Deferred rather than faked.</span>
+      </div>
+      <div class="call">
+        <h4>New <code>fleet</code> crate, existing crates for UI</h4>
+        <p>Same shape as <code>listen</code>: the crate is pure and testable, the wiring lives where the UI already is.</p>
+        <span class="why"><code>sidebar.rs</code> is 8,591 lines. It gets rows, not readers.</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <div class="sec-head"><h2>Evidence</h2><span class="chip c-verified">Probed, not assumed</span></div>
+    <p class="lede">Four questions were open before the spec. All four were answered by running them against Claude Code 2.1.239 on 22–23 August. Three changed the plan.</p>
+
+    <div class="ev">
+      <div class="ev-head">
+        <h4>A dispatched session can't be attached over ACP while it runs</h4>
+        <span class="chip c-verified">Verified</span>
+      </div>
+      <p><code>session/load</code> against a live one is refused outright:</p>
+      <blockquote>Session 91214c57… is currently running as a background agent (bg). Use <code>claude agents</code> to find and attach to it, or add <code>--fork-session</code> to branch off a copy.</blockquote>
+      <p>After <code>claude stop &lt;id&gt;</code> the same call succeeds and replays the whole transcript as ordinary <code>user_message_chunk</code> / <code>agent_message_chunk</code> updates. <strong>The daemon owns a session while it runs; Echo adopts it once it doesn't.</strong></p>
+    </div>
+
+    <div class="ev">
+      <div class="ev-head">
+        <h4>Agent teams work in a dispatched session — and only there</h4>
+        <span class="chip c-verified">Verified</span>
+      </div>
+      <p>They don't work over ACP. The adapter is built on <code>@anthropic-ai/claude-agent-sdk</code>, and Claude Code doesn't spawn teammates for Agent SDK sessions — a named subagent silently degrades to an ordinary subagent. Dispatching through the daemon with the experimental flag spawned a real one:</p>
+<pre>{ <span class="s">"agentId"</span>: <span class="s">"scout@session-3b6b4eb4"</span>, <span class="s">"name"</span>: <span class="s">"scout"</span>, <span class="s">"color"</span>: <span class="s">"blue"</span>,
+  <span class="s">"agentType"</span>: <span class="s">"general-purpose"</span>, <span class="s">"model"</span>: <span class="s">"opus[1m]"</span>,
+  <span class="s">"backendType"</span>: <span class="s">"in-process"</span> }</pre>
+      <p>Its transcript landed at <code>&lt;project&gt;/&lt;session&gt;/subagents/agent-&lt;id&gt;.jsonl</code> — the same directory and format Echo's subagent code already reads. <strong>Routing through the daemon is what unlocks teams; nothing else does.</strong></p>
+    </div>
+
+    <div class="ev">
+      <div class="ev-head">
+        <h4>A workflow announces itself on the wire</h4>
+        <span class="chip c-verified">Verified</span>
+        <span class="chip c-decided">Changed the plan</span>
+      </div>
+      <p>The launch arrives as a <code>tool_call</code> carrying <code>_meta.claudeCode.toolName: "Workflow"</code>, then a <code>tool_call_update</code> whose <code>rawInput.script</code> is <strong>the entire script source</strong> — <code>meta.phases</code> and every <code>agent(…, { label, phase })</code> call site included. The response carries the rest:</p>
+<pre>{ <span class="s">"status"</span>: <span class="s">"async_launched"</span>, <span class="s">"taskType"</span>: <span class="s">"local_workflow"</span>,
+  <span class="s">"workflowName"</span>: <span class="s">"echo-alpha-beta"</span>, <span class="s">"runId"</span>: <span class="s">"wf_11e12c55-af7"</span>,
+  <span class="s">"transcriptDir"</span>: <span class="s">"…/subagents/workflows/wf_11e12c55-af7"</span>,
+  <span class="s">"scriptPath"</span>:   <span class="s">"…/workflows/scripts/echo-alpha-beta-wf_11e12c55-af7.js"</span> }</pre>
+      <p>No globbing, no guessing. Echo is handed the run id, the run directory, the script path, and the declared phases at launch.</p>
+    </div>
+
+    <div class="ev">
+      <div class="ev-head">
+        <h4>The workflow journal is a resume cache, not a progress feed</h4>
+        <span class="chip c-risk">Constrains the design</span>
+      </div>
+      <p><code>journal.jsonl</code> holds only <code>started</code> / <code>result</code> records keyed by an opaque hash and an <code>agentId</code>. The sidecar is no help either:</p>
+<pre>agent-a4ba69c604ed54dc1.meta.json
+  { <span class="s">"agentType"</span>: <span class="s">"workflow-subagent"</span>, <span class="s">"spawnDepth"</span>: <span class="n">1</span> }   <span class="c">// no label, no phase</span></pre>
+      <p>Verified identical on 2.1.239 and on an older run. Phase titles, labels, token totals, and elapsed time live in the CLI process's memory — which is why workflow resume only works inside one session. <strong>Everything per-agent is on disk; the phase each agent belongs to is not.</strong></p>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="sec-head"><h2>Architecture</h2><span class="chip c-decided">Decided</span></div>
+    <p>New crate <code>crates/fleet/</code>, <code>[lib] path = "src/fleet.rs"</code>. Every format the crate reads is a private Claude Code implementation detail, so the parsers are split out: they're the part most likely to break on a CLI upgrade and the part that must be exercised by fixtures.</p>
+    <div class="tw"><table>
+      <thead><tr><th>File</th><th>Holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>src/fleet.rs</code></td><td>The <code>Fleet</code> entity, refresh loop, dispatch / stop / respawn / adopt, shared types</td></tr>
+        <tr><td><code>src/claude_home.rs</code></td><td>Pure parsers over <code>~/.claude</code>. Path in, value out. No process spawning, no GPUI.</td></tr>
+        <tr><td><code>src/workflow.rs</code></td><td>The <code>WorkflowRun</code> model, script parsing, journal-to-transcript join, phase attribution</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Echo writes no scheduler, no process manager, and no worktree logic.</strong> A per-user supervisor daemon already hosts the processes, restarts them on wake, upgrades them across versions, and puts each one in its own git worktree.</p>
+  </section>
+
+  <section id="fleet">
+    <div class="sec-head"><h2>Part 1 · Fleet</h2></div>
+    <p class="lede">Many real, parallel Claude Code sessions — each with its own process, git worktree, context, and transcript. The surface answers one question: <em>which of these needs me?</em></p>
+
+    <h3 id="fleet-data">Data planes</h3>
+    <p>“Background” names only the absence of an attached terminal. A fleet session is a complete Claude session, not a subagent and not a reduced one.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Plane</th><th>Source</th><th>Documented</th></tr></thead>
+      <tbody>
+        <tr><td>Roster</td><td><code>~/.claude/daemon/roster.json</code> — workers keyed by short id</td><td class="no">No</td></tr>
+        <tr><td>Detail</td><td><code>jobs/&lt;id&gt;/state.json</code> — <code>state</code>, <code>detail</code>, <code>tokens</code>, <code>intent</code>, <code>linkScanPath</code></td><td class="no">No</td></tr>
+        <tr><td>Activity</td><td><code>jobs/&lt;id&gt;/timeline.jsonl</code> — one record per state transition</td><td class="no">No</td></tr>
+        <tr><td>Transcript</td><td><code>linkScanPath</code> → <code>projects/&lt;cwd&gt;/&lt;session&gt;.jsonl</code></td><td class="no">No</td></tr>
+        <tr><td>Team</td><td><code>teams/session-&lt;8 chars&gt;/config.json</code> — <code>members[]</code></td><td class="yes">Yes</td></tr>
+        <tr><td>Teammate</td><td><code>subagents/agent-&lt;id&gt;.jsonl</code> + <code>.meta.json</code></td><td class="no">No</td></tr>
+        <tr><td>Tasks</td><td><code>tasks/&lt;session uuid&gt;/&lt;n&gt;.json</code> — <code>blocks</code>, <code>blockedBy</code></td><td class="partly">Partly</td></tr>
+      </tbody>
+    </table></div>
+    <p><code>state.json</code> is the richest and the least supported. It carries a written summary of what a session did — <code>detail: "scout spawned and idle; instruction delivered"</code> — that nothing else exposes. The tasks directory is keyed by session uuid, not by team name as the docs claim.</p>
+
+    <h4>Types</h4>
+<pre><span class="k">pub struct</span> FleetSession {
+    <span class="k">pub</span> short_id: String,           <span class="c">// "91214c57" — daemon id, also the jobs dir</span>
+    <span class="k">pub</span> session_id: acp::SessionId, <span class="c">// full uuid; the ACP session id on adopt</span>
+    <span class="k">pub</span> name: SharedString,
+    <span class="k">pub</span> state: FleetState,
+    <span class="k">pub</span> detail: Option&lt;SharedString&gt;, <span class="c">// the CLI's own written summary</span>
+    <span class="k">pub</span> team: Option&lt;Team&gt;,
+    <span class="k">pub</span> tasks: Vec&lt;Task&gt;,
+}
+
+<span class="k">pub enum</span> FleetState { Working, Blocked, Done, Failed, Stopped, <span class="n">Unknown</span>(String) }</pre>
+    <p><code>Unknown(String)</code> is load-bearing. These formats are private and will gain states; an unrecognized value renders as itself and never panics.</p>
+
+    <h3 id="fleet-surface">Surface</h3>
+    <ul>
+      <li>One row per session: name, state, the CLI's own <code>detail</code> as subtitle, token count.</li>
+      <li>Grouped by working directory, matching the sidebar's existing project headers.</li>
+      <li>Teammates nest underneath, reusing the subagent row rendering that already exists — their <code>.meta.json</code> already carries name, type, model, and colour.</li>
+      <li><strong>Blocked sessions sort to the top.</strong> That is the whole point of the surface.</li>
+    </ul>
+    <p>Refresh is a 2-second poll of a directory of small JSON files while the section is expanded. Not a filesystem watch — <code>state.json</code> is rewritten on every transition and the debounce would cost more than the read.</p>
+
+    <h3 id="fleet-adopt">Talking to one</h3>
+    <p>A running session and a finished one admit different things, so there are three levels. All three are offered; none is a fallback for another failing.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Level</th><th>Mechanism</th><th>Keeps running</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read</strong></td><td>Tail the transcript at <code>linkScanPath</code></td><td class="yes">Yes</td></tr>
+        <tr><td><strong>Attach</strong></td><td><code>claude attach &lt;id&gt;</code> in a terminal Echo owns</td><td class="yes">Yes</td></tr>
+        <tr><td><strong>Adopt</strong></td><td><code>claude stop</code>, then ACP <code>load_session</code></td><td class="no">No</td></tr>
+      </tbody>
+    </table></div>
+
+    <h4>Attach</h4>
+    <p>The answer to <em>“can I talk to one of these?”</em>, and the only level that is both interactive and non-destructive. There is no <code>claude send</code> or <code>claude message</code> — the CLI's hidden subcommands are exactly <code>attach</code>, <code>logs</code>, <code>stop</code>, <code>respawn</code>, and <code>rm</code>, so <strong>attach is the sole supported way to put a turn into a live session from outside it</strong>.</p>
+    <p>Echo is well placed for it: a Zed fork with a first-class terminal, whose sidebar already renders <code>ListEntry::Terminal</code> rows beside threads and subagents. Attaching opens a terminal entry <strong>nested under the session's own row</strong>, next to its teammates — the session's real interface, in place.</p>
+    <p>What it isn't: Echo's own thread UI. The attached view is Claude Code's TUI, so it gets no Echo transcript rendering, no narration, no voice. That's the honest trade for talking to a session that's still working, and it's why adopt still exists.</p>
+
+    <h4>Adopt</h4>
+    <p>Turns a session into a real Echo thread, and requires stopping it first — so it's explicit and never automatic.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Session state</th><th>Offered</th></tr></thead>
+      <tbody>
+        <tr><td><code>done</code> · <code>stopped</code> · <code>failed</code></td><td><strong>Open in Echo</strong> — stop (a no-op if already exited), then <code>load_session</code></td></tr>
+        <tr><td><code>working</code> · <code>blocked</code></td><td><strong>Attach</strong> for a live conversation. Adopting is offered as <strong>Stop and open</strong>, with the stop named in the button.</td></tr>
+      </tbody>
+    </table></div>
+    <p>Writing into a teammate's mailbox at <code>teams/&lt;team&gt;/inboxes/&lt;agent&gt;.json</code> would be a second route to a running session, and is rejected: Claude Code tells the recipient the message came from another agent rather than from you, so it can't approve a permission prompt or carry consent — and a malformed entry is a private-format corruption Echo would be causing. <strong>Attach delivers a real user turn; the mailbox delivers a nudge.</strong></p>
+  </section>
+
+  <section id="workflows">
+    <div class="sec-head"><h2>Part 2 · Workflows</h2></div>
+    <p class="lede">One scripted run fanning out dozens of agents across phases. The surface answers a different question: <em>what is this thing actually doing, and what did each agent find?</em></p>
+
+    <h3 id="wf-lifecycle">Lifecycle</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Stage</th><th>Source</th><th>What Echo gets</th></tr></thead>
+      <tbody>
+        <tr><td>Launch</td><td>ACP <code>tool_call</code></td><td>A run exists — render a placeholder immediately</td></tr>
+        <tr><td>Script</td><td><code>rawInput.script</code></td><td>Full source: phases, and every <code>agent()</code> call with its label</td></tr>
+        <tr><td>Identity</td><td><code>toolResponse</code></td><td><code>runId</code>, name, summary, <code>transcriptDir</code>, <code>scriptPath</code></td></tr>
+        <tr><td>Progress</td><td>tail <code>journal.jsonl</code></td><td><code>started</code> / <code>result</code> per agent, in start order</td></tr>
+        <tr><td>Detail</td><td><code>agent-&lt;id&gt;.jsonl</code></td><td>Prompt, tool calls, result, usage, timestamps</td></tr>
+      </tbody>
+    </table></div>
+    <p>The <code>agentId</code> in the journal is exactly the transcript filename, so that join is exact. Tokens and duration are computed from the transcript rather than read: sum usage across assistant records, take last-minus-first timestamp.</p>
+
+    <h3 id="wf-phase">Phase attribution <span class="chip c-risk">The one soft edge</span></h3>
+    <p>The single thing not on disk. The script does carry it — <code>phase('Alpha')</code> statements sit next to the prompt each agent receives — and the script arrives on the wire. So Echo locates an agent's first prompt as a substring of the script source, then takes the nearest preceding phase marker. No JavaScript is parsed; it's a text search over a string Echo already holds.</p>
+<pre><span class="c">// ponytail: substring match, nearest preceding phase marker. Fails for prompts</span>
+<span class="c">// built at runtime (template literals over a list); those render Unattributed.</span>
+<span class="c">// Upgrade path is asking Claude Code to persist label+phase in agent meta.json.</span></pre>
+    <p>It fails cleanly and in a known direction. A dynamically-built prompt won't appear literally in the script, so its agent lands under <strong>Unattributed</strong> — a real group in the UI, never a wrong phase. <strong>Every agent is always shown; only its grouping is ever uncertain.</strong> Declared phases render whether or not anything has been attributed to them, so a run's shape is visible from the first frame.</p>
+
+    <h3 id="wf-surface">Surface</h3>
+    <p>A run belongs to the thread that launched it, so it nests there rather than in the fleet. In the thread, the bare <code>Workflow</code> tool-call row becomes a live run card. In the sidebar, the run nests under its thread. And the run view is the thing a terminal can't give you:</p>
+<div class="runview" role="img" aria-label="Run view mock: phases Recon and Concepts with their agents, token counts, durations, and progress; plus an Unattributed group holding one agent whose prompt was built at runtime.">
+      <div class="rv-head">
+        <span class="rv-name">dromaki-browser-design</span>
+        <span class="rv-sum">Recon, competing concepts, adversarial judging, synthesized spec</span>
+        <span class="rv-tot">8 agents · 358k · 6m 41s</span>
+      </div>
+
+      <div class="rv-phase">
+        <div class="rv-phase-head">
+          <span class="rv-tri">▼</span>
+          <span class="rv-nm">Recon</span>
+          <span class="rv-meta">3 agents · 148k · 2m 14s</span>
+          <span class="rv-prog">
+            <span class="rv-bar is-done"><i style="width:100%"></i></span>
+            <span class="rv-state is-done">Done</span>
+          </span>
+        </div>
+        <div class="rv-agents">
+          <div class="rv-agent"><span class="dot d-done"></span><span class="rv-an">competitive teardown</span><span class="rv-as is-done">Done</span><span class="rv-num">52k</span><span class="rv-num">1m 48s</span></div>
+          <div class="rv-agent"><span class="dot d-done"></span><span class="rv-an">tech foundation</span><span class="rv-as is-done">Done</span><span class="rv-num">47k</span><span class="rv-num">2m 14s</span></div>
+          <div class="rv-agent"><span class="dot d-done"></span><span class="rv-an">user jobs-to-be-done</span><span class="rv-as is-done">Done</span><span class="rv-num">49k</span><span class="rv-num">1m 52s</span></div>
+        </div>
+      </div>
+
+      <div class="rv-phase">
+        <div class="rv-phase-head">
+          <span class="rv-tri">▼</span>
+          <span class="rv-nm">Concepts</span>
+          <span class="rv-meta">4 agents · 210k</span>
+          <span class="rv-prog">
+            <span class="rv-bar"><i style="width:50%"></i></span>
+            <span class="rv-state is-run">2/4</span>
+          </span>
+        </div>
+        <div class="rv-agents">
+          <div class="rv-agent"><span class="dot d-done"></span><span class="rv-an">concept: MVP-first</span><span class="rv-as is-done">Done</span><span class="rv-num">61k</span><span class="rv-num">3m 02s</span></div>
+          <div class="rv-agent"><span class="dot d-done"></span><span class="rv-an">concept: risk-first</span><span class="rv-as is-done">Done</span><span class="rv-num">57k</span><span class="rv-num">2m 44s</span></div>
+          <div class="rv-agent sel"><span class="dot d-work pulse"></span><span class="rv-an">concept: user-first</span><span class="rv-as is-run">Running</span><span class="rv-num">58k</span><span class="rv-num">—</span></div>
+          <div class="rv-agent"><span class="dot d-work pulse"></span><span class="rv-an">concept: contrarian</span><span class="rv-as is-run">Running</span><span class="rv-num">34k</span><span class="rv-num">—</span></div>
+        </div>
+      </div>
+
+      <div class="rv-phase is-unattr">
+        <div class="rv-phase-head">
+          <span class="rv-tri">▼</span>
+          <span class="rv-nm">Unattributed</span>
+          <span class="rv-meta">prompt built at runtime</span>
+          <span class="rv-prog"><span class="rv-state">1 agent</span></span>
+        </div>
+        <div class="rv-agents">
+          <div class="rv-agent"><span class="dot d-work pulse"></span><span class="rv-an">judge · lens 3 of 3</span><span class="rv-as is-run">Running</span><span class="rv-num">7k</span><span class="rv-num">—</span></div>
+        </div>
+      </div>
+
+      <div class="rv-foot">Selected agent opens its transcript — prompt, tool calls, result.</div>
+    </div>
+    <p>Selecting an agent opens its full transcript in the existing read-only viewer — its prompt, every tool call, its result. <strong>Reading four agents' reasoning side by side is the thing <code>/workflows</code> cannot do in a terminal.</strong></p>
+
+    <h4>Launching one</h4>
+    <p>The adapter stamps <code>origin: { kind: "human" }</code> on prompts — the exact gate the <code>ultracode</code> keyword checks, verified in the adapter source. So workflows already run through Echo today, unsurfaced, and launching one needs no protocol work: a <strong>Run as workflow</strong> toggle on the message editor prefixes the prompt.</p>
+  </section>
+
+  <section id="failure">
+    <div class="sec-head"><h2>Failure modes</h2><span class="chip c-risk">Standing risk</span></div>
+    <p class="lede">Every high-value field lives in an undocumented format. The mitigation isn't avoidance — it's that each surface degrades rather than breaks.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Situation</th><th>Behavior</th></tr></thead>
+      <tbody>
+        <tr><td>Daemon not running</td><td>Empty fleet, not an error. The first dispatch starts it.</td></tr>
+        <tr><td><code>state.json</code> schema changed by an upgrade</td><td>Per-field tolerance. Unparsable is <code>None</code>, unknown state is <code>Unknown</code>. A session with no <code>state.json</code> still renders from the roster.</td></tr>
+        <tr><td>Session stopped outside Echo</td><td>Next poll reconciles. No cached authority.</td></tr>
+        <tr><td>Attach to a session whose process already exited</td><td><code>claude attach</code> fails and the terminal shows its error. Offer <strong>Open in Echo</strong> instead, which works on an exited session.</td></tr>
+        <tr><td>Adopt races the daemon</td><td><code>load_session</code> is the source of truth. If it returns the bg-guard error, the session didn't stop — report it and stay read-only.</td></tr>
+        <tr><td>Workflow tool call with no response</td><td>The run is unlocatable. Render the tool call as it renders today and don't fabricate a run.</td></tr>
+        <tr><td>Agent transcript with no journal record</td><td>Render it as running. The journal lags the transcript, never leads it.</td></tr>
+        <tr><td>Prompt not found in the script</td><td><strong>Unattributed.</strong> Never dropped, never misfiled.</td></tr>
+        <tr><td>Echo restarts mid-run</td><td>The run directory is on disk and the thread persists — re-derive from <code>transcriptDir</code>, reread <code>scriptPath</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>A degraded fleet view still works from <code>roster.json</code> alone. A workflow with no attribution is still a complete list of agents with prompts, results, and transcripts. <strong>A schema break costs detail, not the feature.</strong></p>
+  </section>
+
+  <section id="testing">
+    <div class="sec-head"><h2>Testing</h2><span class="chip c-decided">Decided</span></div>
+    <p>Fixtures captured during the spike — a real <code>state.json</code>, <code>roster.json</code>, <code>timeline.jsonl</code>, team config, teammate meta, a two-agent journal, and the <code>echo-alpha-beta</code> script — go in <code>crates/fleet/test_fixtures/</code>. Every parser is a pure function over a path or a string, so <strong>the suite runs with no daemon, no network, and no Claude Code installed</strong>.</p>
+    <h4>Cases that must hold</h4>
+    <ul>
+      <li>An unrecognized <code>state</code> renders <code>Unknown</code> and does not panic.</li>
+      <li>A session in the roster with no <code>jobs/</code> directory still renders.</li>
+      <li>A task set with <code>blockedBy</code> produces the right blocked ordering.</li>
+      <li>Tail resumption from a byte offset does not re-emit records already seen.</li>
+      <li>An agent whose prompt appears verbatim attributes to the nearest preceding phase.</li>
+      <li>An agent whose prompt is absent attributes to <code>None</code> — and still renders.</li>
+      <li>A prompt appearing twice attributes to the first match and is flagged ambiguous, not silently split.</li>
+      <li>Tokens sum across multiple assistant records in one transcript.</li>
+    </ul>
+    <p>Two end-to-end tests — one that actually dispatches, one that actually runs a workflow — sit behind <code>RUN_FLEET_E2E=1</code> and stay out of CI. They cost tokens and need a real daemon.</p>
+  </section>
+
+  <section id="build">
+    <div class="sec-head"><h2>Build order</h2><span class="chip c-decided">Two shippable stops</span></div>
+    <p class="lede">Fleet and workflows are independent after step one. Either order, or both at once.</p>
+    <ol class="build">
+      <li><code>claude_home.rs</code> parsers, against fixtures. No UI.</li>
+      <li>The <code>Fleet</code> entity and refresh loop.</li>
+      <li>Sidebar fleet section, read-only: rows, grouping, blocked-first ordering.</li>
+      <li class="ship">Read-only transcript view, reusing the existing tail.<span class="mark">→ ships alone: a complete read-only fleet</span></li>
+      <li>Dispatch, stop, respawn.</li>
+      <li>Attach: a terminal entry running <code>claude attach</code>, nested under the session.</li>
+      <li>Adopt.</li>
+      <li>Teams: the env var at dispatch, members as nested rows, teammate transcripts.</li>
+      <li>Task graph under a session.</li>
+      <li><code>workflow.rs</code>: script parsing, journal join, phase attribution. Fixtures only.</li>
+      <li>Detect the <code>Workflow</code> tool call, capture script and response, persist with the thread.</li>
+      <li>Run card in the thread, replacing the bare tool-call row.</li>
+      <li class="ship">Run view: phases, agents, per-agent transcript.<span class="mark">→ ships alone: a complete workflow viewer</span></li>
+      <li><strong>Run as workflow</strong> toggle on the message editor.</li>
+    </ol>
+  </section>
+
+  <section id="later">
+    <div class="sec-head"><h2>Not in v1</h2><span class="chip c-later">Deferred</span></div>
+    <div class="tw"><table>
+      <thead><tr><th>Deferred</th><th>Why, and what would bring it back</th></tr></thead>
+      <tbody>
+        <tr><td>Interactive session listing</td><td>Those are your own terminals. A different product than a managed fleet.</td></tr>
+        <tr><td>Workflow pause / resume / restart-agent</td><td>Keystrokes in the CLI's own view with no protocol equivalent. Observe-only until there is one.</td></tr>
+        <tr><td>Saving a run as a command</td><td>Straightforward once the run view exists.</td></tr>
+        <tr><td>Voice</td><td>The natural payoff of Echo having both — <em>“what's blocked?”</em> across the fleet, <em>“how far along is the audit?”</em> across a run. <code>FleetState</code> and <code>WorkflowRun</code> exposing status is the whole hook needed.</td></tr>
+        <tr><td>Cross-session messaging</td><td>Between fleet sessions. Needs a mailbox writer, not just a reader.</td></tr>
+        <tr><td>Worktree management UI</td><td>The daemon creates and cleans them.</td></tr>
+        <tr><td><code>--fork-session</code> adoption</td><td>Would allow adopting a live session, at the cost of two divergent transcripts.</td></tr>
+      </tbody>
+    </table></div>
+
+  </section>
+
+  <section id="preview">
+    <div class="sec-head"><h2>Appendix · Live preview</h2><span class="chip c-open">Idea capture</span><span class="chip c-later">Separate document</span></div>
+    <p class="lede">Not part of the spec above and not scheduled. Captured here so it reviews alongside — the source of truth is <code>2026-08-23-live-preview-notes.md</code>.</p>
+
+    <p>The app you're building, rendered inside Echo, with its console and network wired to the agent working on it.</p>
+
+    <h3>The reframe</h3>
+    <p>The point isn't the pixels. Your <code>chrome-devtools</code> and <code>playwright</code> MCP servers already let an agent drive a real Chrome — navigate, click, screenshot, read the console. That half is solved.</p>
+    <p>What's missing is that <strong>the agent's Chrome and your eyes are looking at different browsers</strong>. The agent drives an instance you can't see; you check the work in a window Echo knows nothing about. Every loop goes through alt-tab and a description.</p>
+    <p>One browser, two consumers: the agent drives it and reads its console, you watch the same pixels. <strong><em>The agent sees its own bugs</em> is the payoff, and it only works if there's one instance.</strong></p>
+
+    <h3>What GPUI can't do — and why it doesn't matter here</h3>
+    <p><strong>There is no web content path in GPUI.</strong> No <code>WKWebView</code>, no <code>wry</code>, no CEF, no Servo. Zed draws every pixel itself to one GPU surface, and <code>crates/gpui_web</code> is GPUI compiled <em>to</em> WASM — the opposite direction. Embedding a real engine means overlaying a native view on that surface and fighting z-order, clipping, and occlusion, per platform.</p>
+    <p>A preview doesn't need one. Three things already in the tree make a cheaper route work:</p>
+    <div class="tw"><table>
+      <thead><tr><th>Already present</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td><code>async-tungstenite = "0.31.0"</code></td><td>The DevTools protocol is JSON-RPC over a WebSocket. The transport is already a dependency.</td></tr>
+        <tr><td><code>image</code>, with decode features</td><td>Screencast frames arrive as base64 JPEG.</td></tr>
+        <tr><td><code>RenderImage</code> / <code>ImageSource</code></td><td>Drawing a stream of frames is drawing an image, which GPUI already does well.</td></tr>
+      </tbody>
+    </table></div>
+    <p>And there's direct precedent for embedding a foreign process and rendering its output inline: <code>crates/repl</code> runs a Jupyter kernel and draws the images it returns. A browser process is the same shape.</p>
+    <p>Roughly six CDP methods do it — <code>Page.startScreencast</code> for frames, <code>Input.dispatch*</code> for interaction, and <code>Runtime.consoleAPICalled</code> plus <code>Network.responseReceived</code> <strong>on the same connection</strong>, which is what makes one browser serve both consumers. No native view, no platform-specific code.</p>
+
+    <h3>The ceiling, and the seam to a real browser</h3>
+    <p>Screencast is compressed JPEG at roughly 10–20fps. Fine for <em>did the layout break, what did the console say</em>. Not fine for a surface you live in: no smooth scrolling, compression-blurred text, a round trip of input latency.</p>
+    <p>So the dromaki-shaped ambition — tabs, address bar, history — needs a natively composited engine, and this work doesn't get you there. What carries over is worth being precise about:</p>
+    <div class="tw"><table>
+      <thead><tr><th>Layer</th><th>Reusable for a real browser</th></tr></thead>
+      <tbody>
+        <tr><td>CDP client, session management, lifecycle</td><td class="yes">Yes — the control plane is the same</td></tr>
+        <tr><td>Console and network capture, agent wiring</td><td class="yes">Yes — the reason to build it at all</td></tr>
+        <tr><td>Input event translation (GPUI → CDP)</td><td class="partly">Mostly — retargeted at a native view</td></tr>
+        <tr><td>Screencast frame transport and decode</td><td class="no">No — thrown away entirely</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Build the preview knowing the frame transport is disposable and the control plane is not.</strong></p>
+
+    <h3>Open questions</h3>
+    <ul>
+      <li>Who owns the Chrome process — Echo, or the MCP server already launching one? Sharing is cheaper but couples Echo to that server's lifecycle.</li>
+      <li>Does the agent get the preview's console automatically, or on request? Piping every <code>console.log</code> into a turn is a context cost with no ceiling.</li>
+      <li>Headless with screencast, or headful offscreen? Headless renders some CSS differently — a preview that lies.</li>
+      <li>What happens on a dev-server restart, a port change, or a compile error page.</li>
+    </ul>
+
+    <p class="foot">Specs: <code>2026-08-22-fleet-and-workflows-design.md</code> · <code>2026-08-23-live-preview-notes.md</code> · verified against Claude Code 2.1.239 and the tree on 2026-08-23 · this page is a review artifact and is not committed.</p>
+  </section>
+
+</main>
+
+<script>
+// Scrollspy: mark the section currently in view, matching the rail to the read.
+(function(){
+  var links = Array.prototype.slice.call(document.querySelectorAll('#nav a'));
+  var targets = links.map(function(a){ return document.querySelector(a.getAttribute('href')); })
+                     .filter(Boolean);
+  if(!('IntersectionObserver' in window) || !targets.length) return;
+
+  var visible = new Map();
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting) visible.set(e.target.id, e.intersectionRatio);
+      else visible.delete(e.target.id);
+    });
+    var best = null, bestRatio = -1;
+    visible.forEach(function(ratio, id){ if(ratio > bestRatio){ bestRatio = ratio; best = id; } });
+    if(!best) return;
+    links.forEach(function(a){ a.classList.toggle('on', a.getAttribute('href') === '#' + best); });
+  }, { rootMargin: '-15% 0px -70% 0px', threshold: [0, 0.25, 0.5, 1] });
+
+  targets.forEach(function(t){ obs.observe(t); });
+})();
+</script>
+</body>
+</html>
