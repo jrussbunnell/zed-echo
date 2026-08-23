@@ -449,6 +449,12 @@ mod macos {
                     if heard && !woke.swap(true, Ordering::Relaxed) {
                         emit(&signals, WakeSignal::Woke);
                     }
+
+                    // Forwarded whether or not the wake word was heard: inside
+                    // an open conversation window this is the only signal that
+                    // somebody has started talking, and the window is opened by
+                    // the listener, which knows things this handler does not.
+                    emit(&signals, WakeSignal::PartialTranscript(transcript.clone()));
                     if unsafe { result.isFinal() } {
                         if woke.swap(false, Ordering::Relaxed) {
                             emit(&signals, WakeSignal::UtteranceEnded);

@@ -1,3 +1,4 @@
+use crate::conversation::{Activity, DEFAULT_WINDOW, SILENCE_ENDS_UTTERANCE, Window, activity};
 use crate::intent::{VoiceCommand, parse_intent};
 use crate::provider::{SttProvider, Transcript};
 use anyhow::Result;
@@ -19,6 +20,12 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeSignal {
     Woke,
+    /// The recognizer's running transcript of what it is hearing.
+    ///
+    /// Carried rather than kept inside the wake source because it is the only
+    /// voice-activity signal available without a second framework object fed
+    /// by the same audio: a transcript that grows means somebody is talking.
+    PartialTranscript(String),
     /// The speaker stopped. Ends the utterance in flight.
     UtteranceEnded,
     Failed(String),
@@ -63,6 +70,10 @@ impl FakeWake {
 
     pub fn end_utterance(&self) {
         self.emit(WakeSignal::UtteranceEnded);
+    }
+
+    pub fn push_partial(&self, transcript: &str) {
+        self.emit(WakeSignal::PartialTranscript(transcript.to_string()));
     }
 
     pub fn fail(&self, message: &str) {
@@ -112,25 +123,32 @@ impl WakeSource for FakeWake {
 /// Something the owning view has to act on.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ListenEvent {
-    /// The wake word landed. The owner pauses narration on this, which is what
-    /// lets the command be captured against a silent speaker.
+    /// The wake word landed.
     Woke,
+    /// Somebody started talking inside an open window. The owner ducks
+    /// narration on this rather than pausing it — with the canceller running,
+    /// Echo's own voice is no longer in the way.
+    Speaking,
     Command(VoiceCommand),
-    /// A wake that came to nothing. The owner resumes narration.
+    /// A wake, or an open window, that came to nothing. The owner unducks.
     Abandoned,
+    /// The window closed and the wake word is required again.
+    WindowClosed,
     Failed(SharedString),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListenerState {
-    Idle,
-    Capturing,
 }
 
 pub struct Listener {
     provider: Arc<dyn SttProvider>,
-    state: ListenerState,
+    window: Window,
     wake_word: String,
+    /// When false the window closes after one utterance, which is the shipped
+    /// walkie-talkie behavior.
+    conversation: bool,
+    window_duration: Duration,
+    /// The last partial transcript seen, to tell growth from revision.
+    last_partial: String,
+    silence: Option<Task<()>>,
+    window_timer: Option<Task<()>>,
     /// Feeds the transcription in flight. Dropping it ends the utterance,
     /// which is how a provider learns there is no more to come.
     audio: Option<mpsc::UnboundedSender<Vec<f32>>>,
@@ -171,8 +189,13 @@ impl Listener {
 
         Self {
             provider,
-            state: ListenerState::Idle,
+            window: Window::Asleep,
             wake_word: String::from("echo"),
+            conversation: false,
+            window_duration: DEFAULT_WINDOW,
+            last_partial: String::new(),
+            silence: None,
+            window_timer: None,
             audio: None,
             transcription: None,
             timeout: None,
@@ -181,8 +204,15 @@ impl Listener {
         }
     }
 
-    pub fn state(&self) -> ListenerState {
-        self.state
+    pub fn window(&self) -> Window {
+        self.window
+    }
+
+    /// Turns the walkie-talkie into a conversation: the window stays open for
+    /// `window_duration` after each exchange rather than closing immediately.
+    pub fn set_conversation(&mut self, conversation: bool, window_duration: Duration) {
+        self.conversation = conversation;
+        self.window_duration = window_duration;
     }
 
     pub fn set_wake_word(&mut self, wake_word: String) {
@@ -205,22 +235,41 @@ impl Listener {
     /// span of `window`. Used when Echo has just asked a question and the user
     /// is already mid-conversation.
     pub fn arm_without_wake(&mut self, window: Duration, cx: &mut Context<Self>) {
-        if self.state == ListenerState::Capturing {
+        if self.window == Window::Capturing {
             return;
         }
-        self.begin_capture(cx);
-        self.arm_timeout(window, cx);
+        // Opens the window rather than starting a capture: transcribing
+        // against silence while the user gathers their thoughts spends a
+        // request on nothing, and the utterance still begins the moment they
+        // actually speak.
+        self.window = Window::Listening;
+        self.last_partial.clear();
+        self.window_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(window).await;
+            this.update(cx, |this, cx| {
+                if this.window != Window::Listening {
+                    return;
+                }
+                this.window = Window::Asleep;
+                this.last_partial.clear();
+                cx.emit(ListenEvent::Abandoned);
+            })
+            .ok();
+        }));
     }
 
     fn handle_wake(&mut self, signal: WakeSignal, cx: &mut Context<Self>) {
         match signal {
             WakeSignal::Woke => {
-                if self.state == ListenerState::Capturing {
+                if self.window == Window::Capturing {
                     return;
                 }
                 cx.emit(ListenEvent::Woke);
                 self.begin_capture(cx);
                 self.arm_timeout(COMMAND_TIMEOUT, cx);
+            }
+            WakeSignal::PartialTranscript(transcript) => {
+                self.note_partial(transcript, cx);
             }
             WakeSignal::UtteranceEnded => {
                 // Dropping the sender is the end-of-utterance signal; the
@@ -234,13 +283,70 @@ impl Listener {
         }
     }
 
+    /// Turns the recognizer's running transcript into the two facts the window
+    /// needs: somebody started talking, and somebody stopped.
+    fn note_partial(&mut self, transcript: String, cx: &mut Context<Self>) {
+        let speaking = activity(&self.last_partial, &transcript) == Activity::Speaking;
+        self.last_partial = transcript;
+        if !speaking {
+            return;
+        }
+
+        match self.window {
+            // Outside a window the wake word is the only way in, so growth
+            // here is somebody talking near the machine, not to it.
+            Window::Asleep => return,
+            Window::Listening => {
+                cx.emit(ListenEvent::Speaking);
+                self.begin_capture(cx);
+                self.window_timer.take();
+            }
+            Window::Capturing => {}
+        }
+
+        // Every word restarts the clock, so the utterance ends on a real
+        // pause rather than on a fixed budget.
+        self.silence = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SILENCE_ENDS_UTTERANCE).await;
+            this.update(cx, |this, _| {
+                if this.window == Window::Capturing {
+                    this.audio.take();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Where the window goes once an exchange is over.
+    fn close_or_rearm(&mut self, cx: &mut Context<Self>) {
+        if !self.conversation {
+            self.window = Window::Asleep;
+            return;
+        }
+        self.window = Window::Listening;
+        self.last_partial.clear();
+        let window_duration = self.window_duration;
+        self.window_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(window_duration).await;
+            this.update(cx, |this, cx| {
+                if this.window != Window::Listening {
+                    return;
+                }
+                this.window = Window::Asleep;
+                this.last_partial.clear();
+                cx.emit(ListenEvent::WindowClosed);
+            })
+            .ok();
+        }));
+    }
+
     fn begin_capture(&mut self, cx: &mut Context<Self>) {
         let (audio_sender, audio) = mpsc::unbounded();
         let mut transcripts = self.provider.transcribe(audio, cx);
         let wake_word = self.wake_word.clone();
 
         self.audio = Some(audio_sender);
-        self.state = ListenerState::Capturing;
+        self.window = Window::Capturing;
         self.transcription = Some(cx.spawn(async move |this, cx| {
             let mut latest: Option<Result<Transcript>> = None;
             while let Some(transcript) = transcripts.next().await {
@@ -264,15 +370,16 @@ impl Listener {
         wake_word: &str,
         cx: &mut Context<Self>,
     ) {
-        if self.state != ListenerState::Capturing {
+        if self.window != Window::Capturing {
             return;
         }
         // Deliberately does not drop `transcription`: this runs inside that
         // task, and a task that cancels itself mid-poll is a trap for whoever
         // adds work after the dispatch.
-        self.state = ListenerState::Idle;
         self.audio.take();
         self.timeout.take();
+        self.silence.take();
+        self.close_or_rearm(cx);
 
         match transcript {
             Some(Ok(transcript)) => {
@@ -292,7 +399,7 @@ impl Listener {
         self.timeout = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(window).await;
             this.update(cx, |this, cx| {
-                if this.state != ListenerState::Capturing {
+                if this.window != Window::Capturing {
                     return;
                 }
                 this.abandon_capture();
@@ -305,10 +412,13 @@ impl Listener {
     /// Tears down a capture without dispatching, cancelling the transcription
     /// rather than letting it land after the listener has moved on.
     fn abandon_capture(&mut self) {
-        self.state = ListenerState::Idle;
+        self.window = Window::Asleep;
         self.audio.take();
         self.transcription.take();
         self.timeout.take();
+        self.silence.take();
+        self.window_timer.take();
+        self.last_partial.clear();
     }
 }
 
@@ -333,8 +443,8 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        fn state(&self, cx: &mut TestAppContext) -> ListenerState {
-            self.listener.read_with(cx, |listener, _| listener.state())
+        fn window(&self, cx: &mut TestAppContext) -> Window {
+            self.listener.read_with(cx, |listener, _| listener.window())
         }
     }
 
@@ -369,7 +479,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(harness.events(), vec![ListenEvent::Woke]);
-        assert_eq!(harness.state(cx), ListenerState::Capturing);
+        assert_eq!(harness.window(cx), Window::Capturing);
     }
 
     #[gpui::test]
@@ -388,7 +498,7 @@ mod tests {
                 ListenEvent::Command(VoiceCommand::Say("check the tests first".to_string())),
             ]
         );
-        assert_eq!(harness.state(cx), ListenerState::Idle);
+        assert_eq!(harness.window(cx), Window::Asleep);
     }
 
     /// A wake with nothing behind it is Echo hearing its own voice, or a
@@ -406,7 +516,7 @@ mod tests {
             harness.events(),
             vec![ListenEvent::Woke, ListenEvent::Abandoned]
         );
-        assert_eq!(harness.state(cx), ListenerState::Idle);
+        assert_eq!(harness.window(cx), Window::Asleep);
     }
 
     /// A failed transcription must be audible as a failure. Returning quietly
@@ -423,7 +533,7 @@ mod tests {
         let events = harness.events();
         assert_eq!(events[0], ListenEvent::Woke);
         assert!(matches!(events[1], ListenEvent::Failed(_)), "{events:?}");
-        assert_eq!(harness.state(cx), ListenerState::Idle);
+        assert_eq!(harness.window(cx), Window::Asleep);
     }
 
     /// Mid-conversation — answering "approve?" — the user should not have to
@@ -436,12 +546,17 @@ mod tests {
             listener.arm_without_wake(Duration::from_secs(8), cx)
         });
         cx.run_until_parked();
+        harness.wake.push_partial("yes");
+        cx.run_until_parked();
         harness.wake.end_utterance();
         cx.run_until_parked();
 
         assert_eq!(
             harness.events(),
-            vec![ListenEvent::Command(VoiceCommand::Approve)]
+            vec![
+                ListenEvent::Speaking,
+                ListenEvent::Command(VoiceCommand::Approve),
+            ]
         );
     }
 
@@ -458,8 +573,149 @@ mod tests {
         cx.background_executor.advance_clock(Duration::from_secs(9));
         cx.run_until_parked();
 
-        assert_eq!(harness.state(cx), ListenerState::Idle);
+        assert_eq!(harness.window(cx), Window::Asleep);
         assert_eq!(harness.events(), vec![ListenEvent::Abandoned]);
+    }
+
+    /// The point of conversation mode. Without it, answering a follow-up means
+    /// saying Echo's name again, which is not a conversation.
+    #[gpui::test]
+    async fn a_conversation_window_stays_open_after_an_exchange(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.listener.update(cx, |listener, _| {
+            listener.set_conversation(true, Duration::from_secs(15))
+        });
+        harness.stt.queue_transcript("what is it doing");
+        harness.wake.wake();
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        assert_eq!(
+            harness.window(cx),
+            Window::Listening,
+            "the window should still be open for a follow-up"
+        );
+    }
+
+    /// And a follow-up needs no wake word — speech alone starts the capture.
+    #[gpui::test]
+    async fn a_follow_up_inside_the_window_needs_no_wake_word(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.listener.update(cx, |listener, _| {
+            listener.set_conversation(true, Duration::from_secs(15))
+        });
+        harness.stt.queue_transcript("first");
+        harness.stt.queue_transcript("and the tests");
+        harness.wake.wake();
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        harness.wake.push_partial("and the tests");
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        assert_eq!(
+            harness.stt.heard(),
+            2,
+            "the follow-up should be transcribed"
+        );
+        assert!(
+            harness
+                .events()
+                .contains(&ListenEvent::Command(VoiceCommand::Say(
+                    "and the tests".to_string()
+                )))
+        );
+    }
+
+    /// A window that never closed would leave the microphone accepting input
+    /// indefinitely, which is the thing the wake word exists to prevent.
+    #[gpui::test]
+    async fn a_silent_window_closes_itself(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.listener.update(cx, |listener, _| {
+            listener.set_conversation(true, Duration::from_secs(15))
+        });
+        harness.stt.queue_transcript("what is it doing");
+        harness.wake.wake();
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        cx.background_executor
+            .advance_clock(Duration::from_secs(16));
+        cx.run_until_parked();
+
+        assert_eq!(harness.window(cx), Window::Asleep);
+        assert!(harness.events().contains(&ListenEvent::WindowClosed));
+    }
+
+    /// With conversation mode off, the shipped walkie-talkie behavior is
+    /// unchanged: one utterance per wake word.
+    #[gpui::test]
+    async fn without_conversation_mode_the_window_closes_immediately(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.stt.queue_transcript("what is it doing");
+        harness.wake.wake();
+        cx.run_until_parked();
+        harness.wake.end_utterance();
+        cx.run_until_parked();
+
+        assert_eq!(harness.window(cx), Window::Asleep);
+    }
+
+    /// Speech inside a window ducks narration. Outside one it must not, or
+    /// every conversation in the room would quiet the agent.
+    #[gpui::test]
+    async fn speech_ducks_only_inside_an_open_window(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.wake.push_partial("somebody talking nearby");
+        cx.run_until_parked();
+        assert_eq!(harness.events(), vec![], "asleep, so nothing was addressed");
+
+        harness.listener.update(cx, |listener, cx| {
+            listener.arm_without_wake(Duration::from_secs(8), cx)
+        });
+        harness.stt.queue_transcript("pause");
+        cx.run_until_parked();
+        harness.wake.push_partial("pause");
+        cx.run_until_parked();
+
+        assert!(harness.events().contains(&ListenEvent::Speaking));
+    }
+
+    /// The utterance ends on a real pause rather than a fixed budget, so a
+    /// slow speaker is not cut off mid-sentence.
+    #[gpui::test]
+    async fn an_utterance_ends_once_the_transcript_stops_growing(cx: &mut TestAppContext) {
+        let harness = harness(cx);
+        harness.listener.update(cx, |listener, cx| {
+            listener.arm_without_wake(Duration::from_secs(30), cx)
+        });
+        harness.stt.queue_transcript("check the tests first");
+        cx.run_until_parked();
+
+        harness.wake.push_partial("check");
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(SILENCE_ENDS_UTTERANCE / 2);
+        harness.wake.push_partial("check the tests first");
+        cx.run_until_parked();
+
+        cx.background_executor
+            .advance_clock(SILENCE_ENDS_UTTERANCE * 2);
+        cx.run_until_parked();
+
+        assert!(
+            harness
+                .events()
+                .contains(&ListenEvent::Command(VoiceCommand::Say(
+                    "check the tests first".to_string()
+                )))
+        );
     }
 
     /// The mirror of the gate: once woken, the frames the microphone was
