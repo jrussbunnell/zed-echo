@@ -2988,10 +2988,7 @@ mod tests {
             cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
         cx.run_until_parked();
 
-        let read_aloud = cx.new({
-            let provider = provider.clone();
-            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
-        });
+        let read_aloud = cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
         read_aloud.update(cx, |read_aloud, cx| {
             read_aloud.enqueue_markdown(&markdown, false, cx);
         });

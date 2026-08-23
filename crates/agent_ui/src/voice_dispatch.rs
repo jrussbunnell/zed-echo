@@ -916,11 +916,7 @@ impl AgentPanel {
         // silence reads as "it is looking" instead of "it did not hear me".
         self.say_to_the_user("Let me check.", cx);
 
-        let transcript = thread_view
-            .read(cx)
-            .voice_candidate(false, cx)
-            .session_id
-            .clone();
+        let transcript = thread_view.read(cx).voice_candidate(false, cx).session_id;
         let briefing = self.voice.as_ref().is_some_and(|voice| {
             voice
                 .sidecar
@@ -928,7 +924,7 @@ impl AgentPanel {
                 .is_some_and(|sidecar| sidecar.briefed)
         });
         let opening = if briefing {
-            question.clone()
+            question
         } else {
             format!(
                 "{}\n\n{question}",
