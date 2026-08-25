@@ -1,5 +1,8 @@
 mod thread_switcher;
 
+mod fleet_section;
+use fleet_section::{FleetSection, render_fleet_section};
+
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
@@ -778,6 +781,8 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    /// Dispatched Claude Code sessions, rendered above the thread list.
+    fleet_section: FleetSection,
     /// Threads whose subagent rows are currently shown. Deliberately not
     /// persisted: a thread's subagents only exist while it is loaded, so a
     /// remembered expansion would restore to nothing.
@@ -955,6 +960,7 @@ impl Sidebar {
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
+            fleet_section: FleetSection::new(cx),
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
         }
@@ -8094,6 +8100,17 @@ impl Render for Sidebar {
         let ui_font = theme_settings::setup_ui_font(window, cx);
         let sticky_header = self.render_sticky_header(window, cx);
 
+        // Built before `cx.theme()` is borrowed for the rest of this method: a
+        // row registers listeners, which needs the context mutably.
+        let fleet_section = match self.multi_workspace.upgrade() {
+            Some(multi_workspace) => {
+                let workspace = multi_workspace.read(cx).workspace().downgrade();
+                let snapshot = self.fleet_section.snapshot(cx);
+                render_fleet_section(&self.fleet_section, snapshot, &workspace, cx)
+            }
+            None => None,
+        };
+
         let color = cx.theme().colors();
         let bg = color
             .title_bar_background
@@ -8101,6 +8118,7 @@ impl Render for Sidebar {
 
         let no_open_projects = !self.contents.has_open_projects;
         let no_search_results = self.contents.entries.is_empty();
+        // Rendered before the builder chain takes over `self`.
 
         v_flex()
             .id("workspace-sidebar")
@@ -8187,7 +8205,7 @@ impl Render for Sidebar {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))
                         } else {
-                            this.child(
+                            this.children(fleet_section).child(
                                 v_flex()
                                     .relative()
                                     .flex_1()
