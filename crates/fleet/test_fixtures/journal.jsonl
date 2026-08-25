@@ -1,0 +1,4 @@
+{"type":"started","key":"v2:695523946d3c555b0e9a6ce2ebee9d37b526914d6a6cdec55458c14cd8236ecc","agentId":"af5784b3849ea373d"}
+{"type":"result","key":"v2:695523946d3c555b0e9a6ce2ebee9d37b526914d6a6cdec55458c14cd8236ecc","agentId":"af5784b3849ea373d","result":"ALPHA_DONE"}
+{"type":"started","key":"v2:ecaf90debd2d96cb06bcb713c2237c36b29c805823349434471fe3c7a0142b8b","agentId":"a8dfaad1c2970fcd8"}
+{"type":"result","key":"v2:ecaf90debd2d96cb06bcb713c2237c36b29c805823349434471fe3c7a0142b8b","agentId":"a8dfaad1c2970fcd8","result":"BETA_DONE"}

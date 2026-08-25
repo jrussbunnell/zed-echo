@@ -1,0 +1,49 @@
+{
+  "state": "blocked",
+  "detail": "scout idle, final text not surfaced; cannot confirm SCOUT_OK",
+  "tempo": "blocked",
+  "inFlight": {
+    "tasks": 1,
+    "queued": 0,
+    "kinds": [
+      "in_process_teammate"
+    ],
+    "drainableMonitors": 0
+  },
+  "fan": [
+    {
+      "id": "tpa8drsem",
+      "kind": "agent",
+      "label": "Reply with exactly SCOUT_OK and stop. Do no other ...",
+      "startedAt": 1787627480314,
+      "doneAt": 0
+    }
+  ],
+  "tokens": 775,
+  "needs": "confirm scout's final output or re-run scout",
+  "output": null,
+  "children": null,
+  "linkScanOffset": 139512,
+  "linkScanPath": "/Users/testuser/.claude/projects/-private-tmp-fleet-fx/e9b5670a-0f01-4df8-9ddf-547b333d2703.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--name",
+    "fx-team",
+    "--model",
+    "opus[1m]"
+  ],
+  "providerEnv": {},
+  "intent": "Spawn one teammate named scout (use the Agent tool with name set to 'scout') and ask it to reply SCOUT_OK and stop. Then reply TEAM_DONE. Do no other work.",
+  "name": "fx-team",
+  "nameSource": "user",
+  "sessionId": "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+  "resumeSessionId": "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+  "daemonShort": "e9b5670a",
+  "cliVersion": "2.1.241",
+  "cwd": "/private/tmp/fleet-fx",
+  "createdAt": "2026-08-25T03:11:00.125Z",
+  "updatedAt": "2026-08-25T03:11:40.412Z",
+  "firstTerminalAt": null,
+  "backend": "daemon",
+  "suggestedReply": "show me scout's output"
+}

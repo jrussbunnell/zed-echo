@@ -1,0 +1,124 @@
+{
+  "proto": 1,
+  "supervisorPid": 77671,
+  "updatedAt": 1787627549666,
+  "workers": {
+    "888caac0": {
+      "pid": 78668,
+      "procStart": "Tue Aug 25 03:12:13 2026",
+      "sessionId": "888caac0-731a-4a10-80c4-9133d5f14877",
+      "rendezvousSock": "/tmp/cc-daemon-501/b5d41a71/rv/888caac0.sock",
+      "ptySock": "/tmp/cc-daemon-501/b5d41a71/spare/efa19b2d.pty.sock",
+      "cliVersion": "2.1.243",
+      "startedAt": 1787627433023,
+      "attempt": 2,
+      "cwd": "/private/tmp/fleet-fx",
+      "dispatch": {
+        "proto": 1,
+        "short": "888caac0",
+        "nonce": "64625bb5",
+        "sessionId": "888caac0-731a-4a10-80c4-9133d5f14877",
+        "createdAt": 1787627430661,
+        "source": "shell",
+        "cwd": "/private/tmp/fleet-fx",
+        "launch": {
+          "mode": "prompt",
+          "args": [
+            "--session-id",
+            "888caac0-731a-4a10-80c4-9133d5f14877",
+            "--name",
+            "fx-plain",
+            "Reply with exactly: FX_OK. Do not use any tools."
+          ],
+          "restoresTranscript": false
+        },
+        "env": {},
+        "isolation": "none",
+        "respawnFlags": [
+          "--name",
+          "fx-plain",
+          "Reply with exactly: FX_OK. Do not use any tools."
+        ],
+        "seed": {
+          "intent": "Reply with exactly: FX_OK. Do not use any tools.",
+          "name": "fx-plain"
+        }
+      },
+      "decModes": [
+        1000,
+        1002,
+        1003,
+        1006,
+        2004,
+        1004,
+        2031
+      ],
+      "firedInteractiveMarks": [
+        {
+          "kind": "content_paint",
+          "msgsLoaded": 17,
+          "msgsInJsonl": 17,
+          "msgsRenderedAtFirstPaint": 17
+        },
+        {
+          "kind": "prompt_idle"
+        }
+      ],
+      "rvAuth": "748245fe10bec6d5a89a0ebbced445c5",
+      "ptyAuth": "4d464f7282ee3b07112aeae78cb76a75"
+    },
+    "e9b5670a": {
+      "pid": 75904,
+      "procStart": "Tue Aug 25 03:10:33 2026",
+      "sessionId": "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+      "rendezvousSock": "/tmp/cc-daemon-501/b5d41a71/rv/e9b5670a.sock",
+      "ptySock": "/tmp/cc-daemon-501/b5d41a71/spare/b3149380.pty.sock",
+      "cliVersion": "2.1.241",
+      "startedAt": 1787627460351,
+      "attempt": 1,
+      "cwd": "/private/tmp/fleet-fx",
+      "dispatch": {
+        "proto": 1,
+        "short": "e9b5670a",
+        "nonce": "aae83cfb",
+        "sessionId": "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+        "createdAt": 1787627460130,
+        "source": "shell",
+        "cwd": "/private/tmp/fleet-fx",
+        "launch": {
+          "mode": "prompt",
+          "args": [
+            "--session-id",
+            "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+            "--name",
+            "fx-team",
+            "Spawn one teammate named scout (use the Agent tool with name set to 'scout') and ask it to reply SCOUT_OK and stop. Then reply TEAM_DONE. Do no other work."
+          ],
+          "restoresTranscript": false
+        },
+        "env": {},
+        "isolation": "none",
+        "respawnFlags": [
+          "--name",
+          "fx-team",
+          "Spawn one teammate named scout (use the Agent tool with name set to 'scout') and ask it to reply SCOUT_OK and stop. Then reply TEAM_DONE. Do no other work."
+        ],
+        "seed": {
+          "intent": "Spawn one teammate named scout (use the Agent tool with name set to 'scout') and ask it to reply SCOUT_OK and stop. Then reply TEAM_DONE. Do no other work.",
+          "name": "fx-team"
+        }
+      },
+      "decModes": [
+        1000,
+        1002,
+        1003,
+        1006,
+        2004,
+        1004,
+        2031
+      ],
+      "rvAuth": "a19b6a760f0f55562b4e5ae124c5b097",
+      "ptyAuth": "a4b75b5c01e8c6db18559ab43d19b9ba"
+    }
+  }
+}

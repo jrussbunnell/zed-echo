@@ -1,0 +1,32 @@
+{
+  "name": "session-e9b5670a",
+  "createdAt": 1787627461849,
+  "leadAgentId": "team-lead@session-e9b5670a",
+  "leadSessionId": "e9b5670a-0f01-4df8-9ddf-547b333d2703",
+  "members": [
+    {
+      "agentId": "team-lead@session-e9b5670a",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "joinedAt": 1787627461849,
+      "tmuxPaneId": "leader",
+      "cwd": "/private/tmp/fleet-fx",
+      "subscriptions": [],
+      "backendType": "in-process"
+    },
+    {
+      "agentId": "scout@session-e9b5670a",
+      "name": "scout",
+      "color": "blue",
+      "joinedAt": 1787627480303,
+      "tmuxPaneId": "in-process",
+      "subscriptions": [],
+      "agentType": "general-purpose",
+      "model": "opus[1m]",
+      "prompt": "Reply with exactly SCOUT_OK and stop. Do no other work, use no tools.",
+      "planModeRequired": false,
+      "cwd": "/private/tmp/fleet-fx",
+      "backendType": "in-process"
+    }
+  ]
+}

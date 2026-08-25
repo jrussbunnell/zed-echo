@@ -1,0 +1,13 @@
+{
+ "id": "10",
+ "subject": "Task 10",
+ "description": "Fixture body for task 10",
+ "status": "completed",
+ "blocks": [
+  "12"
+ ],
+ "blockedBy": [
+  "7"
+ ],
+ "activeForm": "Working task 10"
+}

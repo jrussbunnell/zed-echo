@@ -1,0 +1,1 @@
+{"agentType":"scout","description":"Scout ack check","name":"scout","spawnDepth":0,"model":"opus[1m]","taskKind":"in_process_teammate","teamName":"session-e9b5670a","color":"blue","planModeRequired":false,"permissionMode":"auto"}
