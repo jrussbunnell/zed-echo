@@ -8,6 +8,7 @@
 //! See `docs/superpowers/specs/2026-08-22-fleet-and-workflows-design.md`.
 
 pub mod claude_home;
+pub mod control;
 pub mod workflow;
 
 use serde::{Deserialize, Deserializer};
