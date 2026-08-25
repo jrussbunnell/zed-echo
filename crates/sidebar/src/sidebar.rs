@@ -3593,6 +3593,19 @@ impl Sidebar {
             return;
         }
 
+        if self.fleet_section.is_dispatching() {
+            let workspace = self
+                .multi_workspace
+                .upgrade()
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().downgrade());
+            if let Some(workspace) = workspace
+                && self.fleet_section.finish_dispatch(&workspace, window, cx)
+            {
+                cx.notify();
+                return;
+            }
+        }
+
         let Some(ix) = self.selection else { return };
         let Some(entry) = self.contents.entries.get(ix) else {
             return;

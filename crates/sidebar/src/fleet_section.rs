@@ -8,15 +8,17 @@
 //!
 //! See `docs/superpowers/specs/2026-08-22-fleet-and-workflows-design.md`.
 
+use editor::Editor;
 use fleet::{Fleet, FleetSession, FleetState, Teammate, control};
-use gpui::{AnyElement, Entity, Subscription, WeakEntity, px};
+use gpui::{AnyElement, Entity, Focusable as _, Subscription, WeakEntity, px};
 use std::collections::HashMap;
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
 };
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{
-    Color, CommonAnimationExt, Icon, IconName, IconSize, Label, LabelSize, Tooltip, prelude::*,
+    Color, CommonAnimationExt, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
+    LabelSize, Tooltip, prelude::*,
 };
 use workspace::Workspace;
 
@@ -60,6 +62,13 @@ pub struct FleetSection {
     /// Sessions whose teammates are shown. Collapsed by default so a team of
     /// five does not push every other session off the screen.
     expanded_teams: HashMap<SharedString, bool>,
+    /// Present while the user is typing a prompt to dispatch. `None` the rest
+    /// of the time, so the row costs nothing when unused.
+    dispatch_editor: Option<Entity<Editor>>,
+    /// Whether the next dispatch enables agent teams. Off by default and set
+    /// per dispatch, never persisted: the variable changes delegation for the
+    /// whole session, so every subagent Claude names becomes a teammate.
+    dispatch_with_teams: bool,
     _observation: Subscription,
 }
 
@@ -74,12 +83,33 @@ impl FleetSection {
             fleet,
             expanded: true,
             expanded_teams: HashMap::default(),
+            dispatch_editor: None,
+            dispatch_with_teams: false,
             _observation: observation,
         }
     }
 
     fn toggle(&mut self) {
         self.expanded = !self.expanded;
+    }
+
+    pub fn is_dispatching(&self) -> bool {
+        self.dispatch_editor.is_some()
+    }
+
+    fn begin_dispatch(&mut self, window: &mut Window, cx: &mut App) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Dispatch a session\u{2026}", window, cx);
+            editor
+        });
+        editor.focus_handle(cx).focus(window, cx);
+        self.dispatch_editor = Some(editor);
+        self.expanded = true;
+    }
+
+    fn cancel_dispatch(&mut self) {
+        self.dispatch_editor = None;
     }
 
     /// Everything the section needs to draw itself, copied out of the entity.
@@ -94,6 +124,7 @@ impl FleetSection {
             waiting: fleet.needs_attention_count(),
             expanded: self.expanded,
             expanded_teams: self.expanded_teams.clone(),
+            dispatch_editor: self.dispatch_editor.clone(),
         }
     }
 
@@ -132,19 +163,69 @@ impl FleetSection {
                             .color(Color::Muted),
                     ),
             )
-            // The count of sessions waiting on the user is the one number worth
-            // seeing with the section collapsed.
-            .when(waiting > 0, |this| {
-                this.child(
-                    Label::new(format!("{waiting} waiting"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                )
-            })
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    // The count of sessions waiting on the user is the one
+                    // number worth seeing with the section collapsed.
+                    .when(waiting > 0, |this| {
+                        this.child(
+                            Label::new(format!("{waiting} waiting"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .child(self.render_dispatch_controls(cx)),
+            )
             .on_click(cx.listener(|sidebar, _, _, cx| {
                 sidebar.fleet_section.toggle();
                 cx.notify();
             }))
+            .into_any_element()
+    }
+
+    /// The controls that start a dispatch, kept beside the header count.
+    fn render_dispatch_controls(&self, cx: &mut Context<Sidebar>) -> AnyElement {
+        let teams_on = self.dispatch_with_teams;
+        h_flex()
+            .gap_0p5()
+            .child(
+                IconButton::new("fleet-teams", IconName::Person)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(if teams_on {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    })
+                    .toggle_state(teams_on)
+                    .tooltip(move |_, cx| {
+                        Tooltip::simple(
+                            if teams_on {
+                                "Agent teams on for the next dispatch"
+                            } else {
+                                "Agent teams off"
+                            },
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|sidebar, _, _, cx| {
+                        sidebar.fleet_section.dispatch_with_teams =
+                            !sidebar.fleet_section.dispatch_with_teams;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("fleet-dispatch", IconName::Plus)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(move |_, cx| Tooltip::simple("Dispatch a session", cx))
+                    .on_click(cx.listener(|sidebar, _, window, cx| {
+                        sidebar.fleet_section.begin_dispatch(window, cx);
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -455,6 +536,7 @@ pub struct FleetSnapshot {
     pub waiting: usize,
     pub expanded: bool,
     pub expanded_teams: HashMap<SharedString, bool>,
+    pub dispatch_editor: Option<Entity<Editor>>,
 }
 
 /// Render the section, or nothing at all.
@@ -492,11 +574,78 @@ pub fn render_fleet_section(
         Vec::new()
     };
 
+    let dispatch_row = snapshot.dispatch_editor.map(|editor| {
+        h_flex()
+            .w_full()
+            .h(rems_from_px(26_f32))
+            .pl(rems_from_px(20_f32))
+            .pr_1p5()
+            .gap_1p5()
+            .child(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1().min_w_0().child(editor))
+            .into_any_element()
+    });
+
     Some(
         v_flex()
             .w_full()
             .child(header)
+            .children(dispatch_row)
             .children(rows)
             .into_any_element(),
     )
+}
+
+impl FleetSection {
+    /// Send whatever is in the dispatch editor, and clear it.
+    ///
+    /// Returns whether a dispatch was in progress, so the sidebar's Enter
+    /// handler can stop rather than also acting on the selected thread.
+    pub fn finish_dispatch(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(editor) = self.dispatch_editor.take() else {
+            return false;
+        };
+        let prompt = editor.read(cx).text(cx).trim().to_string();
+        if prompt.is_empty() {
+            // An empty prompt cancels rather than dispatching a session with
+            // nothing to do.
+            return true;
+        }
+        let Some(workspace) = workspace.upgrade() else {
+            return true;
+        };
+        let Some(cwd) = terminal_view::default_working_directory(workspace.read(cx), cx) else {
+            log::warn!("fleet: no working directory, so there is nowhere to dispatch");
+            return true;
+        };
+
+        let dispatch = control::Dispatch::new(prompt, cwd).with_teams(self.dispatch_with_teams);
+        let fleet = self.fleet.clone();
+        let command = dispatch.command();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = cx.background_executor().spawn(control::run(command)).await;
+                match outcome {
+                    // The daemon writes the new session's state a moment after
+                    // the command returns, so a refresh now beats the next tick.
+                    Ok(_) => {
+                        // AsyncWindowContext::update on a strong entity cannot
+                        // fail, so there is no result to discard here.
+                        fleet.update(cx, |fleet, cx| fleet.refresh_now(cx));
+                    }
+                    Err(error) => log::error!("fleet: dispatch failed: {error:#}"),
+                }
+            })
+            .detach();
+        true
+    }
 }
