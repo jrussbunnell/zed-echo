@@ -8,7 +8,7 @@ use agent_ui::{
     },
     test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
-        open_thread_with_custom_connection, send_message,
+        open_thread_with_custom_connection, register_subagent, send_message,
     },
     thread_metadata_store::{ThreadMetadata, WorktreePaths},
 };
@@ -4117,15 +4117,18 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
         acp::ContentChunk::new("Done".into()),
     )]);
-    open_thread_with_connection(&panel, connection, cx);
+    open_thread_with_connection(&panel, connection.clone(), cx);
     send_message(&panel, cx);
 
     let parent_session_id = active_session_id(&panel, cx);
     save_test_thread_metadata(&parent_session_id, &project, cx).await;
 
-    let subagent_session_id = acp::SessionId::new("subagent-session");
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    // Registered before it is announced, matching the real connection: the
+    // thread goes in first, then the parent emits `SubagentSpawned`.
+    let registered = register_subagent(&connection, &parent_thread, "subagent-session", cx);
+    let subagent_session_id = registered.read_with(cx, |thread, _| thread.session_id().clone());
     cx.update(|_, cx| {
-        let parent_thread = panel.read(cx).active_agent_thread(cx).unwrap();
         parent_thread.update(cx, |thread: &mut AcpThread, cx| {
             thread.subagent_spawned(subagent_session_id.clone(), cx);
         });
@@ -4328,14 +4331,19 @@ async fn test_clicking_the_parent_row_leaves_the_subagent(cx: &mut TestAppContex
     connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
         acp::ContentChunk::new("Done".into()),
     )]);
-    open_thread_with_connection(&panel, connection, cx);
+    open_thread_with_connection(&panel, connection.clone(), cx);
     send_message(&panel, cx);
 
     let parent_session_id = active_session_id(&panel, cx);
     save_test_thread_metadata(&parent_session_id, &project, cx).await;
 
     let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
-    let subagent_session_id = acp::SessionId::new("subagent-session");
+    // Registered before it is announced, which is the order the real
+    // connection uses: a derived subagent is a client-side thread, so the view
+    // finds it through `local_session_thread` rather than loading it.
+    let subagent_thread = register_subagent(&connection, &parent_thread, "subagent-session", cx);
+    let subagent_session_id =
+        subagent_thread.read_with(cx, |thread, _| thread.session_id().clone());
     cx.update(|_, cx| {
         parent_thread.update(cx, |thread, cx| {
             thread.subagent_spawned(subagent_session_id.clone(), cx);

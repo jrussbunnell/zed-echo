@@ -2669,7 +2669,17 @@ impl ConversationView {
                 this.loading_subagents.remove(&loading_id);
             })
             .log_err();
-            let subagent_thread = subagent_thread?;
+            // A failed load has no other symptom: the subagent keeps its row in
+            // the tray and the sidebar, and clicking it silently does nothing,
+            // because navigating to a session that was never registered is a
+            // no-op by design. Say so rather than dropping it on the floor.
+            let subagent_thread = match subagent_thread {
+                Ok(subagent_thread) => subagent_thread,
+                Err(error) => {
+                    log::error!("failed to load subagent {loading_id}: {error:#}");
+                    return Err(error);
+                }
+            };
             this.update_in(cx, |this, window, cx| {
                 let Some(conversation) = this
                     .as_connected()

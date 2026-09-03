@@ -108,7 +108,7 @@ impl FleetSection {
         self.expanded = true;
     }
 
-    fn cancel_dispatch(&mut self) {
+    pub fn cancel_dispatch(&mut self) {
         self.dispatch_editor = None;
     }
 
@@ -321,8 +321,6 @@ impl FleetSection {
                     )
                 })
                 .tooltip({
-                    let name = name.clone();
-                    let subtitle = subtitle.clone();
                     let state_label = state.label().to_string();
                     let attachable = can_attach;
                     Tooltip::element(move |_, _| {
@@ -352,7 +350,6 @@ impl FleetSection {
                     })
                 })
                 .on_click({
-                    let short_id = short_id.clone();
                     let workspace = workspace.clone();
                     let cwd = session.cwd.clone();
                     cx.listener(move |sidebar, _, window, cx| {

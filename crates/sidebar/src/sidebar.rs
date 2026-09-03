@@ -3385,6 +3385,14 @@ impl Sidebar {
             return;
         }
 
+        // Backing out of a dispatch takes the key before anything else, the
+        // same way an in-progress rename does.
+        if self.fleet_section.is_dispatching() {
+            self.fleet_section.cancel_dispatch();
+            cx.notify();
+            return;
+        }
+
         if self.filter_editor.read(cx).is_focused(window) {
             if self.reset_filter_editor_text(window, cx) {
                 self.selection = None;

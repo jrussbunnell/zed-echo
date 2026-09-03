@@ -304,3 +304,44 @@ pub fn active_thread_id(
 ) -> crate::thread_metadata_store::ThreadId {
     panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap())
 }
+
+/// Registers a subagent with `connection` the way the real one does, and
+/// returns its thread.
+///
+/// A derived subagent exists only on the client: its id names no session the
+/// agent has ever heard of, so `ConversationView` finds it through
+/// `local_session_thread` rather than by loading it. The connection registers
+/// it *before* announcing it, which is the ordering
+/// `agent_servers::acp` uses — the thread goes in, then the parent emits
+/// `SubagentSpawned`. A test that announces without registering exercises the
+/// restore-from-transcript path instead, which has no transcript to read.
+pub fn register_subagent(
+    connection: &StubAgentConnection,
+    parent_thread: &Entity<acp_thread::AcpThread>,
+    session_id: &str,
+    cx: &mut VisualTestContext,
+) -> Entity<acp_thread::AcpThread> {
+    let (parent_session_id, project) = cx.update(|_window, cx| {
+        let parent = parent_thread.read(cx);
+        (parent.session_id().clone(), parent.project().clone())
+    });
+    let session_id = acp::SessionId::new(session_id);
+    let thread = cx.update(|_window, cx| {
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+        cx.new(|cx| {
+            acp_thread::AcpThread::new(
+                Some(parent_session_id),
+                None,
+                None,
+                Rc::new(connection.clone()) as Rc<dyn AgentConnection>,
+                project,
+                action_log,
+                session_id.clone(),
+                watch::Receiver::constant(acp::PromptCapabilities::new()),
+                cx,
+            )
+        })
+    });
+    connection.add_local_session_thread(session_id, thread.clone());
+    thread
+}
