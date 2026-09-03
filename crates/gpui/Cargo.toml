@@ -142,6 +142,13 @@ rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation = { workspace = true }
 
+# The window_blur_lab example drives AppKit directly to compare blur
+# mechanisms. gpui itself moved to objc2 when the platform crates split out, so
+# the example carries these itself rather than putting them back on the library.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+cocoa.workspace = true
+objc.workspace = true
+
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
