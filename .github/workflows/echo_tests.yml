@@ -37,7 +37,14 @@ jobs:
   test:
     # Not gated on repository_owner: that gate is exactly what this file exists
     # to work around.
-    runs-on: macos-14
+    #
+    # macos-15, not macos-14: the older image defaults to Xcode 15.4, whose
+    # libc++ hard-errors instantiating `pointer_traits` on cxx's
+    # `rust::Slice<T>::iterator` while building webrtc-sys. Newer libc++ makes
+    # that check SFINAE-friendly. Upstream never hits this because every
+    # upstream macOS job runs on its own `namespace-profile-mac-large` runners,
+    # which this fork has no access to.
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Checkout repo
@@ -51,6 +58,18 @@ jobs:
           # Keyed per workflow so this does not fight the upstream jobs' cache.
           prefix-key: echo-tests
 
+      # Pinned rather than left to the image default, which moves. Also prints
+      # what was available, so a future toolchain failure says so on its face
+      # instead of surfacing as a template error deep in libc++.
+      - name: Select the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          newest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "selecting $newest"
+          sudo xcode-select -s "$newest/Contents/Developer"
+          xcodebuild -version
+          c++ --version
+
       - name: Install Rust toolchain
         run: rustup show
 
@@ -63,6 +82,7 @@ jobs:
             -p acp_thread \
             -p agent_servers \
             -p agent_ui \
+            -p fleet \
             -p listen \
             -p read_aloud \
             -p settings_ui \
