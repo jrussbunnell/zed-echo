@@ -58,6 +58,7 @@ pub fn into_open_ai(
     reasoning_effort: Option<ReasoningEffort>,
     interleaved_reasoning: bool,
 ) -> Result<crate::Request> {
+    let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
     if request
         .tools
         .iter()
@@ -257,6 +258,7 @@ pub fn into_open_ai_response(
     supports_none_reasoning_effort: bool,
     compaction_state_owner: &LanguageModelProviderId,
 ) -> Result<ResponseRequest> {
+    let max_output_tokens = request.effective_max_output_tokens(max_output_tokens);
     let stream = !model_id.starts_with("o1-");
 
     let LanguageModelRequest {
@@ -272,6 +274,7 @@ pub fn into_open_ai_response(
         thinking_effort,
         speed,
         compact_at_tokens,
+        max_output_tokens: _,
     } = request;
 
     let service_tier = service_tier_for(speed);
@@ -1356,11 +1359,16 @@ fn completion_error_from_response_error(
     error: &ResponseError,
     provider: language_model_core::LanguageModelProviderName,
 ) -> LanguageModelCompletionError {
-    let category = response_error_category(error.code.as_deref(), None, &error.message);
+    let category = response_error_category(
+        error.code.as_deref(),
+        error.error_type.as_deref(),
+        None,
+        &error.message,
+    );
     LanguageModelCompletionError::from_provider_response(
         provider,
         None,
-        error.code.clone(),
+        error.code.clone().or_else(|| error.error_type.clone()),
         error.message.clone(),
         None,
         category,
@@ -1369,41 +1377,52 @@ fn completion_error_from_response_error(
 
 pub(crate) fn response_error_category(
     code: Option<&str>,
+    error_type: Option<&str>,
     status: Option<StatusCode>,
     message: &str,
 ) -> ProviderErrorCategory {
-    match code {
-        Some("context_length_exceeded" | "request_too_large") => {
+    code.and_then(response_error_category_from_discriminator)
+        .or_else(|| error_type.and_then(response_error_category_from_discriminator))
+        .unwrap_or_else(|| {
+            status
+                .map(|status| ProviderErrorCategory::from_http_status(status, message))
+                .unwrap_or(ProviderErrorCategory::Other)
+        })
+}
+
+fn response_error_category_from_discriminator(
+    discriminator: &str,
+) -> Option<ProviderErrorCategory> {
+    let category = match discriminator {
+        "context_length_exceeded" | "request_too_large" => {
             ProviderErrorCategory::PromptTooLarge { tokens: None }
         }
-        Some("invalid_encrypted_content") => ProviderErrorCategory::InvalidEncryptedContent,
-        Some("invalid_request_error") => ProviderErrorCategory::InvalidRequest,
-        Some("authentication_error") => ProviderErrorCategory::Authentication,
-        Some(
-            "billing_error"
-            | "payment_required_error"
-            | "credit_balance_exhausted"
-            | "insufficient_quota"
-            | "organization_spend_limit_exceeded"
-            | "project_spend_limit_exceeded"
-            | "organization_usage_limit_exceeded",
-        ) => ProviderErrorCategory::PaymentRequired,
-        Some("permission_error") => ProviderErrorCategory::Permission,
-        Some("cyber_policy" | "invalid_prompt") => ProviderErrorCategory::ContentPolicy,
-        Some("not_found_error") => ProviderErrorCategory::EndpointNotFound,
-        Some("conflict_error") => ProviderErrorCategory::Conflict,
-        Some("rate_limit_error" | "rate_limit_exceeded") => ProviderErrorCategory::RateLimit,
-        Some("timeout_error" | "request_timed_out") => ProviderErrorCategory::Timeout,
-        Some("api_error" | "internal_server_error" | "server_error") => {
+        "invalid_encrypted_content" => ProviderErrorCategory::InvalidEncryptedContent,
+        "invalid_request_error" => ProviderErrorCategory::InvalidRequest,
+        "authentication_error" => ProviderErrorCategory::Authentication,
+        "billing_error"
+        | "payment_required_error"
+        | "credit_balance_exhausted"
+        | "insufficient_quota"
+        | "organization_spend_limit_exceeded"
+        | "project_spend_limit_exceeded"
+        | "organization_usage_limit_exceeded"
+        | "usage_limit_reached" => ProviderErrorCategory::PaymentRequired,
+        "permission_error" => ProviderErrorCategory::Permission,
+        "cyber_policy" | "invalid_prompt" => ProviderErrorCategory::ContentPolicy,
+        "not_found_error" => ProviderErrorCategory::EndpointNotFound,
+        "conflict_error" => ProviderErrorCategory::Conflict,
+        "rate_limit_error" | "rate_limit_exceeded" => ProviderErrorCategory::RateLimit,
+        "timeout_error" | "request_timed_out" => ProviderErrorCategory::Timeout,
+        "api_error" | "internal_server_error" | "server_error" => {
             ProviderErrorCategory::InternalServer
         }
-        Some("overloaded_error" | "server_is_overloaded" | "slow_down") => {
+        "overloaded_error" | "server_is_overloaded" | "slow_down" => {
             ProviderErrorCategory::Overloaded
         }
-        Some(_) | None => status
-            .map(|status| ProviderErrorCategory::from_http_status(status, message))
-            .unwrap_or(ProviderErrorCategory::Other),
-    }
+        _ => return None,
+    };
+    Some(category)
 }
 
 fn response_error_message(error: &ResponseError) -> String {
@@ -1818,6 +1837,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2004,6 +2024,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2105,6 +2126,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2190,6 +2212,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2256,6 +2279,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2302,6 +2326,7 @@ mod tests {
                 thinking_effort: None,
                 speed,
                 compact_at_tokens: None,
+                max_output_tokens: None,
             };
 
             let response = into_open_ai_response(
@@ -2354,6 +2379,7 @@ mod tests {
                 thinking_effort: None,
                 speed,
                 compact_at_tokens: None,
+                max_output_tokens: None,
             };
 
             let chat = into_open_ai(
@@ -2399,22 +2425,60 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
-        let chat = into_open_ai(
-            request,
-            "compatible-model",
-            false,
-            false,
-            Some(4096),
-            ChatCompletionMaxTokensParameter::MaxTokens,
-            None,
-            false,
-        )?;
+        for (requested, model_maximum, expected) in [
+            (None, None, None),
+            (None, Some(4096), Some(4096)),
+            (Some(1024), Some(4096), Some(1024)),
+            (Some(8192), Some(4096), Some(4096)),
+            (Some(1024), None, Some(1024)),
+        ] {
+            let mut request = request.clone();
+            request.max_output_tokens = requested;
+            for (parameter, field, absent_field) in [
+                (
+                    ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                    "max_completion_tokens",
+                    "max_tokens",
+                ),
+                (
+                    ChatCompletionMaxTokensParameter::MaxTokens,
+                    "max_tokens",
+                    "max_completion_tokens",
+                ),
+            ] {
+                let chat = into_open_ai(
+                    request.clone(),
+                    "compatible-model",
+                    false,
+                    false,
+                    model_maximum,
+                    parameter,
+                    None,
+                    false,
+                )?;
+                let serialized = serde_json::to_value(chat)?;
+                assert_eq!(serialized[field].as_u64(), expected);
+                assert!(serialized.get(absent_field).is_none());
+            }
 
-        let serialized = serde_json::to_value(&chat)?;
-        assert_eq!(serialized.get("max_completion_tokens"), None);
-        assert_eq!(serialized["max_tokens"], json!(4096));
+            let response = into_open_ai_response(
+                request,
+                "gpt-4.1",
+                false,
+                false,
+                model_maximum,
+                None,
+                false,
+                &language_model_core::OPEN_AI_PROVIDER_ID,
+            )?;
+            assert_eq!(
+                serde_json::to_value(response)?["max_output_tokens"].as_u64(),
+                expected
+            );
+        }
         Ok(())
     }
 
@@ -2438,6 +2502,7 @@ mod tests {
             thinking_effort: Some("high".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2479,6 +2544,7 @@ mod tests {
             thinking_effort: Some("none".into()),
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2532,6 +2598,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2624,6 +2691,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2714,6 +2782,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let response = into_open_ai_response(
@@ -2855,6 +2924,7 @@ mod tests {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
                     code: Some("server_error".into()),
+                    error_type: None,
                     message: "The model failed to generate a response.".into(),
                     param: None,
                 }),
@@ -2948,6 +3018,35 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_preserves_and_classifies_type_without_code() {
+        let event = serde_json::from_value::<ResponsesStreamEvent>(json!({
+            "type": "error",
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "plus"
+            }
+        }))
+        .expect("nested usage limit error event");
+
+        let mut mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID);
+        let mapped = mapper.map_event(event);
+
+        assert_eq!(mapped.len(), 1);
+        let error = mapped.into_iter().next().unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                code: Some(code),
+                message,
+                category: ProviderErrorCategory::PaymentRequired,
+                ..
+            } if code == "usage_limit_reached"
+                && message == "The usage limit has been reached"
+        ));
+    }
+
+    #[test]
     fn responses_stream_maps_billing_codes_to_payment_required() {
         for code in [
             "billing_error",
@@ -2959,7 +3058,7 @@ mod tests {
             "organization_usage_limit_exceeded",
         ] {
             assert_eq!(
-                response_error_category(Some(code), None, ""),
+                response_error_category(Some(code), None, None, ""),
                 ProviderErrorCategory::PaymentRequired,
                 "{code}"
             );
@@ -2967,9 +3066,22 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_uses_known_type_when_code_is_unknown() {
+        assert_eq!(
+            response_error_category(
+                Some("provider_specific_code"),
+                Some("usage_limit_reached"),
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                "",
+            ),
+            ProviderErrorCategory::PaymentRequired
+        );
+    }
+
+    #[test]
     fn responses_stream_maps_invalid_prompt_to_content_policy() {
         assert_eq!(
-            response_error_category(Some("invalid_prompt"), None, ""),
+            response_error_category(Some("invalid_prompt"), None, None, ""),
             ProviderErrorCategory::ContentPolicy
         );
     }
@@ -2978,7 +3090,7 @@ mod tests {
     fn responses_stream_maps_overload_codes_to_overloaded() {
         for code in ["overloaded_error", "server_is_overloaded", "slow_down"] {
             assert_eq!(
-                response_error_category(Some(code), None, ""),
+                response_error_category(Some(code), None, None, ""),
                 ProviderErrorCategory::Overloaded,
                 "{code}"
             );
@@ -3021,6 +3133,7 @@ mod tests {
                 status: Some("failed".into()),
                 error: Some(ResponseError {
                     code: Some("context_length_exceeded".into()),
+                    error_type: None,
                     message: "Your input exceeds the context window of this model.".into(),
                     param: Some("input".into()),
                 }),
@@ -3974,6 +4087,7 @@ mod tests {
             thinking_effort: None,
             speed: None,
             compact_at_tokens: None,
+            max_output_tokens: None,
         };
 
         let result = into_open_ai(

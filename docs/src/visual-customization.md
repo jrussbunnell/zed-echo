@@ -78,15 +78,17 @@ If you would like to use distinct themes for light mode/dark mode that can be se
   // and any other snippet of code.
   "agent_buffer_font_size": 12,
 
-  // Controls the font size for the markdown preview.
-  // If not specified, it falls back to the editor font size.
-  "markdown_preview_font_size": null,
-  // Controls the font family for the markdown preview.
-  // If not specified, it falls back to the UI font family.
-  "markdown_preview_font_family": null,
-  // Controls the font family for code blocks in the markdown preview.
-  // If not specified, it falls back to the editor font family.
-  "markdown_preview_code_font_family": null
+  "markdown_preview": {
+    // Controls the font size for the markdown preview.
+    // If not specified, it falls back to the editor font size.
+    "font_size": null,
+    // Controls the font family for the markdown preview.
+    // If not specified, it falls back to the UI font family.
+    "font_family": null,
+    // Controls the font family for code blocks in the markdown preview.
+    // If not specified, it falls back to the editor font family.
+    "code_font_family": null
+  }
 ```
 
 ### Font ligatures
@@ -368,7 +370,7 @@ TBD: Centered layout related settings
   "global_lsp_settings": {
     // Show/hide the LSP button in the status bar.
     // Activity from the LSP is still shown.
-    // Button is not shown if "enable_language_server" if false.
+    // Button is not shown if "enable_language_server" is false.
     "button": true
   },
 ```
@@ -521,7 +523,8 @@ Project panel can be shown/hidden with {#action project_panel::ToggleFocus} ({#k
     "enabled": true, // Enable/disable the agent
     "button": true, // Show/hide the icon in the status bar
     "dock": "right", // Where to dock: left, right, bottom
-    "default_width": 640, // Default width (left/right docked)
+    "flexible": true, // Use proportional sizing (left/right docked)
+    "default_width": 640, // Fixed width when flexible is false
     "default_height": 320 // Default height (bottom docked)
   },
   // Controls the font family and size for agent responses in the agent panel.
@@ -535,6 +538,8 @@ Project panel can be shown/hidden with {#action project_panel::ToggleFocus} ({#k
   "agent_buffer_font_size": 12
 }
 ```
+
+When `agent.flexible` is enabled, `agent.default_width` does not control the panel width. Double-clicking the panel’s outer resize handle restores the default proportion. Set `agent.flexible` to `false` to use `agent.default_width` as the reset width.
 
 See [Zed AI Documentation](./ai/overview.md) for additional non-visual AI settings.
 

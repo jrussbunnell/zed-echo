@@ -500,6 +500,10 @@ pub struct ToolCallFacts {
     /// [`Self::awaiting_input`].
     pub input: ToolCallInput,
     pub outcome: ToolCallOutcome,
+    /// Whether the agent gave the call a title. An untitled call's label is a
+    /// display placeholder ("Tool call", or the tool's name), which must not
+    /// be spoken as if the agent had written it.
+    pub titled: bool,
 }
 
 impl ToolCallFacts {
@@ -518,6 +522,17 @@ impl ToolCallFacts {
             output: None,
             input: ToolCallInput::default(),
             outcome: ToolCallOutcome::default(),
+            titled: true,
+        }
+    }
+
+    /// The label as narration should treat it: empty when the agent gave no
+    /// title.
+    fn spoken_label(&self, cx: &App) -> String {
+        if self.titled {
+            self.label.read(cx).source().trim().to_string()
+        } else {
+            String::new()
         }
     }
 
@@ -549,7 +564,7 @@ impl ToolCallFacts {
     /// watches for quiescence. Comparing titles is what made several distinct
     /// commands sharing one generic title collapse into a single utterance.
     pub fn spoken_key(&self, cx: &App) -> String {
-        let label = self.label.read(cx).source().trim().to_string();
+        let label = self.spoken_label(cx);
         match tool_call_target(
             self.kind,
             self.stated_purpose().as_deref(),
@@ -575,7 +590,7 @@ impl ToolCallFacts {
     /// heredoc scripts. Two dozen of those would be tens of kilobytes of
     /// prompt on a path that has a two-second race to lose.
     pub fn description(&self, cx: &App) -> String {
-        let label = self.label.read(cx).source().trim().to_string();
+        let label = self.spoken_label(cx);
         // The agent's own statement of purpose is strictly better prompt
         // input than the command that implements it: it is shorter, it is
         // about intent, and it does not spend the prompt on a heredoc. For
@@ -716,7 +731,7 @@ impl ToolCallFacts {
         if self.kind != NarrationKind::Execute {
             return false;
         }
-        let label = self.label.read(cx).source().trim().to_string();
+        let label = self.spoken_label(cx);
         match tool_call_target(
             self.kind,
             self.stated_purpose().as_deref(),
@@ -921,7 +936,7 @@ impl NarrationQueue {
     /// continuation state (`last_tool_key`, `last_tool_kind`) is left
     /// untouched so the next real call still reads as the first of its run.
     pub fn push_tool_call(&mut self, facts: ToolCallFacts, cx: &mut App) -> bool {
-        let label = facts.label.read(cx).source().trim().to_string();
+        let label = facts.spoken_label(cx);
         let kind = facts.kind;
         let key = facts.heard_key(cx);
         if key.trim().is_empty()
@@ -1811,7 +1826,7 @@ pub fn files_changed<'a>(
         }
         let named = match facts.path.as_deref().map(str::trim) {
             Some(path) if !path.is_empty() => path.to_string(),
-            _ => facts.label.read(cx).source().trim().to_string(),
+            _ => facts.spoken_label(cx),
         };
         let file: String = named.chars().take(MAX_ACTION_CHARS).collect();
         if !file.is_empty() && !files.contains(&file) {
