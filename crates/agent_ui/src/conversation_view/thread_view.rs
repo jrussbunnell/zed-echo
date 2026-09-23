@@ -998,6 +998,7 @@ impl read_aloud::SummaryModel for ReadAloudSummaryModel {
                 speed: None,
                 compact_at_tokens: None,
                 max_output_tokens: None,
+                prompt_cache_key: None,
             };
             let mut completion = model.stream_completion_text(request, cx).await?;
             let mut summary = String::new();
@@ -1957,7 +1958,7 @@ impl ThreadView {
             .iter()
             .rev()
             .find_map(|chunk| match chunk {
-                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
+                AssistantMessageChunk::Message { block, .. } => block.markdowns().last().cloned(),
                 // Thinking is deliberately never spoken.
                 AssistantMessageChunk::Thought { .. } => None,
             })
@@ -3008,9 +3009,11 @@ impl ThreadView {
         message
             .chunks
             .iter()
-            .filter_map(|chunk| match chunk {
-                AssistantMessageChunk::Message { block, .. } => block.markdown().cloned(),
-                AssistantMessageChunk::Thought { .. } => None,
+            .flat_map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } => {
+                    block.markdowns().cloned().collect()
+                }
+                AssistantMessageChunk::Thought { .. } => Vec::new(),
             })
             .filter(|markdown| !markdown.read(cx).source().trim().is_empty())
             .collect()
@@ -8930,40 +8933,31 @@ impl ThreadView {
                     .children(chunks.iter().enumerate().filter_map(
                         |(chunk_ix, chunk)| match chunk {
                             AssistantMessageChunk::Message { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-
-                                    Some(
-                                        self.render_speakable_markdown(
-                                            md.clone(),
+                                let this_is_blank = !block.visible_content(cx);
+                                is_blank = is_blank && this_is_blank;
+                                (!this_is_blank).then(|| {
+                                    div()
+                                        .id(("assistant-message-chunk", chunk_ix))
+                                        .child(self.render_message_content(
+                                            entry_ix,
+                                            chunk_ix,
+                                            block,
                                             style.clone(),
+                                            true,
+                                            window,
                                             cx,
-                                        )
-                                        .into_any_element(),
-                                    )
+                                        ))
+                                        .into_any_element()
                                 })
                             }
                             AssistantMessageChunk::Thought { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-                                    Some(
-                                        self.render_thinking_block(
-                                            entry_ix,
-                                            chunk_ix,
-                                            md.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .into_any_element(),
+                                let this_is_blank = !block.visible_content(cx);
+                                is_blank = is_blank && this_is_blank;
+                                (!this_is_blank).then(|| {
+                                    self.render_thinking_block(
+                                        entry_ix, chunk_ix, block, window, cx,
                                     )
+                                    .into_any_element()
                                 })
                             }
                         },
@@ -8981,7 +8975,7 @@ impl ThreadView {
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
-                        .child(self.render_message_context_menu(entry_ix, message_body, cx))
+                        .child(message_body)
                         .when_some(
                             self.entry_view_state
                                 .read(cx)
@@ -10074,11 +10068,54 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn render_message_content(
+        &self,
+        entry_ix: usize,
+        chunk_ix: usize,
+        content: &acp_thread::MessageContent,
+        markdown_style: MarkdownStyle,
+        speakable: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        v_flex().w_full().gap_3().children(
+            content
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.visible_content(cx))
+                .map(|(block_ix, block)| {
+                    let content = match block.markdown() {
+                        Some(markdown) if speakable => self
+                            .render_speakable_markdown(markdown.clone(), markdown_style.clone(), cx)
+                            .into_any(),
+                        Some(markdown) => self
+                            .render_markdown(markdown.clone(), markdown_style.clone(), cx)
+                            .into_any(),
+                        None => self.render_output_content_block(
+                            entry_ix, block_ix, block, None, false, window, cx,
+                        ),
+                    };
+                    div()
+                        .id(("message-content-block", block_ix))
+                        .debug_selector(move || {
+                            format!("message-content-{entry_ix}-{chunk_ix}-{block_ix}")
+                        })
+                        .child(self.render_message_context_menu(
+                            entry_ix,
+                            block.markdown().cloned(),
+                            content,
+                            cx,
+                        ))
+                }),
+        )
+    }
+
     fn render_thinking_block(
         &self,
         entry_ix: usize,
         chunk_ix: usize,
-        chunk: Entity<Markdown>,
+        chunk: &acp_thread::MessageContent,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -10103,6 +10140,7 @@ impl ThreadView {
         let panel_bg = cx.theme().colors().panel_background;
 
         v_flex()
+            .id(("thinking-block", chunk_ix))
             .gap_1()
             .child(
                 h_flex()
@@ -10140,7 +10178,10 @@ impl ThreadView {
                     )
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         this.toggle_thinking_block_expansion(key, window, cx);
-                    })),
+                    }))
+                    .map(|header| {
+                        self.render_message_context_menu(entry_ix, None, header.into_any(), cx)
+                    }),
             )
             .when(is_open, |this| {
                 this.child(
@@ -10158,7 +10199,9 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(self.render_markdown(
+                                .child(self.render_message_content(
+                                    entry_ix,
+                                    chunk_ix,
                                     chunk,
                                     {
                                         let mut style =
@@ -10168,6 +10211,8 @@ impl ThreadView {
                                             .apply_to_markdown_style(&mut style);
                                         style
                                     },
+                                    false,
+                                    window,
                                     cx,
                                 )),
                         )
@@ -10193,6 +10238,7 @@ impl ThreadView {
     fn render_message_context_menu(
         &self,
         entry_ix: usize,
+        markdown: Option<Entity<Markdown>>,
         message_body: AnyElement,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -10205,51 +10251,18 @@ impl ThreadView {
                 let focus = window.focused(cx);
                 let entity = entity.clone();
                 let workspace = workspace.clone();
+                let markdown = markdown.clone();
 
                 ContextMenu::build(window, cx, move |menu, _, cx| {
                     let this = entity.read(cx);
                     let is_at_top = this.list_state.logical_scroll_top().item_ix == 0;
-
-                    let chunks =
-                        this.thread.read(cx).entries().get(entry_ix).and_then(
-                            |entry| match &entry {
-                                AgentThreadEntry::AssistantMessage(msg) => Some(&msg.chunks),
-                                _ => None,
-                            },
-                        );
-
-                    let context_menu_link = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let markdown = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            markdown
-                                .and_then(|markdown| markdown.read(cx).context_menu_link().cloned())
-                        })
-                    });
-                    let selected_text = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let markdown = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            markdown.and_then(|markdown| {
-                                markdown.read(cx).context_menu_selected_text().cloned()
-                            })
-                        })
-                    });
-                    let selected_markdown = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let markdown = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            markdown.and_then(|markdown| {
-                                markdown.read(cx).context_menu_selected_markdown().cloned()
-                            })
-                        })
-                    });
+                    let markdown = markdown.as_ref().map(|markdown| markdown.read(cx));
+                    let context_menu_link =
+                        markdown.and_then(|markdown| markdown.context_menu_link().cloned());
+                    let selected_text = markdown
+                        .and_then(|markdown| markdown.context_menu_selected_text().cloned());
+                    let selected_markdown = markdown
+                        .and_then(|markdown| markdown.context_menu_selected_markdown().cloned());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -10369,7 +10382,7 @@ impl ThreadView {
                                 if markdown.trim().is_empty() {
                                     None
                                 } else {
-                                    Some(markdown.to_string())
+                                    Some(markdown)
                                 }
                             }
                             AssistantMessageChunk::Thought { .. } => None,
@@ -10534,7 +10547,13 @@ impl ThreadView {
         let output_line_count = output.map(|output| output.content_line_count).unwrap_or(0);
 
         let command_failed = command_finished
-            && output.is_some_and(|o| o.exit_status.is_some_and(|status| !status.success()));
+            && output.is_some_and(|output| {
+                output
+                    .exit_status
+                    .exit_code
+                    .is_some_and(|exit_code| exit_code != 0)
+                    || output.exit_status.signal.is_some()
+            });
 
         let time_elapsed = if let Some(output) = output {
             output.ended_at.duration_since(started_at)
@@ -10605,26 +10624,24 @@ impl ThreadView {
                 cx.notify();
             }
         }))
-        .on_stop({
-            let terminal = terminal.clone();
-            cx.listener(move |this, _event, _window, cx| {
-                terminal.update(cx, |terminal, cx| {
-                    terminal.stop_by_user(cx);
-                });
-                if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
-                    this.cancel_generation(cx);
-                }
+        .when(terminal_data.is_process_backed(), |header| {
+            header.on_stop({
+                let terminal = terminal.clone();
+                cx.listener(move |this, _event, _window, cx| {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.stop_by_user(cx);
+                    });
+                    if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
+                        this.cancel_generation(cx);
+                    }
+                })
             })
         })
         .when_some(truncated_tooltip, |header, tooltip| {
             header.truncated(tooltip)
         })
         .when(tool_failed || command_failed, |header| {
-            header.failed(
-                output
-                    .and_then(|o| o.exit_status)
-                    .map(|status| status.code().unwrap_or(-1)),
-            )
+            header.failed(output.and_then(|output| output.exit_status.exit_code))
         })
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
@@ -13214,6 +13231,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         v_flex()
+            .debug_selector(|| "agent-output-image".into())
             .gap_2()
             .map(|this| {
                 if card_layout {
@@ -13345,6 +13363,13 @@ impl ThreadView {
                 _ => false,
             });
 
+        let model_name = thread_view
+            .and_then(|view| view.read(cx).as_native_thread(cx))
+            .and_then(|thread| {
+                let thread = thread.read(cx);
+                let model = thread.model()?;
+                Some(model.name().0)
+            });
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -13446,33 +13471,64 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .min_w_0()
-                                    .w_full()
+                                    .flex_1()
                                     .gap_1p5()
-                                    .child(icon)
+                                    .justify_between()
                                     .child(
-                                        Label::new(title.to_string())
-                                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                                            .truncate(),
+                                        h_flex()
+                                            .min_w_0()
+                                            .flex_initial()
+                                            .gap_1p5()
+                                            .child(icon)
+                                            .child(
+                                                Label::new(title.to_string())
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .flex_1()
+                                                    .truncate(),
+                                            )
+                                            .when_some(model_name, |this, model_name| {
+                                                this.child(
+                                                    Label::new(format!("· {model_name}"))
+                                                        .size(LabelSize::Custom(
+                                                            self.tool_name_font_size(),
+                                                        ))
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                )
+                                            }),
                                     )
                                     .when(files_changed > 0, |this| {
                                         this.child(
-                                            Label::new(format!(
-                                                "— {} {} changed",
-                                                files_changed,
-                                                if files_changed == 1 { "file" } else { "files" }
-                                            ))
-                                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            DiffStat::new(
-                                                diff_stat_id.clone(),
-                                                diff_stats.lines_added as usize,
-                                                diff_stats.lines_removed as usize,
-                                            )
-                                            .label_size(LabelSize::Custom(
-                                                self.tool_name_font_size(),
-                                            )),
+                                            h_flex()
+                                                .flex_none()
+                                                .gap_1p5()
+                                                .child(
+                                                    Label::new(format!(
+                                                        "— {} {} changed",
+                                                        files_changed,
+                                                        if files_changed == 1 {
+                                                            "file"
+                                                        } else {
+                                                            "files"
+                                                        }
+                                                    ))
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    DiffStat::new(
+                                                        diff_stat_id.clone(),
+                                                        diff_stats.lines_added as usize,
+                                                        diff_stats.lines_removed as usize,
+                                                    )
+                                                    .label_size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    )),
+                                                ),
                                         )
                                     }),
                             )

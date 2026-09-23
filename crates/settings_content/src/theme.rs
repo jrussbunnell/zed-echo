@@ -1371,6 +1371,8 @@ pub enum WindowBackgroundContent {
     Opaque,
     Transparent,
     Blurred,
+    MicaBackdrop,
+    MicaAltBackdrop,
 }
 
 /// The material used to blur what is behind the window, for themes whose
