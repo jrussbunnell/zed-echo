@@ -334,11 +334,21 @@ impl DerivedSubagents {
         self.thread(session_id)
     }
 
-    /// Drops everything derived from `parent_session_id`, for when that session
-    /// goes away.
-    fn remove_children_of(&mut self, parent_session_id: &acp::SessionId) {
+    /// Drops everything derived from `parent_session_id`, transitively, for
+    /// when that session goes away. A nested subagent's parent is itself
+    /// derived and never gets a release of its own to clean up after it.
+    fn remove_descendants_of(&mut self, parent_session_id: &acp::SessionId) {
         let Self { sessions, owners } = self;
-        sessions.retain(|_, session| &session.parent_session_id != parent_session_id);
+        let mut orphaned = vec![parent_session_id.clone()];
+        while let Some(parent_session_id) = orphaned.pop() {
+            sessions.retain(|session_id, session| {
+                let is_child = session.parent_session_id == parent_session_id;
+                if is_child {
+                    orphaned.push(session_id.clone());
+                }
+                !is_child
+            });
+        }
         owners.retain(|_, session_id| sessions.contains_key(session_id));
     }
 }
@@ -1254,7 +1264,7 @@ impl AcpConnection {
                 // must go with the parent or they'd outlive it.
                 derived_subagents
                     .borrow_mut()
-                    .remove_children_of(&session_id);
+                    .remove_descendants_of(&session_id);
                 let removed = {
                     let mut sessions = sessions.borrow_mut();
                     match sessions.get(&session_id) {
@@ -4539,6 +4549,61 @@ mod tests {
             assert_eq!(inner_thread.parent_session_id(), Some(&outer));
             assert!(inner_thread.to_markdown(cx).contains("inner work"));
         });
+    }
+
+    #[gpui::test]
+    async fn test_dropping_the_root_thread_drops_nested_subagents(cx: &mut gpui::TestAppContext) {
+        let (connection, project, _load_count, _close_count, updates, _gate, _keep_alive) =
+            connect_fake_agent(cx).await;
+
+        let session_id = acp::SessionId::new("session-1");
+        let parent = replay_updates(
+            &connection,
+            &project,
+            &updates,
+            &session_id,
+            vec![
+                acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+                    acp::ToolCallId::new("task-1"),
+                    "Outer subagent",
+                )),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(acp::ToolCallId::new("task-2"), "Inner subagent")
+                        .meta(owned_by_subagent("task-1")),
+                ),
+                acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new("inner work".into()).meta(owned_by_subagent("task-2")),
+                ),
+            ],
+            cx,
+        )
+        .await;
+
+        let outer =
+            acp_thread::derived_subagent_session_id(&session_id, &acp::ToolCallId::new("task-1"));
+        let inner =
+            acp_thread::derived_subagent_session_id(&outer, &acp::ToolCallId::new("task-2"));
+        for derived_session_id in [&outer, &inner] {
+            assert!(
+                cx.update(|cx| connection.local_session_thread(derived_session_id, cx))
+                    .is_some()
+            );
+        }
+
+        drop(parent);
+        // Releases are processed when an update's effects flush.
+        cx.update(|_| {});
+        cx.run_until_parked();
+
+        // The connection is the only owner of a derived thread, and each one
+        // holds the project, so one that survives its root leaks the project.
+        for derived_session_id in [&outer, &inner] {
+            assert!(
+                cx.update(|cx| connection.local_session_thread(derived_session_id, cx))
+                    .is_none(),
+                "{derived_session_id:?} should be dropped along with the root thread"
+            );
+        }
     }
 
     #[gpui::test]
