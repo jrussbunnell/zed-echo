@@ -13,4 +13,28 @@
     "allow_concurrent_runs": true,
     "use_new_terminal": false,
   },
+  {
+    "label": "github: switch to jrussbunnell (personal)",
+    "command": "(gh auth switch --hostname github.com --user jrussbunnell || gh auth login --hostname github.com --git-protocol https --web) && git config --local --replace-all credential.https://github.com.helper '' && git config --local --add credential.https://github.com.helper '!gh auth git-credential' && git config --local user.name jrussbunnell && git config --local user.email joshua.r.bunnell@gmail.com && gh auth status --active && git config --local user.email",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "reveal": "always",
+  },
+  {
+    "label": "github: switch to joshuaatryse (work)",
+    "command": "(gh auth switch --hostname github.com --user joshuaatryse || gh auth login --hostname github.com --git-protocol https --web) && git config --local --replace-all credential.https://github.com.helper '' && git config --local --add credential.https://github.com.helper '!gh auth git-credential' && git config --local user.name joshuaatryse && git config --local user.email joshua@rysemarket.com && gh auth status --active && git config --local user.email",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "reveal": "always",
+  },
+  {
+    "label": "github: show active account",
+    "command": "gh auth status --active; echo; echo \"git user: $(git config user.name) <$(git config user.email)>\"",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": true,
+    "use_new_terminal": false,
+    "reveal": "always",
+  },
 ]
