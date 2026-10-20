@@ -4656,7 +4656,7 @@ fn record_spawn_tool_call(
     tool_call_id: &str,
     title: &str,
     subagent_session_id: &acp::SessionId,
-    status: acp::ToolCallStatus,
+    status: acp_v1::ToolCallStatus,
     cx: &mut gpui::VisualTestContext,
 ) {
     let session_info = acp_thread::SubagentSessionInfo {
@@ -4668,9 +4668,9 @@ fn record_spawn_tool_call(
         parent_thread.update(cx, |thread, cx| {
             thread
                 .upsert_tool_call(
-                    acp::ToolCall::new(acp::ToolCallId::new(tool_call_id), title)
+                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new(tool_call_id), title)
                         .status(status)
-                        .meta(acp::Meta::from_iter([(
+                        .meta(acp_v1::Meta::from_iter([(
                             acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
                             serde_json::json!(&session_info),
                         )])),
@@ -4704,8 +4704,8 @@ async fn test_sidebar_toggles_subagent_rows_under_their_parent(cx: &mut TestAppC
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
 
     let connection = StubAgentConnection::new().with_supports_load_session(true);
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done".into()),
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
     )]);
     open_thread_with_connection(&panel, connection, cx);
     send_message(&panel, cx);
@@ -4720,7 +4720,7 @@ async fn test_sidebar_toggles_subagent_rows_under_their_parent(cx: &mut TestAppC
         "spawn-1",
         "Research alternatives",
         &subagent_session_id,
-        acp::ToolCallStatus::InProgress,
+        acp_v1::ToolCallStatus::InProgress,
         cx,
     );
 
@@ -4814,8 +4814,8 @@ async fn test_clicking_the_parent_row_leaves_the_subagent(cx: &mut TestAppContex
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
 
     let connection = StubAgentConnection::new().with_supports_load_session(true);
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done".into()),
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
     )]);
     open_thread_with_connection(&panel, connection.clone(), cx);
     send_message(&panel, cx);
@@ -4897,8 +4897,8 @@ async fn test_sidebar_subagent_rows_follow_the_spawn_tool_call_status(cx: &mut T
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
 
     let connection = StubAgentConnection::new().with_supports_load_session(true);
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-        acp::ContentChunk::new("Done".into()),
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
     )]);
     open_thread_with_connection(&panel, connection, cx);
     send_message(&panel, cx);
@@ -4913,7 +4913,7 @@ async fn test_sidebar_subagent_rows_follow_the_spawn_tool_call_status(cx: &mut T
         "spawn-1",
         "Research alternatives",
         &subagent_session_id,
-        acp::ToolCallStatus::InProgress,
+        acp_v1::ToolCallStatus::InProgress,
         cx,
     );
 
@@ -4944,7 +4944,7 @@ async fn test_sidebar_subagent_rows_follow_the_spawn_tool_call_status(cx: &mut T
         "spawn-1",
         "Research alternatives",
         &subagent_session_id,
-        acp::ToolCallStatus::Completed,
+        acp_v1::ToolCallStatus::Completed,
         cx,
     );
 
