@@ -8,7 +8,7 @@
 //! Ranking is pure over a snapshot so it can be tested without building a
 //! panel; the caller assembles the snapshot from the live conversation views.
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use std::time::Instant;
 
 /// One thread's standing at the moment a spoken command lands.

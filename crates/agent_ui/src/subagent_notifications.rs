@@ -20,7 +20,7 @@
 //! `<parent>/subagent/<tool call id>` — the same tool call id the notification
 //! names.
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;

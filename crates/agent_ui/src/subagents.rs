@@ -1,5 +1,5 @@
 use acp_thread::{AcpThread, ToolCallStatus};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use gpui::{App, Entity, SharedString};
 use ui::{Color, IconName};
 
@@ -166,9 +166,12 @@ impl SubagentSummary {
                 ToolCallStatus::Completed => SubagentStatus::Completed,
                 ToolCallStatus::Pending
                 | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation { .. } => match subagent_thread {
+                | ToolCallStatus::WaitingForConfirmation => match subagent_thread {
                     Some(thread) => match thread.read(cx).status() {
-                        acp_thread::ThreadStatus::Generating => SubagentStatus::Running,
+                        // Unconfirmed means the agent has not yet reported
+                        // whether a turn is running; treat it as still working.
+                        acp_thread::ThreadStatus::Generating
+                        | acp_thread::ThreadStatus::Unconfirmed => SubagentStatus::Running,
                         acp_thread::ThreadStatus::Idle => {
                             if thread.read(cx).had_error() {
                                 SubagentStatus::Failed

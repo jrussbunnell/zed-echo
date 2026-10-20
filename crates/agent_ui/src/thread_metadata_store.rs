@@ -5,7 +5,8 @@ use std::{
 };
 
 use agent::{ThreadStore, ZED_AGENT_ID};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v1 as acp_v1;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
@@ -26,7 +27,7 @@ pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
-use util::ResultExt as _;
+use util::{ResultExt as _, paths::PathStyle};
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
@@ -386,7 +387,8 @@ pub fn worktree_info_from_thread_paths<S: std::hash::BuildHasher>(
         let is_linked = main_path != folder_path;
 
         if is_linked {
-            let short_name = linked_worktree_short_name(main_path, folder_path).unwrap_or_default();
+            let short_name = linked_worktree_short_name(main_path, folder_path, PathStyle::local())
+                .unwrap_or_default();
             let project_name = main_path
                 .file_name()
                 .map(|n| SharedString::from(n.to_string_lossy().to_string()))
@@ -666,7 +668,7 @@ impl acp_thread::SubagentTranscriptStore for SubagentTranscripts {
         &self,
         session_id: &acp::SessionId,
         parent_session_id: &acp::SessionId,
-        update: &acp::SessionUpdate,
+        update: &acp_v1::SessionUpdate,
     ) {
         let update_json = match serde_json::to_string(update) {
             Ok(update_json) => update_json,
@@ -688,7 +690,7 @@ impl acp_thread::SubagentTranscriptStore for SubagentTranscripts {
         &self,
         session_id: &acp::SessionId,
         cx: &mut App,
-    ) -> Task<anyhow::Result<Vec<acp::SessionUpdate>>> {
+    ) -> Task<anyhow::Result<Vec<acp_v1::SessionUpdate>>> {
         let db = self.db.clone();
         let session_id = session_id.0.to_string();
         cx.background_spawn(async move {
@@ -2139,7 +2141,7 @@ mod tests {
     use acp_thread::StubAgentConnection;
     use action_log::ActionLog;
     use agent::DbThread;
-    use agent_client_protocol::schema::v1 as acp;
+    use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp};
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use project::Project;
@@ -2259,6 +2261,52 @@ mod tests {
         metadata.title_override = None;
         assert_eq!(metadata.title().as_deref(), Some("Agent Generated Title"));
         assert_eq!(metadata.display_title().as_ref(), "Agent Generated Title");
+    }
+
+    #[gpui::test]
+    async fn test_database_preserves_legacy_session_ids(_cx: &mut TestAppContext) {
+        let legacy_session_id = acp_v1::SessionId::new("legacy/session:opaque-☃");
+        let thread_id = ThreadId::new();
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            "THREAD_METADATA_DB_LEGACY_SESSION_IDS",
+        )));
+
+        db.write({
+            let session_id = legacy_session_id.0.clone();
+            move |connection| {
+                connection.exec_bound::<(ThreadId, Arc<str>)>(
+                    "INSERT INTO sidebar_threads \
+                     (thread_id, session_id, title, updated_at, archived) \
+                     VALUES (?1, ?2, 'Legacy thread', '2025-01-15T10:00:00Z', 0)",
+                )?((thread_id, session_id))
+            }
+        })
+        .await
+        .expect("legacy session should be stored as plain text");
+
+        let mut metadata = db
+            .list()
+            .expect("legacy metadata should load")
+            .pop()
+            .expect("legacy thread should exist");
+        assert_eq!(
+            metadata.session_id,
+            Some(acp::SessionId::new(legacy_session_id.0.clone()))
+        );
+        assert_eq!(metadata.thread_id, thread_id);
+
+        metadata.title_override = Some("Renamed legacy thread".into());
+        db.save(metadata)
+            .await
+            .expect("v2 session metadata should save");
+        let stored_session_id = db
+            .select_row_bound::<ThreadId, Arc<str>>(
+                "SELECT session_id FROM sidebar_threads WHERE thread_id = ?1",
+            )
+            .expect("session ID query should prepare")(thread_id)
+        .expect("session ID query should succeed")
+        .expect("stored session ID should exist");
+        assert_eq!(acp_v1::SessionId::new(stored_session_id), legacy_session_id);
     }
 
     #[gpui::test]
@@ -4009,8 +4057,8 @@ mod tests {
             store.append(
                 &session_id,
                 &parent_session_id,
-                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::from(text.to_string()),
+                &acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    acp_v1::ContentBlock::from(text.to_string()),
                 )),
             );
         }
@@ -4031,8 +4079,8 @@ mod tests {
         let recovered: Vec<String> = loaded
             .iter()
             .filter_map(|update| match update {
-                acp::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
-                    acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                acp_v1::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    acp_v1::ContentBlock::Text(text) => Some(text.text.clone()),
                     _ => None,
                 },
                 _ => None,
@@ -4071,8 +4119,8 @@ mod tests {
                 store.append(
                     &acp::SessionId::new("parent/subagent/tool-1"),
                     &acp::SessionId::new("parent"),
-                    &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                        acp::ContentBlock::from(text.to_string()),
+                    &acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        acp_v1::ContentBlock::from(text.to_string()),
                     )),
                 );
                 store
@@ -4094,8 +4142,8 @@ mod tests {
         let texts: Vec<String> = loaded
             .iter()
             .filter_map(|update| match update {
-                acp::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
-                    acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                acp_v1::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    acp_v1::ContentBlock::Text(text) => Some(text.text.clone()),
                     _ => None,
                 },
                 _ => None,
@@ -4152,8 +4200,8 @@ mod tests {
             store.append(
                 session,
                 &parent,
-                &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::from("work".to_string()),
+                &acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    acp_v1::ContentBlock::from("work".to_string()),
                 )),
             );
         }
@@ -4201,8 +4249,8 @@ mod tests {
         store.append(
             &session_id,
             &acp::SessionId::new("parent"),
-            &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                acp::ContentBlock::from("irreplaceable".to_string()),
+            &acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                acp_v1::ContentBlock::from("irreplaceable".to_string()),
             )),
         );
         cx.run_until_parked();
