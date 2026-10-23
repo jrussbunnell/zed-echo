@@ -1,10 +1,10 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
-    enqueue_request, first_class_terminal_auth_task, handle_v2_complete_elicitation,
-    handle_v2_create_elicitation, map_acp_error, mcp_configurations_for_project, respond_err,
-    respond_result, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    ForegroundWork, UnsupportedVersion, apply_subagent_update, drain_foreground_queue,
+    enqueue_notification, enqueue_request, first_class_terminal_auth_task,
+    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
+    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
+    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -67,9 +67,9 @@ const STEER_METHOD: &str = "_session/steering";
 ///
 /// Agents that run subagents as child sessions of their own (the ACP subagents
 /// RFD, which Claude Code speaks once the client advertises
-/// `clientCapabilities.subagents`) are held here too, keyed by the child's
-/// session id. Their updates arrive addressed to that id, so they need none of
-/// the tag-based routing, and the child can be cancelled on its own.
+/// `clientCapabilities.subagents`) get threads the way upstream routes them;
+/// `native_children` only tracks which parent tool call each one's card
+/// belongs on, and keeps the tag-based routing out of their traffic.
 #[derive(Default)]
 pub(super) struct DerivedSubagents {
     sessions: HashMap<acp_v2::SessionId, DerivedSubagentSession>,
@@ -77,6 +77,16 @@ pub(super) struct DerivedSubagents {
     /// the tool call and the *parent* session, so this is what lets the prompt
     /// be attributed to the subagent that actually raised it.
     owners: HashMap<acp_v2::ToolCallId, acp_v2::SessionId>,
+    native_children: HashMap<acp_v2::SessionId, NativeChild>,
+}
+
+struct NativeChild {
+    parent_session_id: acp_v2::SessionId,
+    /// The parent's tool call that delegated to the child, learned from the
+    /// first message the parent sends it.
+    spawning_tool_call_id: Option<acp_v2::ToolCallId>,
+    /// Whether that tool call has been stamped as the child's card.
+    announced: bool,
 }
 
 struct DerivedSubagentSession {
@@ -90,13 +100,6 @@ struct DerivedSubagentSession {
     /// exist in the parent thread, which the first subagent update does not
     /// guarantee, so it is retried until it lands.
     announced: bool,
-    /// Whether the agent announced this child as a session of its own, which
-    /// it accepts `session/cancel` for without cancelling the parent.
-    native: bool,
-    /// The parent's tool call that delegated to a native child, learned from
-    /// the first message the parent sends it. A derived subagent's session id
-    /// already encodes it.
-    spawning_tool_call_id: Option<acp_v2::ToolCallId>,
 }
 
 impl DerivedSubagents {
@@ -104,22 +107,17 @@ impl DerivedSubagents {
         self.sessions.get(session_id).map(|session| &session.thread)
     }
 
-    fn is_native(&self, session_id: &acp_v2::SessionId) -> bool {
-        self.sessions
-            .get(session_id)
-            .is_some_and(|session| session.native)
-    }
-
     /// The session a `session/cancel` for `session_id` has to name.
     ///
     /// A derived subagent has no session the agent knows about, so only
-    /// cancelling the turn it runs inside stops it. A native child is cancelled
-    /// by its own id, which stops it alone.
+    /// cancelling the turn it runs inside stops it. Any other session, an ACP
+    /// subagent session included, is cancelled by its own id, which stops it
+    /// alone.
     fn cancel_target(&self, session_id: &acp_v2::SessionId) -> acp_v2::SessionId {
-        match self.sessions.get(session_id) {
-            Some(session) if !session.native => session.parent_session_id.clone(),
-            _ => session_id.clone(),
-        }
+        self.sessions
+            .get(session_id)
+            .map(|session| session.parent_session_id.clone())
+            .unwrap_or_else(|| session_id.clone())
     }
 
     fn owner_of_tool_call(&self, tool_call_id: &acp_v2::ToolCallId) -> Option<&Entity<AcpThread>> {
@@ -131,7 +129,11 @@ impl DerivedSubagents {
     /// when that session goes away. A nested subagent's parent is itself
     /// derived and never gets a release of its own to clean up after it.
     fn remove_descendants_of(&mut self, parent_session_id: &acp_v2::SessionId) {
-        let Self { sessions, owners } = self;
+        let Self {
+            sessions,
+            owners,
+            native_children,
+        } = self;
         let mut orphaned = vec![parent_session_id.clone()];
         while let Some(parent_session_id) = orphaned.pop() {
             sessions.retain(|session_id, session| {
@@ -143,6 +145,16 @@ impl DerivedSubagents {
             });
         }
         owners.retain(|_, session_id| sessions.contains_key(session_id));
+        let mut orphaned = vec![parent_session_id.clone()];
+        while let Some(parent_session_id) = orphaned.pop() {
+            native_children.retain(|session_id, child| {
+                let is_child = child.parent_session_id == parent_session_id;
+                if is_child {
+                    orphaned.push(session_id.clone());
+                }
+                !is_child
+            });
+        }
     }
 }
 
@@ -640,6 +652,7 @@ impl AcpConnection {
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let client_capabilities = client_capabilities_for_agent(&agent_id);
 
         let derived_subagents: Rc<RefCell<DerivedSubagents>> = Rc::default();
         let dispatch_context = ClientContext {
@@ -649,6 +662,7 @@ impl AcpConnection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            accepts_subagent_updates: client_capabilities.subagents.is_some(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -703,7 +717,7 @@ impl AcpConnection {
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(&agent_id))
+                    .client_capabilities(client_capabilities)
                     .client_info(
                         acp::Implementation::new("zed", version)
                             .title(release_channel.map(ToOwned::to_owned)),
@@ -1663,8 +1677,6 @@ impl AgentConnection for AcpConnection {
                 // The client re-stamped the spawning tool call while restoring;
                 // announcing again would emit a second card for it.
                 announced: true,
-                native: false,
-                spawning_tool_call_id: None,
             },
         );
     }
@@ -2419,6 +2431,7 @@ pub mod test_support {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            accepts_subagent_updates: false,
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -5466,6 +5479,19 @@ mod tests {
         assert!(elicitation.url.is_some());
     }
 
+    #[test]
+    fn client_capabilities_advertise_subagents() {
+        // Echo offers ACP subagent sessions to every v1 agent: they are what
+        // lets one subagent be stopped without stopping its parent.
+        for agent_id in ["codex-acp", CURSOR_ID] {
+            assert!(
+                client_capabilities_for_agent(&AgentId::new(agent_id))
+                    .subagents
+                    .is_some()
+            );
+        }
+    }
+
     #[gpui::test]
     async fn request_scoped_elicitation_during_auth_uses_connection_store(
         cx: &mut gpui::TestAppContext,
@@ -7707,6 +7733,10 @@ exit 7
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            // Mirrors production, which accepts what it advertises.
+            accepts_subagent_updates: client_capabilities_for_agent(&AgentId::new("fake-agent"))
+                .subagents
+                .is_some(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -8093,6 +8123,7 @@ exit 7
             request_elicitations: store.clone(),
             active_request_scopes: None,
             pending_session_updates: None,
+            accepts_subagent_updates: false,
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -8209,6 +8240,144 @@ exit 7
     }
 
     #[gpui::test]
+    async fn v1_subagent_state_snapshots_drive_child_activity(cx: &mut gpui::TestAppContext) {
+        use acp_thread::ThreadStatus;
+
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let project = project::Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let parent = cx
+            .update(|cx| {
+                Rc::new(acp_thread::StubAgentConnection::new()).new_session(
+                    project,
+                    PathList::default(),
+                    cx,
+                )
+            })
+            .await
+            .expect("parent session");
+        let parent_session_id = parent.read_with(cx, |parent, _| parent.session_id().clone());
+        let sessions = Rc::new(RefCell::new(HashMap::default()));
+        sessions.borrow_mut().insert(
+            parent_session_id.clone(),
+            AcpSession {
+                thread: parent.downgrade(),
+                suppress_abort_err: false,
+                session_modes: None,
+                config_options: None,
+                default_config_task: None,
+                _release_subscription: Subscription::new(|| {}),
+            },
+        );
+        let context_for = |accepts_subagent_updates, cx: &mut gpui::TestAppContext| ClientContext {
+            derived_subagents: Rc::default(),
+            sessions: sessions.clone(),
+            session_list: Rc::new(RefCell::new(None)),
+            request_elicitations: cx.new(|_| ElicitationStore::default()),
+            active_request_scopes: None,
+            pending_session_updates: None,
+            accepts_subagent_updates,
+        };
+        let parent_id = parent_session_id.0.to_string();
+
+        let unadvertised = context_for(false, cx);
+        handle_session_notification(
+            acp::SessionNotification::new(
+                parent_id.clone(),
+                acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("child")),
+            ),
+            &mut cx.to_async(),
+            &unadvertised,
+        );
+        parent.read_with(cx, |parent, _| {
+            assert_eq!(
+                parent.subagents().count(),
+                0,
+                "without the advertised capability, a v1 agent's subagent updates are ignored"
+            );
+        });
+        assert!(
+            !sessions
+                .borrow()
+                .contains_key(&acp_v2::SessionId::new("child"))
+        );
+
+        let context = context_for(true, cx);
+        let notify =
+            |session_id: &str, update: acp::SessionUpdate, cx: &mut gpui::TestAppContext| {
+                handle_session_notification(
+                    acp::SessionNotification::new(session_id.to_string(), update),
+                    &mut cx.to_async(),
+                    &context,
+                );
+            };
+        let subagent_state = |state| {
+            acp::SessionUpdate::SubagentUpdate(acp::SubagentUpdate::new("child").state(state))
+        };
+
+        notify(
+            &parent_id,
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("child")
+                    .title("Worker")
+                    .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+            ),
+            cx,
+        );
+        notify(
+            "child",
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Working".into())),
+            cx,
+        );
+        let child = parent
+            .read_with(cx, |parent, _| parent.subagent(&"child".into()).cloned())
+            .expect("the parent owns the announced subagent");
+        child.read_with(cx, |child, _| {
+            assert_eq!(child.parent_session_id(), Some(&parent_session_id));
+            assert_eq!(
+                child
+                    .subagent_association()
+                    .and_then(|association| association.title.clone()),
+                Some("Worker".into())
+            );
+            assert_eq!(child.status(), ThreadStatus::Generating);
+            assert_eq!(child.entries().len(), 1, "child traffic reaches the child");
+        });
+
+        notify(&parent_id, subagent_state(MaybeUndefined::Null), cx);
+        child.read_with(cx, |child, _| {
+            assert_eq!(
+                child.status(),
+                ThreadStatus::Unconfirmed,
+                "clearing the snapshot leaves activity unconfirmed, not idle"
+            );
+        });
+        notify(
+            &parent_id,
+            subagent_state(MaybeUndefined::Value(acp::StateUpdate::Idle(
+                acp::IdleStateUpdate::new().stop_reason(acp::IdleStopReason::Cancelled),
+            ))),
+            cx,
+        );
+        child.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Idle)
+        });
+
+        drop((parent, child));
+        cx.run_until_parked();
+        cx.update(|_| ());
+        assert!(
+            !context
+                .sessions
+                .borrow()
+                .contains_key(&acp_v2::SessionId::new("child")),
+            "the subagent is released with its parent"
+        );
+    }
+
+    #[gpui::test]
     async fn disconnect_cleanup_runs_once_for_both_completion_paths(cx: &mut gpui::TestAppContext) {
         let derived_subagents: Rc<RefCell<DerivedSubagents>> = Rc::default();
         let context = ClientContext {
@@ -8218,6 +8387,7 @@ exit 7
             request_elicitations: cx.new(|_| ElicitationStore::default()),
             active_request_scopes: None,
             pending_session_updates: None,
+            accepts_subagent_updates: false,
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -9216,9 +9386,9 @@ exit 7
             assert_eq!(subagents, vec![child_session_id.clone()]);
         });
 
-        let child = cx
-            .update(|cx| connection.local_session_thread(&child_session_id, cx))
-            .expect("the child session should have a thread");
+        let child = parent
+            .read_with(cx, |parent, _| parent.subagent(&child_session_id).cloned())
+            .expect("the parent should own the child session's thread");
         child.read_with(cx, |child, cx| {
             assert_eq!(child.parent_session_id(), Some(&session_id));
             assert_eq!(child.status(), acp_thread::ThreadStatus::Generating);
@@ -10674,22 +10844,13 @@ fn create_derived_subagent_thread(
             .tool_call(tool_call_id)
             .map(|(_, tool_call)| tool_call.label.read(cx).source().to_string())
     });
-    create_subagent_thread(
-        parent_session_id,
-        session_id,
-        title,
-        false,
-        parent_thread,
-        cx,
-        ctx,
-    )
+    create_subagent_thread(parent_session_id, session_id, title, parent_thread, cx, ctx)
 }
 
 fn create_subagent_thread(
     parent_session_id: &acp_v2::SessionId,
     session_id: &acp_v2::SessionId,
     title: Option<String>,
-    native: bool,
     parent_thread: &WeakEntity<AcpThread>,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
@@ -10722,9 +10883,9 @@ fn create_subagent_thread(
                 project,
                 action_log,
                 session_id.clone(),
-                // A subagent is never prompted directly (a native child grants
-                // no prompt capability either); messages to it are relayed
-                // through its parent.
+                // A derived subagent has no session on the agent side, so
+                // it can never be prompted; the thread view suppresses its
+                // message editor on the strength of `parent_session_id`.
                 watch::Receiver::constant(acp_v2::PromptCapabilities::default()),
                 cx,
             )
@@ -10737,8 +10898,6 @@ fn create_subagent_thread(
             thread: thread.clone(),
             parent_session_id: parent_session_id.clone(),
             announced: false,
-            native,
-            spawning_tool_call_id: None,
         },
     );
 
@@ -10761,43 +10920,20 @@ fn announce_derived_subagent(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    if ctx
-        .derived_subagents
-        .borrow()
-        .sessions
-        .get(session_id)
-        .is_none_or(|session| session.announced)
-    {
-        return;
-    }
-
-    let session_info = acp_thread::SubagentSessionInfo {
-        session_id: session_id.clone(),
-        message_start_index: 0,
-        message_end_index: None,
+    let child = {
+        let derived = ctx.derived_subagents.borrow();
+        match derived.sessions.get(session_id) {
+            Some(session) if !session.announced => session.thread.clone(),
+            _ => return,
+        }
     };
-    let meta = acp::Meta::from_iter([(
-        acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
-        serde_json::json!(&session_info),
-    )]);
 
     let announced = parent_thread
         .update(cx, |parent, cx| {
-            if parent.tool_call(tool_call_id).is_none() {
-                return false;
+            stamp_spawning_tool_call(parent, tool_call_id, session_id, cx) && {
+                parent.register_subagent(child, cx);
+                true
             }
-            parent
-                .update_tool_call(
-                    acp::ToolCallUpdate::new(
-                        acp::ToolCallId::new(tool_call_id.0.clone()),
-                        acp::ToolCallUpdateFields::new(),
-                    )
-                    .meta(meta),
-                    cx,
-                )
-                .log_err();
-            parent.subagent_spawned(session_id.clone(), cx);
-            true
         })
         .unwrap_or(false);
 
@@ -10812,77 +10948,62 @@ fn announce_derived_subagent(
     }
 }
 
-/// Creates the thread for a child session the agent announced, and applies the
-/// child's reported work state to it.
-fn handle_subagent_update(
-    parent_session_id: &acp_v2::SessionId,
-    parent_thread: &WeakEntity<AcpThread>,
-    update: &acp::SubagentUpdate,
-    cx: &mut AsyncApp,
-    ctx: &ClientContext,
-) {
-    let session_id = acp_v2::SessionId::new(update.session_id.0.clone());
-    let existing = ctx.derived_subagents.borrow().thread(&session_id).cloned();
-    let thread = match existing {
-        Some(thread) => thread,
-        None => {
-            // The description is the task, which is what the spawning tool
-            // call is labelled with; the title is only the agent's name.
-            let title = match (&update.description, &update.title) {
-                (MaybeUndefined::Value(description), _) => Some(description.clone()),
-                (_, MaybeUndefined::Value(title)) => Some(title.clone()),
-                _ => None,
-            };
-            let Some(thread) = create_subagent_thread(
-                parent_session_id,
-                &session_id,
-                title,
-                true,
-                parent_thread,
-                cx,
-                ctx,
-            ) else {
-                return;
-            };
-            thread
-        }
-    };
-
-    if let MaybeUndefined::Value(state) = &update.state {
-        // The RFD's state snapshot is v2's `state_update`, field for field.
-        let state = serde_json::to_value(state)
-            .and_then(serde_json::from_value::<acp_v2::StateUpdate>)
-            .map_err(anyhow::Error::from);
-        match state {
-            Ok(state) => {
-                thread
-                    .update(cx, |thread, cx| thread.update_session_state(state, cx))
-                    .log_err();
-            }
-            Err(error) => log::error!("unreadable subagent state for {session_id}: {error:#}"),
-        }
+/// Stamps `tool_call_id` in `parent` with `subagent_session_info`, which is
+/// what turns it into the subagent card and puts the subagent in the tray and
+/// the sidebar. Returns false while the tool call does not exist yet; stamping
+/// one that isn't there would leave a spurious "Tool call not found" failure
+/// in the transcript.
+fn stamp_spawning_tool_call(
+    parent: &mut AcpThread,
+    tool_call_id: &acp_v2::ToolCallId,
+    session_id: &acp_v2::SessionId,
+    cx: &mut gpui::Context<AcpThread>,
+) -> bool {
+    if parent.tool_call(tool_call_id).is_none() {
+        return false;
     }
+    let session_info = acp_thread::SubagentSessionInfo {
+        session_id: session_id.clone(),
+        message_start_index: 0,
+        message_end_index: None,
+    };
+    let meta = acp::Meta::from_iter([(
+        acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+        serde_json::json!(&session_info),
+    )]);
+    parent
+        .update_tool_call(
+            acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(tool_call_id.0.clone()),
+                acp::ToolCallUpdateFields::new(),
+            )
+            .meta(meta),
+            cx,
+        )
+        .log_err();
+    true
 }
 
-/// Learns which of its parent's tool calls delegated to a native child, which
-/// is where its card goes. The parent's first message to the child carries
-/// that tool call's id; failing that, the child's own work is tagged with it.
+/// Learns which of its parent's tool calls delegated to an ACP subagent
+/// session, which is where its card goes. The parent's first message to the
+/// child carries that tool call's id; failing that, the child's own work is
+/// tagged with it.
 fn note_native_delegation(
     session_id: &acp_v2::SessionId,
     update: &acp::SessionUpdate,
     ctx: &ClientContext,
 ) {
     let mut derived = ctx.derived_subagents.borrow_mut();
-    let Some(session) = derived.sessions.get_mut(session_id) else {
+    let Some(child) = derived.native_children.get_mut(session_id) else {
         return;
     };
-    if session.spawning_tool_call_id.is_some() {
+    if child.spawning_tool_call_id.is_some() {
         return;
     }
     let from_parent = |sender: Option<&acp::SessionId>| {
-        sender.is_some_and(|sender| sender.0 == session.parent_session_id.0)
+        sender.is_some_and(|sender| sender.0 == child.parent_session_id.0)
     };
-    session.spawning_tool_call_id = match update {
+    child.spawning_tool_call_id = match update {
         acp::SessionUpdate::SessionMessage(message)
             if from_parent(message.sender_session_id.as_ref()) =>
         {
@@ -10897,10 +11018,10 @@ fn note_native_delegation(
     };
 }
 
-/// Stamps the spawning tool call of every native child of `parent_session_id`
-/// that is still waiting for it. The agent announces a child before it sends
-/// the parent the tool call that launched it, so this runs after each update
-/// either of them receives until the stamp lands.
+/// Stamps the spawning tool call of every ACP subagent session of
+/// `parent_session_id` that is still waiting for it. The agent announces a
+/// child before it sends the parent the tool call that launched it, so this
+/// runs after each update either of them receives until the stamp lands.
 fn announce_native_children(
     parent_session_id: &acp_v2::SessionId,
     parent_thread: &WeakEntity<AcpThread>,
@@ -10910,65 +11031,46 @@ fn announce_native_children(
     let pending: Vec<(acp_v2::SessionId, acp_v2::ToolCallId)> = ctx
         .derived_subagents
         .borrow()
-        .sessions
+        .native_children
         .iter()
-        .filter(|(_, session)| {
-            session.native && !session.announced && &session.parent_session_id == parent_session_id
-        })
-        .filter_map(|(session_id, session)| {
-            Some((session_id.clone(), session.spawning_tool_call_id.clone()?))
+        .filter(|(_, child)| !child.announced && &child.parent_session_id == parent_session_id)
+        .filter_map(|(session_id, child)| {
+            Some((session_id.clone(), child.spawning_tool_call_id.clone()?))
         })
         .collect();
     for (session_id, tool_call_id) in pending {
-        announce_derived_subagent(&session_id, &tool_call_id, parent_thread, cx, ctx);
+        let stamped = parent_thread
+            .update(cx, |parent, cx| {
+                stamp_spawning_tool_call(parent, &tool_call_id, &session_id, cx)
+            })
+            .unwrap_or(false);
+        if stamped
+            && let Some(child) = ctx
+                .derived_subagents
+                .borrow_mut()
+                .native_children
+                .get_mut(&session_id)
+        {
+            child.announced = true;
+        }
     }
 }
 
-/// Applies an update the agent addressed to a native child session, which
-/// needs no routing: the session id already names the subagent.
-fn handle_native_child_notification(
-    session_id: &acp_v2::SessionId,
-    notification: &acp::SessionNotification,
-    cx: &mut AsyncApp,
-    ctx: &ClientContext,
-) {
-    let Some(thread) = ctx
-        .derived_subagents
-        .borrow()
-        .thread(session_id)
-        .map(|thread| thread.downgrade())
-    else {
-        return;
-    };
-
-    if let acp::SessionUpdate::SubagentUpdate(update) = &notification.update {
-        handle_subagent_update(session_id, &thread, update, cx, ctx);
-        return;
-    }
-
-    note_native_delegation(session_id, &notification.update, ctx);
-    if let Err(err) = thread
-        .update(cx, |thread, cx| {
-            thread.apply_session_update(notification.update.clone(), cx)
-        })
-        .flatten_acp()
-    {
-        log::error!("Failed to handle session update for {session_id:?}: {err:?}");
-    }
-
-    let parent = ctx
-        .derived_subagents
-        .borrow()
-        .sessions
-        .get(session_id)
-        .map(|session| session.parent_session_id.clone());
-    if let Some(parent_session_id) = parent
-        && let Ok(parent_thread) = session_thread(ctx, &parent_session_id)
-    {
-        announce_native_children(&parent_session_id, &parent_thread, cx, ctx);
-    }
-    // A nested child's card lives in this child's thread.
-    announce_native_children(session_id, &thread, cx, ctx);
+fn apply_v1_subagent_update(
+    parent: &Entity<AcpThread>,
+    update: acp::SubagentUpdate,
+    sessions: &Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    cx: &mut App,
+) -> Result<()> {
+    let update = acp_thread::subagents::update_from_v1(update)?;
+    let subagent = apply_subagent_update(parent, &update, sessions, cx)?;
+    // A v1 subagent has no stream or prompt response of its own that reports its
+    // activity, so the parent's snapshot is the only source.
+    subagent.update(cx, |subagent, cx| match update.state {
+        MaybeUndefined::Undefined => Ok(()),
+        MaybeUndefined::Null => subagent.clear_session_state(cx),
+        MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
+    })
 }
 
 fn handle_session_notification(
@@ -10977,10 +11079,6 @@ fn handle_session_notification(
     ctx: &ClientContext,
 ) {
     let session_id = acp_v2::SessionId::new(notification.session_id.0.clone());
-    if ctx.derived_subagents.borrow().is_native(&session_id) {
-        handle_native_child_notification(&session_id, &notification, cx, ctx);
-        return;
-    }
     // Extract everything we need from the session while briefly borrowing.
     let (thread, session_modes, config_opts_data) = {
         let sessions = ctx.sessions.borrow();
@@ -11034,20 +11132,56 @@ fn handle_session_notification(
     }
 
     // Abandoned loads can keep replaying until their wire operation settles.
-    let Some(_thread) = thread.upgrade() else {
+    let Some(strong_thread) = thread.upgrade() else {
         return;
     };
 
-    if let acp::SessionUpdate::SubagentUpdate(update) = &notification.update {
-        handle_subagent_update(&session_id, &thread, update, cx, ctx);
+    if let acp::SessionUpdate::SubagentUpdate(update) = notification.update {
+        if !ctx.accepts_subagent_updates {
+            log::warn!(
+                "Ignoring subagent update for {session_id:?}: Zed did not advertise the subagents capability"
+            );
+            return;
+        }
+        let child_session_id = acp_v2::SessionId::new(update.session_id.0.clone());
+        match cx.update(|cx| apply_v1_subagent_update(&strong_thread, update, &ctx.sessions, cx)) {
+            Ok(()) => {
+                ctx.derived_subagents
+                    .borrow_mut()
+                    .native_children
+                    .entry(child_session_id)
+                    .or_insert_with(|| NativeChild {
+                        parent_session_id: session_id.clone(),
+                        spawning_tool_call_id: None,
+                        announced: false,
+                    });
+            }
+            Err(error) => {
+                log::error!("Failed to apply subagent update for {session_id:?}: {error:?}");
+            }
+        }
         return;
     }
 
     // Work the agent attributed to a subagent goes to that subagent's own
     // thread instead of the parent's transcript. The parent keeps only the
     // spawning tool call, which renders as the subagent card.
-    let session_thread = thread.clone();
-    let thread = route_to_subagent(&notification, &thread, cx, ctx).unwrap_or(thread);
+    let own_thread = thread.clone();
+    let native_parent = ctx
+        .derived_subagents
+        .borrow()
+        .native_children
+        .get(&session_id)
+        .map(|child| child.parent_session_id.clone());
+    // An ACP subagent session's updates are already its own. Its work is still
+    // tagged with the spawning tool call, which the derived routing would
+    // otherwise take for a subagent nested inside it.
+    let thread = if native_parent.is_some() {
+        note_native_delegation(&session_id, &notification.update, ctx);
+        thread
+    } else {
+        route_to_subagent(&notification, &thread, cx, ctx).unwrap_or(thread)
+    };
 
     // Terminal registration, the update itself, and terminal output/exit all
     // happen in `apply_session_update` so the replay path cannot drift from
@@ -11065,7 +11199,12 @@ fn handle_session_notification(
         );
     }
 
-    announce_native_children(&session_id, &session_thread, cx, ctx);
+    announce_native_children(&session_id, &own_thread, cx, ctx);
+    if let Some(parent_session_id) = native_parent
+        && let Ok(parent_thread) = session_thread(ctx, &parent_session_id)
+    {
+        announce_native_children(&parent_session_id, &parent_thread, cx, ctx);
+    }
 }
 
 fn handle_create_terminal(

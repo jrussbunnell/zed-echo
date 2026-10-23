@@ -703,6 +703,19 @@ impl ReadAloud {
         }
     }
 
+    /// Thread markdown defers parsing until a block is laid out, and speech
+    /// segments the parsed form, so a block read before it was ever on screen
+    /// would otherwise say nothing. Every entry point that takes markdown
+    /// starts its parse.
+    fn start_parsing<'a>(
+        markdowns: impl IntoIterator<Item = &'a Entity<Markdown>>,
+        cx: &mut Context<Self>,
+    ) {
+        for markdown in markdowns {
+            markdown.update(cx, |markdown, cx| markdown.ensure_parsed(cx));
+        }
+    }
+
     /// Whether the entity's background parse has caught up with its source.
     /// Segmentation reads the last *completed* parse, which lags appends;
     /// mid-stream that parse often ends at a chunk boundary in the middle of
@@ -725,6 +738,7 @@ impl ReadAloud {
         message_complete: bool,
         cx: &mut Context<Self>,
     ) {
+        Self::start_parsing([markdown], cx);
         let switched_entity = self.speaking.as_ref() != Some(markdown);
         if switched_entity {
             if self.stopped_by_user {
@@ -916,6 +930,7 @@ impl ReadAloud {
         message_complete: bool,
         cx: &mut Context<Self>,
     ) {
+        Self::start_parsing([markdown], cx);
         self.pending.clear();
         self.step_narration_aside(cx);
         self.switch_to(markdown.clone(), message_complete, cx);
@@ -1331,6 +1346,7 @@ impl ReadAloud {
     /// call this for a message that can no longer grow — a summary of half
     /// a message is worse than none.
     pub fn narrate_message(&mut self, blocks: Vec<Entity<Markdown>>, cx: &mut Context<Self>) {
+        Self::start_parsing(&blocks, cx);
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user || blocks.is_empty() {
             return;
         }
@@ -1931,6 +1947,7 @@ impl ReadAloud {
         message_chars: usize,
         cx: &mut Context<Self>,
     ) {
+        Self::start_parsing(&blocks, cx);
         if !self.wants_wrap_up(message_chars) {
             return;
         }
@@ -2086,6 +2103,7 @@ impl ReadAloud {
         blocks: Vec<Entity<Markdown>>,
         cx: &mut Context<Self>,
     ) {
+        Self::start_parsing(&blocks, cx);
         self.stopped_by_user = false;
         let budget = WrapUpBudget::for_turn(span.tool_calls, span.elapsed);
         let Some(model) = self.summary_model.clone() else {
@@ -2213,6 +2231,7 @@ impl ReadAloud {
     /// the wrap-up: a cohesive account of the whole turn rather than a
     /// re-run of its status lines.
     pub fn finish_turn(&mut self, blocks: Vec<Entity<Markdown>>, cx: &mut Context<Self>) {
+        Self::start_parsing(&blocks, cx);
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }

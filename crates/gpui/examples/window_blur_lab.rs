@@ -148,6 +148,10 @@ fn apply(_mechanism: Mechanism, _window: &Window) -> SharedString {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(
+    deprecated,
+    reason = "a dev-only lab that drives AppKit through the legacy cocoa bindings, which gpui itself no longer uses"
+)]
 mod macos {
     use super::Mechanism;
     use cocoa::{

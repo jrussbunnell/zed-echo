@@ -4609,15 +4609,23 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     let parent_session_id = active_session_id(&panel, cx);
     save_test_thread_metadata(&parent_session_id, &project, cx).await;
 
-    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
-    // Registered before it is announced, matching the real connection: the
-    // thread goes in first, then the parent emits `SubagentSpawned`.
-    let registered = register_subagent(&connection, &parent_thread, "subagent-session", cx);
-    let subagent_session_id = registered.read_with(cx, |thread, _| thread.session_id().clone());
-    cx.update(|_, cx| {
-        parent_thread.update(cx, |thread: &mut AcpThread, cx| {
-            thread.subagent_spawned(subagent_session_id.clone(), cx);
-        });
+    let subagent_session_id = acp::SessionId::new("subagent-session");
+    let parent_thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+    let subagent = cx
+        .update(|_, cx| {
+            let parent = parent_thread.read(cx);
+            parent.connection().clone().load_session(
+                subagent_session_id.clone(),
+                parent.project().clone(),
+                PathList::default(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("subagent session");
+    parent_thread.update(cx, |thread: &mut AcpThread, cx| {
+        thread.register_subagent(subagent, cx);
     });
     cx.run_until_parked();
 
@@ -4832,7 +4840,7 @@ async fn test_clicking_the_parent_row_leaves_the_subagent(cx: &mut TestAppContex
         subagent_thread.read_with(cx, |thread, _| thread.session_id().clone());
     cx.update(|_, cx| {
         parent_thread.update(cx, |thread, cx| {
-            thread.subagent_spawned(subagent_session_id.clone(), cx);
+            thread.register_subagent(subagent_thread.clone(), cx);
         });
     });
     cx.run_until_parked();
