@@ -92,7 +92,7 @@ rustup target add $target_triple
 
 echo "Compiling zed binaries"
 if [[ "$target_dir" = "release" ]]; then
-    cargo --config .cargo/bundle-config.toml rustc ${build_flag} ${zed_features} --package zed --bin zed --target $target_triple -- -C 'link-arg=-Wl,-unexported_symbol,__R*'
+    cargo --config .cargo/bundle-config.toml rustc ${build_flag} ${zed_features} --package zed --bin zedecho --target $target_triple -- -C 'link-arg=-Wl,-unexported_symbol,__R*'
     cargo --config .cargo/bundle-config.toml build ${build_flag} --package cli --target $target_triple
 else
     cargo --config .cargo/bundle-config.toml build ${build_flag} ${zed_features} --package zed --package cli --target $target_triple
