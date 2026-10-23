@@ -372,6 +372,7 @@ impl Conversation {
                         this.note_subagent_output(&session_id, cx);
                     }
                     AcpThreadEvent::Stopped { stop_reason, .. } => {
+                        this.sync_reported_subagent_activity(&session_id, cx);
                         this.settle_live_subagents(
                             &session_id,
                             *stop_reason == Some(acp_v2::StopReason::Cancelled),
@@ -381,8 +382,10 @@ impl Conversation {
                     AcpThreadEvent::Error => {
                         this.settle_live_subagents(&session_id, false, cx);
                     }
+                    AcpThreadEvent::StatusChanged => {
+                        this.sync_reported_subagent_activity(&session_id, cx);
+                    }
                     AcpThreadEvent::ActivityConfirmedIdle
-                    | AcpThreadEvent::StatusChanged
                     | AcpThreadEvent::SubmissionUpdated(_)
                     | AcpThreadEvent::TitleUpdated
                     | AcpThreadEvent::TokenUsageUpdated(_)
@@ -404,7 +407,10 @@ impl Conversation {
             }
         });
         self.subscriptions.push(subscription);
-        self.threads.insert(session_id, thread);
+        self.threads.insert(session_id.clone(), thread);
+        // A native subagent may have reported its state before anything
+        // opened it.
+        self.sync_reported_subagent_activity(&session_id, cx);
         cx.notify();
     }
 
@@ -428,7 +434,9 @@ impl Conversation {
     /// establish it, and the check has to find the spawning call in the
     /// parent's transcript.
     fn note_subagent_output(&mut self, session_id: &acp_v2::SessionId, cx: &mut Context<Self>) {
-        if self.subagent_activity(session_id) == SubagentActivity::Live {
+        if self.subagent_activity(session_id) == SubagentActivity::Live
+            || self.reports_own_state(session_id, cx)
+        {
             return;
         }
         let Some(parent_session_id) = self
@@ -581,7 +589,12 @@ impl Conversation {
             .subagent_activity
             .iter()
             .filter(|(subagent, activity)| {
-                **activity == SubagentActivity::Live && &self.turn_owner(subagent, cx) == session_id
+                **activity == SubagentActivity::Live
+                    && &self.turn_owner(subagent, cx) == session_id
+                    // A native child reports its own end. It can outlive the
+                    // parent's turn, and a cancel of the parent spares a
+                    // background child, so the turn ending says nothing.
+                    && !self.reports_own_state(subagent, cx)
             })
             .map(|(subagent, _)| subagent.clone())
             .collect();
@@ -600,6 +613,55 @@ impl Conversation {
         }
         if !canceled_labels.is_empty() {
             self.notify_subagents_canceled(&canceled_labels, cx);
+        }
+    }
+
+    /// Whether the agent reports this subagent's work state itself, as it does
+    /// for a native child session, in place of everything inferred above.
+    fn reports_own_state(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
+        self.threads.get(session_id).is_some_and(|thread| {
+            let thread = thread.read(cx);
+            thread.parent_session_id().is_some() && thread.has_received_session_state()
+        })
+    }
+
+    /// Takes a native subagent's activity from the state its parent reported.
+    fn sync_reported_subagent_activity(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.reports_own_state(session_id, cx) {
+            return;
+        }
+        let Some(thread) = self.threads.get(session_id) else {
+            return;
+        };
+        let activity = match thread.read(cx).foreground_state() {
+            Some(acp_v2::StateUpdate::Running(_) | acp_v2::StateUpdate::RequiresAction(_)) => {
+                SubagentActivity::Live
+            }
+            Some(acp_v2::StateUpdate::Idle(idle)) => match &idle.stop_reason {
+                Some(acp_v2::StopReason::Cancelled) => SubagentActivity::Canceled,
+                Some(
+                    acp_v2::StopReason::Error(_)
+                    | acp_v2::StopReason::Refusal
+                    | acp_v2::StopReason::MaxTokens
+                    | acp_v2::StopReason::MaxTurnRequests,
+                ) => SubagentActivity::Failed,
+                _ => SubagentActivity::Finished,
+            },
+            _ => return,
+        };
+        let previous = self.subagent_activity.insert(session_id.clone(), activity);
+        // Only a stop seen happening: a restored session reports the end of
+        // every subagent it ever ran.
+        if activity == SubagentActivity::Canceled && previous == Some(SubagentActivity::Live) {
+            let label = self.subagent_label(session_id, cx);
+            self.notify_subagents_canceled(&[label], cx);
+        }
+        if previous != Some(activity) {
+            cx.notify();
         }
     }
 
@@ -20702,6 +20764,114 @@ pub(crate) mod tests {
             .expect("cancelling the parent should succeed");
         cx.run_until_parked();
         assert_eq!(status(cx), SubagentStatus::Canceled);
+    }
+
+    /// A native subagent's state comes from the agent's own reports on it, so
+    /// neither its parent's turn ending nor a sibling stopping settles it.
+    #[gpui::test]
+    async fn test_native_subagent_status_follows_its_reported_state(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        cx.run_until_parked();
+
+        let (parent_thread, project) = conversation_view.read_with(cx, |view, cx| {
+            let thread = view.active_thread().unwrap().read(cx).thread.clone();
+            let project = thread.read(cx).project().clone();
+            (thread, project)
+        });
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let _turn = cx.update(|_window, cx| {
+            parent_thread.update(cx, |thread, cx| {
+                thread.send(vec!["Delegate the work".into()], cx)
+            })
+        });
+        let mut children = Vec::new();
+        for (tool_call_id, session_id) in [("task-1", "agent-1"), ("task-2", "agent-2")] {
+            let session_id = acp_v2::SessionId::new(session_id);
+            let thread = cx.update(|_window, cx| {
+                create_test_acp_thread(
+                    Some(parent_session_id.clone()),
+                    &session_id.0,
+                    Rc::new(connection.clone()),
+                    project.clone(),
+                    cx,
+                )
+            });
+            connection.add_local_session_thread(session_id.clone(), thread.clone());
+            upsert_spawn_tool_call(
+                &parent_thread,
+                tool_call_id,
+                "Research alternatives",
+                &session_id,
+                acp::ToolCallStatus::Completed,
+                cx,
+            );
+            cx.update(|_window, cx| {
+                thread.update(cx, |thread, cx| {
+                    thread
+                        .update_session_state(
+                            acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                            cx,
+                        )
+                        .unwrap();
+                });
+                parent_thread.update(cx, |thread, cx| {
+                    thread.subagent_spawned(session_id.clone(), cx);
+                });
+            });
+            children.push(thread);
+        }
+        cx.run_until_parked();
+
+        let statuses = |cx: &mut gpui::VisualTestContext| {
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                view.subagent_summaries(cx)
+                    .iter()
+                    .map(|summary| summary.status)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            statuses(cx),
+            vec![SubagentStatus::Running, SubagentStatus::Running]
+        );
+
+        // The agent spares background subagents when the parent is cancelled,
+        // and says so by not reporting them stopped.
+        cx.update(|_window, cx| parent_thread.update(cx, |thread, cx| thread.cancel(cx)))
+            .await
+            .expect("cancelling the parent should succeed");
+        cx.run_until_parked();
+        assert_eq!(
+            statuses(cx),
+            vec![SubagentStatus::Running, SubagentStatus::Running],
+            "a parent's cancel must not settle a native subagent"
+        );
+
+        cx.update(|_window, cx| {
+            children[0].update(cx, |thread, cx| {
+                thread
+                    .update_session_state(
+                        acp_v2::StateUpdate::Idle(
+                            acp_v2::IdleStateUpdate::new()
+                                .stop_reason(acp_v2::StopReason::Cancelled),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            statuses(cx),
+            vec![SubagentStatus::Canceled, SubagentStatus::Running],
+            "stopping one subagent must leave its sibling running"
+        );
     }
 
     #[gpui::test]

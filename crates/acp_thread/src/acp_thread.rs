@@ -4621,8 +4621,10 @@ impl AcpThread {
         state: acp_v2::StateUpdate,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        // A native subagent has no turn of its own; its parent reports its
+        // state, and that report is the only thing that says it is working.
         anyhow::ensure!(
-            self.uses_reported_activity(),
+            self.uses_reported_activity() || self.parent_session_id.is_some(),
             "Session does not report foreground state"
         );
         let previous = self.foreground_activity();
@@ -5004,9 +5006,72 @@ impl AcpThread {
                     cx,
                 );
             }
+            // A native subagent's prompt, and each message its parent sends it
+            // later, arrive as messages to its session. Only incoming ones are
+            // shown: the parent already shows what it sent as its own tool call.
+            acp_v1::SessionUpdate::SessionMessage(message) => {
+                if self.is_incoming_session_message(message.recipient_session_id.as_ref())
+                    && let MaybeUndefined::Value(content) = message.content
+                {
+                    for block in content {
+                        let block = content::from_v1(block).map_err(acp_v1::Error::from)?;
+                        if !self.take_relayed_echo(&block) {
+                            self.push_user_content_block_from_agent(
+                                Some(message.message_id.clone()),
+                                block,
+                                cx,
+                            );
+                        }
+                    }
+                }
+            }
+            acp_v1::SessionUpdate::SessionMessageChunk(chunk) => {
+                if self.is_incoming_session_message(chunk.recipient_session_id.as_ref()) {
+                    let block = content::from_v1(chunk.content).map_err(acp_v1::Error::from)?;
+                    if !self.take_relayed_echo(&block) {
+                        self.push_user_content_block_from_agent(Some(chunk.message_id), block, cx);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    fn is_incoming_session_message(&self, recipient: Option<&acp_v1::SessionId>) -> bool {
+        recipient.is_none_or(|recipient| recipient.0 == self.session_id().0)
+    }
+
+    /// Shows a message the user typed to this subagent right away, before the
+    /// parent has relayed it. See [`Self::take_relayed_echo`].
+    pub fn push_relayed_user_message(
+        &mut self,
+        block: acp_v2::ContentBlock,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_user_content_block_with_protocol_id(None, true, None, block, false, cx)
+    }
+
+    /// Whether `block` is the agent echoing a message already shown by
+    /// [`Self::push_relayed_user_message`]. A native subagent receives the
+    /// relayed message as a message to its session, which would otherwise
+    /// show it twice.
+    fn take_relayed_echo(&mut self, block: &acp_v2::ContentBlock) -> bool {
+        let relayed = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            AgentThreadEntry::UserMessage(message)
+                if message.is_optimistic && message.content.source_blocks().contains(block) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        });
+        match relayed {
+            Some(message) => {
+                message.is_optimistic = false;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn upsert_user_message(

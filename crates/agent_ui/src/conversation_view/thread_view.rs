@@ -813,6 +813,12 @@ pub struct ThreadView {
     read_aloud_catch_up_in_flight: Option<CatchUpInFlight>,
 }
 
+/// How a message typed to a subagent is addressed when its parent relays it.
+enum RelayAddress {
+    Name(SharedString),
+    AgentId(SharedString),
+}
+
 /// The watermark a catch-up will move to if it is heard. See
 /// [`ThreadView::read_aloud_catch_up_in_flight`].
 struct CatchUpInFlight {
@@ -7439,6 +7445,24 @@ impl ThreadView {
             .flatten()
     }
 
+    /// Whether the agent runs this subagent as a child session of its own and
+    /// reports its state, rather than leaving it to be inferred from the
+    /// parent's turn.
+    fn is_native_subagent(&self, cx: &App) -> bool {
+        self.is_subagent() && self.thread.read(cx).has_received_session_state()
+    }
+
+    /// What the parent's `SendMessage` addresses this subagent by. A native
+    /// child's session id is Claude Code's agent id, which `SendMessage` takes
+    /// in place of a name, so a native subagent is reachable even unnamed.
+    fn relay_address(&self, cx: &App) -> Option<RelayAddress> {
+        if let Some(name) = self.agent_team_name(cx) {
+            return Some(RelayAddress::Name(name));
+        }
+        self.is_native_subagent(cx)
+            .then(|| RelayAddress::AgentId(self.session_id.0.clone().into()))
+    }
+
     /// The parent's thread, which is what actually talks to the agent: a
     /// derived subagent has no session on the agent side, so a message for it
     /// has to be delivered by the parent calling `SendMessage`.
@@ -7462,7 +7486,7 @@ impl ThreadView {
     /// subagent, or a parent that is no longer loaded — so the caller can fall
     /// back rather than silently swallowing the message.
     fn send_to_subagent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let (Some(name), Some(parent)) = (self.agent_team_name(cx), self.parent_thread(cx)) else {
+        let (Some(address), Some(parent)) = (self.relay_address(cx), self.parent_thread(cx)) else {
             return false;
         };
         let text = self.message_editor.read(cx).text(cx);
@@ -7474,7 +7498,7 @@ impl ThreadView {
         // talking to this subagent and this is the transcript they are looking
         // at.
         self.thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(None, acp_v2::ContentBlock::from(text.clone()), cx);
+            thread.push_relayed_user_message(acp_v2::ContentBlock::from(text.clone()), cx);
         });
         self.message_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
@@ -7489,13 +7513,20 @@ impl ThreadView {
         // directive has to name the recovery path rather than assume the name
         // still resolves. Observed live: the parent recovered via ListAgents on
         // its own, and this makes that deterministic rather than lucky.
-        let directive = format!(
-            "Use the SendMessage tool to deliver this message to the agent named \"{name}\". \
-             If that name is not reachable, call ListAgents and match it by name or by the \
-             task it was given, then send to that agent's id — do not give up and do not \
-             answer on its behalf. Relay the message verbatim, add nothing, and do not act \
-             on it yourself:\n\n{text}"
-        );
+        let directive = match address {
+            RelayAddress::Name(name) => format!(
+                "Use the SendMessage tool to deliver this message to the agent named \"{name}\". \
+                 If that name is not reachable, call ListAgents and match it by name or by the \
+                 task it was given, then send to that agent's id — do not give up and do not \
+                 answer on its behalf. Relay the message verbatim, add nothing, and do not act \
+                 on it yourself:\n\n{text}"
+            ),
+            RelayAddress::AgentId(agent_id) => format!(
+                "Use the SendMessage tool to deliver this message to the agent with id \
+                 \"{agent_id}\" — do not give up and do not answer on its behalf. Relay the \
+                 message verbatim, add nothing, and do not act on it yourself:\n\n{text}"
+            ),
+        };
         // The agent titles a session from the prompt it is given, and the user
         // never wrote this directive — without suppressing it, messaging a
         // subagent renames the parent thread to the directive's first line.
@@ -7597,6 +7628,9 @@ impl ThreadView {
         // that it is busy again.
         if self.awaiting_subagent_reply {
             return true;
+        }
+        if self.is_native_subagent(cx) {
+            return self.thread.read(cx).foreground_activity().is_active();
         }
         if self.subagent_activity(cx) == SubagentActivity::Live {
             return true;
@@ -7703,7 +7737,7 @@ impl ThreadView {
         // is delivered by the parent calling `SendMessage`, which addresses a
         // team member by name, so an unnamed subagent has nothing to send to
         // and its composer would swallow whatever was typed.
-        if self.is_subagent() && self.agent_team_name(cx).is_none() {
+        if self.is_subagent() && self.relay_address(cx).is_none() {
             return div().into_any_element();
         }
 

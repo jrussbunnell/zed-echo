@@ -598,6 +598,15 @@ fn session_thread(
     sessions
         .get(session_id)
         .map(|session| session.thread.clone())
+        // A native subagent's child session has no `session/new` of its own;
+        // the connection holds its thread, and the agent addresses its
+        // terminals, file reads, and permission requests to it directly.
+        .or_else(|| {
+            ctx.derived_subagents
+                .borrow()
+                .thread(session_id)
+                .map(|thread| thread.downgrade())
+        })
         .ok_or_else(|| acp::Error::internal_error().data(format!("unknown session: {session_id}")))
 }
 
