@@ -3,9 +3,9 @@ use std::{ops::Range, sync::Arc, time::Instant};
 use anyhow::{Result, bail};
 use collections::{HashMap, HashSet};
 use database::{
-    BrowseRequest, Capability, Change, ChangeSet, CollectionRef, CollectionSchema,
-    ConnectionState, DatabaseEnvironment, DatabaseKind, DatabaseStore, DatabaseStoreEvent, Filter,
-    FilterOp, HistoryEntry, QueryLanguage, Reference, ResultSet, Value, is_reading_statement,
+    BrowseRequest, Capability, Change, ChangeSet, CollectionRef, CollectionSchema, ConnectionState,
+    DatabaseEnvironment, DatabaseKind, DatabaseStore, DatabaseStoreEvent, Filter, FilterOp,
+    HistoryEntry, QueryLanguage, Reference, ResultSet, Value, is_reading_statement,
 };
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -98,8 +98,9 @@ impl ResultsView {
         text: Option<String>,
         window: &mut Window,
         cx: &mut gpui::Context<Workspace>,
-    ) {
+    ) -> Entity<Self> {
         let workspace_handle = cx.entity().downgrade();
+        let languages = workspace.project().read(cx).languages().clone();
         let view = cx.new(|cx| {
             let editor = cx.new(|cx| {
                 let mut editor = Editor::auto_height(4, 16, window, cx);
@@ -110,13 +111,20 @@ impl ResultsView {
                 }
                 editor
             });
-            set_sql_language(&editor, &workspace_handle, cx);
-            Self::new(store, workspace_handle, connection, Mode::Query { editor }, cx)
+            set_sql_language(&editor, languages, cx);
+            Self::new(
+                store,
+                workspace_handle,
+                connection,
+                Mode::Query { editor },
+                cx,
+            )
         });
         workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
         if text.is_some() {
             view.update(cx, |view, cx| view.run(window, cx));
         }
+        view
     }
 
     pub fn open_table(
@@ -127,7 +135,7 @@ impl ResultsView {
         filters: Vec<Filter>,
         window: &mut Window,
         cx: &mut gpui::Context<Workspace>,
-    ) {
+    ) -> Entity<Self> {
         let workspace_handle = cx.entity().downgrade();
         let view = cx.new(|cx| {
             let filter_editor = cx.new(|cx| {
@@ -156,6 +164,7 @@ impl ResultsView {
             view.load_schema(cx);
             view.run(window, cx);
         });
+        view
     }
 
     fn new(
@@ -188,7 +197,9 @@ impl ResultsView {
             inserted: Vec::new(),
             history: None,
             table_state: cx.new(|cx| TableInteractionState::new(cx)),
-            column_widths: cx.new(|_| ResizableColumnsState::new(1, vec![px(160.)], vec![TableResizeBehavior::Resizable])),
+            column_widths: cx.new(|_| {
+                ResizableColumnsState::new(1, vec![px(160.)], vec![TableResizeBehavior::Resizable])
+            }),
             task: None,
             _subscriptions: subscriptions,
         }
@@ -203,13 +214,19 @@ impl ResultsView {
     }
 
     fn kind(&self, cx: &App) -> Option<DatabaseKind> {
-        self.store.read(cx).entry(&self.connection).map(|entry| entry.spec.kind)
+        self.store
+            .read(cx)
+            .entry(&self.connection)
+            .map(|entry| entry.spec.kind)
     }
 
     fn is_writable(&self, cx: &App) -> bool {
         let capability_writable = matches!(
             self.store.read(cx).state(&self.connection),
-            ConnectionState::Connected { capability: Capability::Writable, .. }
+            ConnectionState::Connected {
+                capability: Capability::Writable,
+                ..
+            }
         );
         capability_writable
             && matches!(self.mode, Mode::Table { .. })
@@ -226,9 +243,9 @@ impl ResultsView {
         let Mode::Table { collection, .. } = &self.mode else {
             return;
         };
-        let task = self
-            .store
-            .update(cx, |store, cx| store.describe(&self.connection, collection, cx));
+        let task = self.store.update(cx, |store, cx| {
+            store.describe(&self.connection, collection, cx)
+        });
         cx.spawn(async move |this, cx| {
             let schema = task.await;
             this.update(cx, |this, cx| {
@@ -243,7 +260,7 @@ impl ResultsView {
         .detach();
     }
 
-    fn run(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    pub fn run(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         let numbers_are_floats = self.kind(cx) == Some(DatabaseKind::Convex);
         match &mut self.mode {
             Mode::Query { editor } => {
@@ -257,7 +274,8 @@ impl ResultsView {
                 let approval = needs_confirmation.then(|| {
                     self.ask(
                         Approval {
-                            title: format!("Run a writing statement on {}?", self.connection).into(),
+                            title: format!("Run a writing statement on {}?", self.connection)
+                                .into(),
                             subtitle: Some("This connection is tagged prod.".into()),
                             detail: text.clone(),
                             confirm_label: "Run".into(),
@@ -286,7 +304,8 @@ impl ResultsView {
                         store.query(&connection, text, QUERY_LIMIT, false, cx)
                     });
                     let result = task.await;
-                    this.update(cx, |this, cx| this.show(result, started, cx)).log_err();
+                    this.update(cx, |this, cx| this.show(result, started, cx))
+                        .log_err();
                 }));
             }
             Mode::Table {
@@ -312,7 +331,9 @@ impl ResultsView {
 
     fn load_page(&mut self, cursor: Option<String>, cx: &mut gpui::Context<Self>) {
         let Mode::Table {
-            collection, filters, ..
+            collection,
+            filters,
+            ..
         } = &self.mode
         else {
             return;
@@ -409,13 +430,18 @@ impl ResultsView {
         cx: &mut gpui::Context<Self>,
     ) -> futures::channel::oneshot::Receiver<bool> {
         match self.workspace.upgrade() {
-            Some(workspace) => workspace.update(cx, |workspace, cx| ApprovalModal::ask(workspace, approval, window, cx)),
+            Some(workspace) => workspace.update(cx, |workspace, cx| {
+                ApprovalModal::ask(workspace, approval, window, cx)
+            }),
             None => futures::channel::oneshot::channel().1,
         }
     }
 
     fn row_count(&self) -> usize {
-        self.results.as_ref().map_or(0, |results| results.rows.len()) + self.inserted.len()
+        self.results
+            .as_ref()
+            .map_or(0, |results| results.rows.len())
+            + self.inserted.len()
     }
 
     fn value(&self, row: usize, column: usize) -> Value {
@@ -445,7 +471,7 @@ impl ResultsView {
             .unwrap_or(Value::Missing)
     }
 
-    fn select(&mut self, row: usize, column: usize, cx: &mut gpui::Context<Self>) {
+    pub fn select(&mut self, row: usize, column: usize, cx: &mut gpui::Context<Self>) {
         if self.selected.map(|(selected, _)| selected) != Some(row) {
             self.history = None;
             self.load_history(row, cx);
@@ -454,14 +480,28 @@ impl ResultsView {
         cx.notify();
     }
 
-    fn start_editing(&mut self, row: usize, column: usize, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn start_editing(
+        &mut self,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if !self.is_writable(cx) || self.deleted.contains(&row) {
             return;
         }
         let value = self.value(row, column);
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_text(if value.is_nullish() { String::new() } else { value.display() }, window, cx);
+            editor.set_text(
+                if value.is_nullish() {
+                    String::new()
+                } else {
+                    value.display()
+                },
+                window,
+                cx,
+            );
             editor
         });
         let subscription = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
@@ -485,29 +525,45 @@ impl ResultsView {
         };
         if keep {
             let text = editing.editor.read(cx).text(cx);
-            let original = self.original(editing.row, editing.column);
-            let value = Value::parse_like(&text, &original);
-            let is_inserted = self
-                .results
-                .as_ref()
-                .is_some_and(|results| editing.row >= results.rows.len());
-            if is_inserted {
-                let offset = editing.row - self.results.as_ref().map_or(0, |results| results.rows.len());
-                if let Some(cell) = self
-                    .inserted
-                    .get_mut(offset)
-                    .and_then(|row| row.get_mut(editing.column))
-                {
-                    *cell = value;
-                }
-            } else if value == original || (text.is_empty() && original.is_nullish()) {
-                self.pending.remove(&(editing.row, editing.column));
-            } else {
-                self.pending.insert((editing.row, editing.column), value);
-            }
+            self.stage_edit(editing.row, editing.column, &text, cx);
         }
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// Records `text` as the new value of a cell, pending review.
+    pub fn stage_edit(
+        &mut self,
+        row: usize,
+        column: usize,
+        text: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let original = self.original(row, column);
+        let value = Value::parse_like(text, &original);
+        let results_len = self
+            .results
+            .as_ref()
+            .map_or(0, |results| results.rows.len());
+        if row >= results_len {
+            if let Some(cell) = self
+                .inserted
+                .get_mut(row - results_len)
+                .and_then(|values| values.get_mut(column))
+            {
+                *cell = value;
+            }
+        } else if value == original || (text.is_empty() && original.is_nullish()) {
+            self.pending.remove(&(row, column));
+        } else {
+            self.pending.insert((row, column), value);
+        }
+        cx.notify();
+    }
+
+    /// Whether a query or page load is still in flight.
+    pub fn is_loading(&self) -> bool {
+        matches!(self.status, Status::Running)
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -529,7 +585,10 @@ impl ResultsView {
     }
 
     fn add_row(&mut self, cx: &mut gpui::Context<Self>) {
-        let columns = self.results.as_ref().map_or(0, |results| results.columns.len());
+        let columns = self
+            .results
+            .as_ref()
+            .map_or(0, |results| results.columns.len());
         self.inserted.push(vec![Value::Missing; columns]);
         cx.notify();
     }
@@ -538,7 +597,10 @@ impl ResultsView {
         let Some((row, _)) = self.selected else {
             return;
         };
-        let results_len = self.results.as_ref().map_or(0, |results| results.rows.len());
+        let results_len = self
+            .results
+            .as_ref()
+            .map_or(0, |results| results.rows.len());
         if row >= results_len {
             self.inserted.remove(row - results_len);
             self.selected = None;
@@ -567,7 +629,9 @@ impl ResultsView {
                 .primary_key
                 .iter()
                 .map(|field| {
-                    let index = column(field).ok_or_else(|| anyhow::anyhow!("the results do not include key field `{field}`"))?;
+                    let index = column(field).ok_or_else(|| {
+                        anyhow::anyhow!("the results do not include key field `{field}`")
+                    })?;
                     Ok((field.clone(), self.original(row, index)))
                 })
                 .collect()
@@ -587,7 +651,10 @@ impl ResultsView {
                 .map(|((_, index), value)| (results.columns[*index].name.clone(), value.clone()))
                 .collect::<Vec<_>>();
             set.sort_by(|left, right| left.0.cmp(&right.0));
-            changes.push(Change::Update { key: key_for(row)?, set });
+            changes.push(Change::Update {
+                key: key_for(row)?,
+                set,
+            });
         }
         let mut deleted = self.deleted.iter().copied().collect::<Vec<_>>();
         deleted.sort_unstable();
@@ -612,7 +679,7 @@ impl ResultsView {
         })
     }
 
-    fn review_changes(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    pub fn review_changes(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         let changes = match self.change_set() {
             Ok(changes) if !changes.changes.is_empty() => changes,
             Ok(_) => return,
@@ -625,7 +692,9 @@ impl ResultsView {
         let connection = self.connection.clone();
         let environment = self.environment(cx);
         let store = self.store.clone();
-        let preview = store.update(cx, |store, cx| store.render_changes(&connection, changes.clone(), cx));
+        let preview = store.update(cx, |store, cx| {
+            store.render_changes(&connection, changes.clone(), cx)
+        });
         let workspace = self.workspace.clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let preview = match preview.await {
@@ -643,7 +712,11 @@ impl ResultsView {
                 ApprovalModal::ask(
                     workspace,
                     Approval {
-                        title: format!("Apply {} change(s) to {connection}?", changes.changes.len()).into(),
+                        title: format!(
+                            "Apply {} change(s) to {connection}?",
+                            changes.changes.len()
+                        )
+                        .into(),
                         subtitle: (environment == DatabaseEnvironment::Prod)
                             .then(|| "This connection is tagged prod.".into()),
                         detail: preview,
@@ -698,7 +771,11 @@ impl ResultsView {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                if this.history.as_ref().is_some_and(|(loading_row, _)| *loading_row == row) {
+                if this
+                    .history
+                    .as_ref()
+                    .is_some_and(|(loading_row, _)| *loading_row == row)
+                {
                     this.history = Some((
                         row,
                         match result {
@@ -714,14 +791,29 @@ impl ResultsView {
         .detach();
     }
 
-    fn follow_reference(&mut self, reference: &Reference, outgoing: bool, row: usize, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn follow_reference(
+        &mut self,
+        reference: &Reference,
+        outgoing: bool,
+        row: usize,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let Some(results) = &self.results else {
             return;
         };
         let (from_fields, to_fields, target) = if outgoing {
-            (&reference.fields, &reference.target_fields, &reference.target)
+            (
+                &reference.fields,
+                &reference.target_fields,
+                &reference.target,
+            )
         } else {
-            (&reference.target_fields, &reference.fields, &reference.source)
+            (
+                &reference.target_fields,
+                &reference.fields,
+                &reference.source,
+            )
         };
         let filters = from_fields
             .iter()
@@ -751,20 +843,31 @@ impl ResultsView {
         let change_count = self.pending.len() + self.deleted.len() + self.inserted.len();
         let status = match &self.status {
             Status::Idle => Label::new("").into_any_element(),
-            Status::Running => Label::new("Running…").color(Color::Muted).size(LabelSize::Small).into_any_element(),
+            Status::Running => Label::new("Running…")
+                .color(Color::Muted)
+                .size(LabelSize::Small)
+                .into_any_element(),
             Status::Done { elapsed_ms } => {
                 let results = self.results.as_ref();
                 let rows = results.map_or(0, |results| results.rows.len());
                 let truncated = results.is_some_and(|results| results.truncated);
                 let affected = results.and_then(|results| results.affected_rows);
                 let text = match affected {
-                    Some(affected) if rows == 0 => format!("{affected} rows affected · {elapsed_ms} ms"),
+                    Some(affected) if rows == 0 => {
+                        format!("{affected} rows affected · {elapsed_ms} ms")
+                    }
                     _ if truncated => format!("first {rows} rows · {elapsed_ms} ms"),
                     _ => format!("{rows} rows · {elapsed_ms} ms"),
                 };
-                Label::new(text).color(Color::Muted).size(LabelSize::Small).into_any_element()
+                Label::new(text)
+                    .color(Color::Muted)
+                    .size(LabelSize::Small)
+                    .into_any_element()
             }
-            Status::Failed(error) => Label::new(error.clone()).color(Color::Error).size(LabelSize::Small).into_any_element(),
+            Status::Failed(error) => Label::new(error.clone())
+                .color(Color::Error)
+                .size(LabelSize::Small)
+                .into_any_element(),
         };
         let mut toolbar = h_flex()
             .w_full()
@@ -780,7 +883,11 @@ impl ResultsView {
                 toolbar = toolbar.child(
                     Button::new("run", "Run")
                         .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
-                        .key_binding(ui::KeyBinding::for_action_in(&RunQuery, &self.focus_handle, cx))
+                        .key_binding(ui::KeyBinding::for_action_in(
+                            &RunQuery,
+                            &self.focus_handle,
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
                 );
             }
@@ -814,7 +921,9 @@ impl ResultsView {
                             IconButton::new("delete-row", IconName::Trash)
                                 .disabled(self.selected.is_none())
                                 .tooltip(Tooltip::text("Delete the selected row"))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_delete_selected(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_delete_selected(cx)),
+                                ),
                         );
                 }
             }
@@ -829,12 +938,21 @@ impl ResultsView {
                 .child(
                     Button::new("review", format!("Review {change_count} change(s)"))
                         .style(ButtonStyle::Filled)
-                        .on_click(cx.listener(|this, _, window, cx| this.review_changes(window, cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.review_changes(window, cx)),
+                        ),
                 );
         } else if !writable && matches!(self.mode, Mode::Table { .. }) {
             let reason = match self.store.read(cx).state(&self.connection) {
-                ConnectionState::Connected { capability: Capability::ReadOnly { reason }, .. } => reason,
-                _ if self.schema.as_ref().is_some_and(|schema| schema.primary_key.is_empty()) => {
+                ConnectionState::Connected {
+                    capability: Capability::ReadOnly { reason },
+                    ..
+                } => reason,
+                _ if self
+                    .schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.primary_key.is_empty()) =>
+                {
                     "this table has no primary key".to_string()
                 }
                 _ => "read-only".to_string(),
@@ -842,7 +960,11 @@ impl ResultsView {
             toolbar = toolbar.child(
                 div()
                     .id("read-only")
-                    .child(Icon::new(IconName::Lock).size(IconSize::Small).color(Color::Muted))
+                    .child(
+                        Icon::new(IconName::Lock)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .tooltip(Tooltip::text(format!("Read-only: {reason}"))),
             );
         }
@@ -871,9 +993,17 @@ impl ResultsView {
                 h_flex()
                     .gap_1()
                     .when(is_key, |this| {
-                        this.child(Icon::new(IconName::Hash).size(IconSize::XSmall).color(Color::Muted))
+                        this.child(
+                            Icon::new(IconName::Hash)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
                     })
-                    .child(Label::new(column.name.clone()).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD))
+                    .child(
+                        Label::new(column.name.clone())
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -887,7 +1017,11 @@ impl ResultsView {
                 self.row_count(),
                 cx.processor(move |this, range: Range<usize>, _, cx| {
                     range
-                        .map(|row| (0..columns).map(|column| this.render_cell(row, column, cx)).collect())
+                        .map(|row| {
+                            (0..columns)
+                                .map(|column| this.render_cell(row, column, cx))
+                                .collect()
+                        })
                         .collect()
                 }),
             )
@@ -899,12 +1033,18 @@ impl ResultsView {
             && editing.row == row
             && editing.column == column
         {
-            return div().w_full().child(editing.editor.clone()).into_any_element();
+            return div()
+                .w_full()
+                .child(editing.editor.clone())
+                .into_any_element();
         }
         let value = self.value(row, column);
         let is_pending = self.pending.contains_key(&(row, column));
         let is_deleted = self.deleted.contains(&row);
-        let is_inserted = self.results.as_ref().is_some_and(|results| row >= results.rows.len());
+        let is_inserted = self
+            .results
+            .as_ref()
+            .is_some_and(|results| row >= results.rows.len());
         let is_selected = self.selected == Some((row, column));
         let color = if is_deleted {
             Color::Deleted
@@ -925,7 +1065,8 @@ impl ResultsView {
             .w_full()
             .overflow_hidden()
             .when(is_selected, |this| {
-                this.border_1().border_color(cx.theme().colors().border_focused)
+                this.border_1()
+                    .border_color(cx.theme().colors().border_focused)
             })
             .child(
                 Label::new(text)
@@ -963,11 +1104,18 @@ impl ResultsView {
             let value = self.value(row, index);
             fields = fields.child(
                 v_flex()
-                    .child(Label::new(column.name.clone()).size(LabelSize::XSmall).color(Color::Muted))
-                    .child(Label::new(match &value {
-                        Value::Missing => "—".to_string(),
-                        value => value.display(),
-                    }).size(LabelSize::Small)),
+                    .child(
+                        Label::new(column.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(match &value {
+                            Value::Missing => "—".to_string(),
+                            value => value.display(),
+                        })
+                        .size(LabelSize::Small),
+                    ),
             );
         }
         detail = detail.child(fields);
@@ -988,7 +1136,11 @@ impl ResultsView {
             if !outgoing.is_empty() || !schema.referenced_by.is_empty() {
                 let mut context = v_flex().gap_1().child(section_label("Context"));
                 for (index, reference) in outgoing.into_iter().enumerate() {
-                    let label = format!("→ {} ({})", reference.target.qualified_name(), reference.fields.join(", "));
+                    let label = format!(
+                        "→ {} ({})",
+                        reference.target.qualified_name(),
+                        reference.fields.join(", ")
+                    );
                     context = context.child(
                         Button::new(("references", index), label)
                             .label_size(LabelSize::Small)
@@ -998,7 +1150,11 @@ impl ResultsView {
                     );
                 }
                 for (index, reference) in schema.referenced_by.iter().cloned().enumerate() {
-                    let label = format!("← {} ({})", reference.source.qualified_name(), reference.fields.join(", "));
+                    let label = format!(
+                        "← {} ({})",
+                        reference.source.qualified_name(),
+                        reference.fields.join(", ")
+                    );
                     context = context.child(
                         Button::new(("referenced-by", index), label)
                             .label_size(LabelSize::Small)
@@ -1017,14 +1173,24 @@ impl ResultsView {
             let mut section = v_flex().gap_1().child(section_label("History"));
             match history {
                 RowHistory::Loading => {
-                    section = section.child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted));
+                    section = section.child(
+                        Label::new("Loading…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    );
                 }
                 RowHistory::Failed(error) => {
-                    section = section.child(Label::new(error.clone()).size(LabelSize::Small).color(Color::Error));
+                    section = section.child(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    );
                 }
                 RowHistory::Loaded(versions) if versions.is_empty() => {
                     section = section.child(
-                        Label::new("No versions indexed yet.").size(LabelSize::Small).color(Color::Muted),
+                        Label::new("No versions indexed yet.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     );
                 }
                 RowHistory::Loaded(versions) => {
@@ -1079,7 +1245,10 @@ fn render_version(version: &HistoryEntry, older: Option<&HistoryEntry>) -> impl 
 }
 
 fn section_label(text: &'static str) -> impl IntoElement {
-    Label::new(text).size(LabelSize::XSmall).color(Color::Muted).weight(gpui::FontWeight::SEMIBOLD)
+    Label::new(text)
+        .size(LabelSize::XSmall)
+        .color(Color::Muted)
+        .weight(gpui::FontWeight::SEMIBOLD)
 }
 
 pub(crate) fn environment_badge(environment: DatabaseEnvironment) -> impl IntoElement {
@@ -1091,15 +1260,13 @@ pub(crate) fn environment_badge(environment: DatabaseEnvironment) -> impl IntoEl
     Label::new(text).size(LabelSize::XSmall).color(color)
 }
 
-fn set_sql_language(editor: &Entity<Editor>, workspace: &WeakEntity<Workspace>, cx: &mut App) {
+fn set_sql_language(
+    editor: &Entity<Editor>,
+    languages: Arc<language::LanguageRegistry>,
+    cx: &mut App,
+) {
     // SQL highlighting comes from the SQL extension when it is installed;
     // otherwise the editor stays plain text.
-    let Some(languages) = workspace
-        .upgrade()
-        .map(|workspace| workspace.read(cx).project().read(cx).languages().clone())
-    else {
-        return;
-    };
     let editor = editor.downgrade();
     cx.spawn(async move |cx| {
         let Ok(language) = languages.language_for_name("SQL").await else {
@@ -1133,7 +1300,9 @@ impl Item for ResultsView {
     fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
         match &self.mode {
             Mode::Query { .. } => format!("Query · {}", self.connection).into(),
-            Mode::Table { collection, .. } => format!("{} · {}", collection.name, self.connection).into(),
+            Mode::Table { collection, .. } => {
+                format!("{} · {}", collection.name, self.connection).into()
+            }
         }
     }
 
@@ -1168,7 +1337,11 @@ impl Render for ResultsView {
                 .gap_1()
                 .border_b_1()
                 .border_color(cx.theme().colors().border_variant)
-                .child(Icon::new(IconName::Filter).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    Icon::new(IconName::Filter)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
                 .child(div().flex_1().child(filter_editor.clone()))
                 .into_any_element(),
         };
@@ -1190,8 +1363,16 @@ impl Render for ResultsView {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex_1().h_full().min_w_0().child(self.render_grid(cx)))
-                    .when_some(detail_row, |this, row| this.child(self.render_detail(row, cx))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .child(self.render_grid(cx)),
+                    )
+                    .when_some(detail_row, |this, row| {
+                        this.child(self.render_detail(row, cx))
+                    }),
             )
     }
 }
@@ -1240,7 +1421,9 @@ fn split_clauses(text: &str) -> Vec<&str> {
 
 fn parse_clause(clause: &str, numbers_are_floats: bool) -> Result<Filter> {
     let field_end = clause
-        .find(|character: char| !(character.is_alphanumeric() || matches!(character, '_' | '.' | '$')))
+        .find(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '_' | '.' | '$'))
+        })
         .unwrap_or(clause.len());
     let field = clause[..field_end].to_string();
     if field.is_empty() {
@@ -1249,10 +1432,18 @@ fn parse_clause(clause: &str, numbers_are_floats: bool) -> Result<Filter> {
     let rest = clause[field_end..].trim_start();
     let lowered = rest.to_ascii_lowercase();
     if lowered == "is null" {
-        return Ok(Filter { field, op: FilterOp::IsNull, value: Value::Null });
+        return Ok(Filter {
+            field,
+            op: FilterOp::IsNull,
+            value: Value::Null,
+        });
     }
     if lowered == "is not null" {
-        return Ok(Filter { field, op: FilterOp::IsNotNull, value: Value::Null });
+        return Ok(Filter {
+            field,
+            op: FilterOp::IsNotNull,
+            value: Value::Null,
+        });
     }
     let operators = [
         ("!=", FilterOp::NotEq),
@@ -1264,7 +1455,10 @@ fn parse_clause(clause: &str, numbers_are_floats: bool) -> Result<Filter> {
         (">", FilterOp::Gt),
         ("~", FilterOp::Contains),
     ];
-    let Some((symbol, op)) = operators.iter().find(|(symbol, _)| rest.starts_with(symbol)) else {
+    let Some((symbol, op)) = operators
+        .iter()
+        .find(|(symbol, _)| rest.starts_with(symbol))
+    else {
         bail!("expected an operator (=, !=, <, <=, >, >=, ~, is null) in `{clause}`");
     };
     let literal = rest[symbol.len()..].trim();
@@ -1279,7 +1473,11 @@ fn parse_literal(literal: &str, numbers_are_floats: bool) -> Value {
     let unquoted = literal
         .strip_prefix('\'')
         .and_then(|rest| rest.strip_suffix('\''))
-        .or_else(|| literal.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')));
+        .or_else(|| {
+            literal
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        });
     if let Some(text) = unquoted {
         return Value::Text(text.to_string());
     }
@@ -1333,7 +1531,9 @@ pub(crate) fn query_language(store: &DatabaseStore, connection: &str) -> QueryLa
         _ => match store.entry(connection).map(|entry| entry.spec.kind) {
             Some(DatabaseKind::Convex) => QueryLanguage::None,
             Some(DatabaseKind::Postgres) => QueryLanguage::Postgres,
-            Some(DatabaseKind::Clickhouse | DatabaseKind::ClickhouseRelay) => QueryLanguage::ClickHouse,
+            Some(DatabaseKind::Clickhouse | DatabaseKind::ClickhouseRelay) => {
+                QueryLanguage::ClickHouse
+            }
             _ => QueryLanguage::MySql,
         },
     }
@@ -1345,13 +1545,20 @@ mod tests {
 
     #[test]
     fn test_parse_filters() {
-        let filters = parse_filters("email = 'a and b@x.com' AND id >= 10 and phone is null", false).unwrap();
+        let filters = parse_filters(
+            "email = 'a and b@x.com' AND id >= 10 and phone is null",
+            false,
+        )
+        .unwrap();
         assert_eq!(filters.len(), 3);
         assert_eq!(filters[0].value, Value::Text("a and b@x.com".into()));
         assert_eq!(filters[1].op, FilterOp::Gte);
         assert_eq!(filters[1].value, Value::Int(10));
         assert_eq!(filters[2].op, FilterOp::IsNull);
-        assert_eq!(parse_filters("ryseSellerId = 2", true).unwrap()[0].value, Value::Float(2.0));
+        assert_eq!(
+            parse_filters("ryseSellerId = 2", true).unwrap()[0].value,
+            Value::Float(2.0)
+        );
         assert!(parse_filters("= 3", false).is_err());
         assert!(parse_filters("id ?? 3", false).is_err());
         let round_trip = format_filters(&filters);

@@ -4,6 +4,7 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
+use context_server::ContextServerCommand;
 use context_server::{
     listener::{McpServer, McpServerTool, ToolResponse},
     types::{
@@ -14,11 +15,12 @@ use context_server::{
 use database::{
     BrowseRequest, Capability, Change, ChangeSet, CollectionRef, CompareOptions, CompareRow,
     CompareSide, ConnectionEntry, ConnectionState, DatabaseAgentAccess, DatabaseKind,
-    DatabaseStore, DatabaseWriteApproval, FetchSource, Filter, FilterOp, ResultSet, Value,
-    compare,
+    DatabaseStore, DatabaseWriteApproval, FetchSource, Filter, FilterOp, ResultSet, Value, compare,
 };
-use gpui::{AnyWindowHandle, AsyncApp, BorrowAppContext as _, Entity, EntityId, Global, Task, WeakEntity, Window};
-use context_server::ContextServerCommand;
+use gpui::{
+    AnyWindowHandle, AsyncApp, BorrowAppContext as _, Entity, EntityId, Global, Task, WeakEntity,
+    Window,
+};
 use project::project_settings::ContextServerSettings;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -38,7 +40,11 @@ struct AgentToolServers(HashMap<EntityId, (McpServer, Vec<WeakEntity<Workspace>>
 
 impl Global for AgentToolServers {}
 
-pub(crate) fn register(workspace: &mut Workspace, window: &mut Window, cx: &mut gpui::Context<Workspace>) {
+pub(crate) fn register(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
     let project = workspace.project().clone();
     if !project.read(cx).is_local() {
         // The agent of a remote project runs on the remote host, which cannot
@@ -77,7 +83,9 @@ pub(crate) fn register(workspace: &mut Workspace, window: &mut Window, cx: &mut 
             Task::ready(Ok(InitializeResponse {
                 protocol_version: ProtocolVersion(params.protocol_version.0),
                 capabilities: ServerCapabilities {
-                    tools: Some(ToolsCapabilities { list_changed: Some(false) }),
+                    tools: Some(ToolsCapabilities {
+                        list_changed: Some(false),
+                    }),
                     ..ServerCapabilities::default()
                 },
                 server_info: Implementation {
@@ -157,16 +165,25 @@ impl ToolContext {
         Ok(entry)
     }
 
-    async fn ensure_connected(&self, connection: &str, cx: &mut AsyncApp) -> Result<(Capability, DatabaseKind)> {
+    async fn ensure_connected(
+        &self,
+        connection: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<(Capability, DatabaseKind)> {
         let store = self.store()?;
         let state = store.read_with(cx, |store, _| store.state(connection));
         if !matches!(state, ConnectionState::Connected { .. }) {
-            store.update(cx, |store, cx| store.connect(connection, cx)).await?;
+            store
+                .update(cx, |store, cx| store.connect(connection, cx))
+                .await?;
         }
         store.read_with(cx, |store, _| match store.state(connection) {
             ConnectionState::Connected { capability, .. } => Ok((
                 capability,
-                store.entry(connection).map(|entry| entry.spec.kind).unwrap_or(DatabaseKind::Mysql),
+                store
+                    .entry(connection)
+                    .map(|entry| entry.spec.kind)
+                    .unwrap_or(DatabaseKind::Mysql),
             )),
             _ => Err(anyhow!("`{connection}` is not connected")),
         })
@@ -178,7 +195,9 @@ impl ToolContext {
         let receiver = self
             .window
             .update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| ApprovalModal::ask(workspace, approval, window, cx))
+                workspace.update(cx, |workspace, cx| {
+                    ApprovalModal::ask(workspace, approval, window, cx)
+                })
             })
             .context("the Echo window was closed")??;
         if receiver.await.unwrap_or(false) {
@@ -188,12 +207,23 @@ impl ToolContext {
         }
     }
 
-    async fn collection(&self, connection: &str, table: &str, cx: &mut AsyncApp) -> Result<CollectionRef> {
+    async fn collection(
+        &self,
+        connection: &str,
+        table: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<CollectionRef> {
         let store = self.store()?;
-        let known = store.read_with(cx, |store, _| store.collections(connection).map(<[_]>::to_vec));
+        let known = store.read_with(cx, |store, _| {
+            store.collections(connection).map(<[_]>::to_vec)
+        });
         let collections = match known {
             Some(collections) => collections,
-            None => store.update(cx, |store, cx| store.refresh_collections(connection, cx)).await?,
+            None => {
+                store
+                    .update(cx, |store, cx| store.refresh_collections(connection, cx))
+                    .await?
+            }
         };
         let (namespace, name) = match table.split_once('.') {
             Some((namespace, name)) => (Some(namespace), name),
@@ -203,12 +233,16 @@ impl ToolContext {
             .iter()
             .filter(|collection| {
                 collection.reference.name == name
-                    && namespace.is_none_or(|namespace| collection.reference.namespace.as_deref() == Some(namespace))
+                    && namespace.is_none_or(|namespace| {
+                        collection.reference.namespace.as_deref() == Some(namespace)
+                    })
             })
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [only] => Ok(only.reference.clone()),
-            [] => bail!("no table `{table}` in `{connection}`; call describe without a table to list them"),
+            [] => bail!(
+                "no table `{table}` in `{connection}`; call describe without a table to list them"
+            ),
             _ => bail!("`{table}` is ambiguous in `{connection}`; qualify it as schema.table"),
         }
     }
@@ -236,7 +270,9 @@ fn value_from_json(value: &serde_json::Value, kind: DatabaseKind) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(value) => Value::Bool(*value),
         serde_json::Value::Number(number) => match (kind, number.as_i64()) {
-            (DatabaseKind::Convex, _) | (_, None) => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
+            (DatabaseKind::Convex, _) | (_, None) => {
+                Value::Float(number.as_f64().unwrap_or(f64::NAN))
+            }
             (_, Some(integer)) => Value::Int(integer),
         },
         serde_json::Value::String(text) => Value::Text(text.clone()),
@@ -354,7 +390,9 @@ impl McpServerTool for Describe {
         let store = self.0.store()?;
         let Some(table) = input.table else {
             let collections = store
-                .update(cx, |store, cx| store.refresh_collections(&input.connection, cx))
+                .update(cx, |store, cx| {
+                    store.refresh_collections(&input.connection, cx)
+                })
                 .await?;
             let names = collections
                 .iter()
@@ -364,7 +402,9 @@ impl McpServerTool for Describe {
         };
         let collection = self.0.collection(&input.connection, &table, cx).await?;
         let schema = store
-            .update(cx, |store, cx| store.describe(&input.connection, &collection, cx))
+            .update(cx, |store, cx| {
+                store.describe(&input.connection, &collection, cx)
+            })
             .await?;
         Ok(text(serde_json::to_string_pretty(&schema)?))
     }
@@ -400,7 +440,10 @@ impl McpServerTool for Query {
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
         let entry = self.0.entry(&input.connection, cx)?;
         let (_, kind) = self.0.ensure_connected(&input.connection, cx).await?;
-        let limit = input.limit.unwrap_or(DEFAULT_ROW_LIMIT).clamp(1, MAX_ROW_LIMIT);
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_ROW_LIMIT)
+            .clamp(1, MAX_ROW_LIMIT);
         let store = self.0.store()?;
         let filters = filters(input.filters.as_deref().unwrap_or_default(), kind)?;
         let (description, rows) = match (&input.sql, &input.table) {
@@ -410,7 +453,11 @@ impl McpServerTool for Query {
                         .approve(
                             Approval {
                                 title: format!("Let the agent query {}?", entry.name).into(),
-                                subtitle: Some(format!("{:?} · read-only", entry.environment).to_lowercase().into()),
+                                subtitle: Some(
+                                    format!("{:?} · read-only", entry.environment)
+                                        .to_lowercase()
+                                        .into(),
+                                ),
                                 detail: sql.clone(),
                                 confirm_label: "Run".into(),
                                 environment: entry.environment,
@@ -420,7 +467,9 @@ impl McpServerTool for Query {
                         .await?;
                 }
                 let rows = store
-                    .update(cx, |store, cx| store.query(&input.connection, sql.clone(), limit, true, cx))
+                    .update(cx, |store, cx| {
+                        store.query(&input.connection, sql.clone(), limit, true, cx)
+                    })
                     .await?;
                 (sql.clone(), rows)
             }
@@ -432,7 +481,9 @@ impl McpServerTool for Query {
                         .approve(
                             Approval {
                                 title: format!("Let the agent read {}?", entry.name).into(),
-                                subtitle: Some(format!("{:?}", entry.environment).to_lowercase().into()),
+                                subtitle: Some(
+                                    format!("{:?}", entry.environment).to_lowercase().into(),
+                                ),
                                 detail: description.clone(),
                                 confirm_label: "Read".into(),
                                 environment: entry.environment,
@@ -446,7 +497,11 @@ impl McpServerTool for Query {
                         store.browse(
                             &input.connection,
                             &collection,
-                            BrowseRequest { filters, cursor: None, page_size: limit },
+                            BrowseRequest {
+                                filters,
+                                cursor: None,
+                                page_size: limit,
+                            },
                             cx,
                         )
                     })
@@ -457,7 +512,11 @@ impl McpServerTool for Query {
             }
             (None, None) => bail!("pass `sql` or `table`"),
         };
-        log::info!("agent read {} rows from {}: {description}", rows.rows.len(), input.connection);
+        log::info!(
+            "agent read {} rows from {}: {description}",
+            rows.rows.len(),
+            input.connection
+        );
         Ok(text(serde_json::to_string(&rows_json(&rows))?))
     }
 }
@@ -520,8 +579,11 @@ impl McpServerTool for Compare {
                 self.0
                     .approve(
                         Approval {
-                            title: format!("Let the agent read {} for a comparison?", entry.name).into(),
-                            subtitle: Some(format!("{:?}", entry.environment).to_lowercase().into()),
+                            title: format!("Let the agent read {} for a comparison?", entry.name)
+                                .into(),
+                            subtitle: Some(
+                                format!("{:?}", entry.environment).to_lowercase().into(),
+                            ),
                             detail: format!("{source:?}"),
                             confirm_label: "Read".into(),
                             environment: entry.environment,
@@ -532,15 +594,23 @@ impl McpServerTool for Compare {
             }
             let store = self.0.store()?;
             let rows = store
-                .update(cx, |store, cx| store.fetch_all(&side.connection, source, COMPARE_ROW_CAP, cx))
+                .update(cx, |store, cx| {
+                    store.fetch_all(&side.connection, source, COMPARE_ROW_CAP, cx)
+                })
                 .await?;
             fetched.push(rows);
         }
         let right = fetched.pop().context("missing right side")?;
         let left = fetched.pop().context("missing left side")?;
         let outcome = compare(
-            CompareSide { rows: &left, key: &input.left.key },
-            CompareSide { rows: &right, key: &input.right.key },
+            CompareSide {
+                rows: &left,
+                key: &input.left.key,
+            },
+            CompareSide {
+                rows: &right,
+                key: &input.right.key,
+            },
             &CompareOptions {
                 fields: input
                     .fields
@@ -630,7 +700,10 @@ impl McpServerTool for Write {
         if let Capability::ReadOnly { reason } = capability {
             bail!("`{}` is read-only: {reason}", input.connection);
         }
-        let collection = self.0.collection(&input.connection, &input.table, cx).await?;
+        let collection = self
+            .0
+            .collection(&input.connection, &input.table, cx)
+            .await?;
         let assignments = |map: &Option<serde_json::Map<String, serde_json::Value>>| {
             map.iter()
                 .flatten()
@@ -642,21 +715,30 @@ impl McpServerTool for Write {
             .iter()
             .map(|change| {
                 Ok(match change.op.as_str() {
-                    "insert" => Change::Insert { values: assignments(&change.values) },
+                    "insert" => Change::Insert {
+                        values: assignments(&change.values),
+                    },
                     "update" => Change::Update {
                         key: assignments(&change.key),
                         set: assignments(&change.values),
                     },
-                    "delete" => Change::Delete { key: assignments(&change.key) },
+                    "delete" => Change::Delete {
+                        key: assignments(&change.key),
+                    },
                     other => bail!("unknown op `{other}`; use insert, update or delete"),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(!changes.is_empty(), "no changes given");
-        let changes = ChangeSet { collection, changes };
+        let changes = ChangeSet {
+            collection,
+            changes,
+        };
         let store = self.0.store()?;
         let preview = store
-            .update(cx, |store, cx| store.render_changes(&input.connection, changes.clone(), cx))
+            .update(cx, |store, cx| {
+                store.render_changes(&input.connection, changes.clone(), cx)
+            })
             .await?;
         // Agent writes are always approved: in Echo with the exact statements
         // (`preview`), or by the agent's own permission prompt (`prompt`).
@@ -665,7 +747,15 @@ impl McpServerTool for Write {
                 .approve(
                     Approval {
                         title: format!("Let the agent change {}?", entry.name).into(),
-                        subtitle: Some(format!("{:?} · {} change(s)", entry.environment, changes.changes.len()).to_lowercase().into()),
+                        subtitle: Some(
+                            format!(
+                                "{:?} · {} change(s)",
+                                entry.environment,
+                                changes.changes.len()
+                            )
+                            .to_lowercase()
+                            .into(),
+                        ),
                         detail: preview.clone(),
                         confirm_label: "Apply".into(),
                         environment: entry.environment,
@@ -699,7 +789,13 @@ mod tests {
     fn test_json_numbers_follow_the_engine() {
         let number = serde_json::json!(2);
         assert_eq!(value_from_json(&number, DatabaseKind::Mysql), Value::Int(2));
-        assert_eq!(value_from_json(&number, DatabaseKind::Convex), Value::Float(2.0));
-        assert_eq!(value_from_json(&serde_json::json!(2.5), DatabaseKind::Mysql), Value::Float(2.5));
+        assert_eq!(
+            value_from_json(&number, DatabaseKind::Convex),
+            Value::Float(2.0)
+        );
+        assert_eq!(
+            value_from_json(&serde_json::json!(2.5), DatabaseKind::Mysql),
+            Value::Float(2.5)
+        );
     }
 }

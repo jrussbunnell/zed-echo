@@ -122,7 +122,11 @@ impl Render for ApprovalModal {
                             .child(Headline::new(self.title.clone()).size(HeadlineSize::Small)),
                     )
                     .when_some(self.subtitle.clone(), |this, subtitle| {
-                        this.child(Label::new(subtitle).color(Color::Muted).size(LabelSize::Small))
+                        this.child(
+                            Label::new(subtitle)
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
                     }),
             )
             .child(
@@ -253,7 +257,10 @@ impl Render for SecretModal {
             .w(rems(28.))
             .p_3()
             .gap_2()
-            .child(Headline::new(format!("{}: {}", self.connection, self.label)).size(HeadlineSize::Small))
+            .child(
+                Headline::new(format!("{}: {}", self.connection, self.label))
+                    .size(HeadlineSize::Small),
+            )
             .child(
                 div()
                     .p_1()
@@ -268,7 +275,11 @@ impl Render for SecretModal {
                     .color(Color::Muted),
             )
             .when(self.saving.is_some(), |this| {
-                this.child(Label::new("Connecting…").size(LabelSize::Small).color(Color::Muted))
+                this.child(
+                    Label::new("Connecting…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
             })
             .when_some(self.error.clone(), |this, error| {
                 this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
@@ -313,7 +324,12 @@ impl PickerDelegate for QueryHistoryDelegate {
         self.selected
     }
 
-    fn set_selected_index(&mut self, ix: usize, _: &mut Window, _: &mut gpui::Context<Picker<Self>>) {
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        _: &mut gpui::Context<Picker<Self>>,
+    ) {
         self.selected = ix;
     }
 
@@ -355,7 +371,14 @@ impl PickerDelegate for QueryHistoryDelegate {
         let store = self.store.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                ResultsView::open_query(workspace, store, entry.connection.into(), Some(entry.text), window, cx);
+                ResultsView::open_query(
+                    workspace,
+                    store,
+                    entry.connection.into(),
+                    Some(entry.text),
+                    window,
+                    cx,
+                );
             })
             .log_err();
         cx.emit(DismissEvent);
@@ -374,7 +397,11 @@ impl PickerDelegate for QueryHistoryDelegate {
     ) -> Option<Self::ListItem> {
         let entry = self.entries.get(*self.matches.get(ix)?)?;
         let when = chrono::DateTime::from_timestamp(entry.ran_at, 0)
-            .map(|time| time.with_timezone(&chrono::Local).format("%b %-d %H:%M").to_string())
+            .map(|time| {
+                time.with_timezone(&chrono::Local)
+                    .format("%b %-d %H:%M")
+                    .to_string()
+            })
             .unwrap_or_default();
         let outcome = match (&entry.rows, &entry.error) {
             (_, Some(_)) => "failed".to_string(),
@@ -392,7 +419,11 @@ impl PickerDelegate for QueryHistoryDelegate {
                         .child(
                             Label::new(format!("{} · {when} · {outcome}", entry.connection))
                                 .size(LabelSize::Small)
-                                .color(if entry.error.is_some() { Color::Error } else { Color::Muted }),
+                                .color(if entry.error.is_some() {
+                                    Color::Error
+                                } else {
+                                    Color::Muted
+                                }),
                         ),
                 ),
         )

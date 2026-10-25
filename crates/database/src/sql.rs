@@ -17,7 +17,11 @@ pub(crate) struct SqlSource {
 }
 
 impl SqlSource {
-    pub async fn connect(name: &str, spec: &ConnectionSpec, secret: Option<String>) -> Result<Self> {
+    pub async fn connect(
+        name: &str,
+        spec: &ConnectionSpec,
+        secret: Option<String>,
+    ) -> Result<Self> {
         let mut config = ConnectionConfig::new(kind_name(spec.kind), name);
         config.host = spec.host.clone().unwrap_or_else(|| "localhost".to_string());
         config.port = spec.port.unwrap_or_else(|| default_port(spec.kind));
@@ -91,7 +95,9 @@ impl SqlSource {
 
     fn table(&self, collection: &CollectionRef) -> String {
         match &collection.namespace {
-            Some(namespace) => format!("{}.{}", self.quote(namespace), self.quote(&collection.name)),
+            Some(namespace) => {
+                format!("{}.{}", self.quote(namespace), self.quote(&collection.name))
+            }
             None => self.quote(&collection.name),
         }
     }
@@ -134,7 +140,11 @@ impl SqlSource {
                         let assignments = set
                             .iter()
                             .map(|(field, value)| {
-                                format!("{} = {}", self.quote(field), self.bind(value, &mut params, inline))
+                                format!(
+                                    "{} = {}",
+                                    self.quote(field),
+                                    self.bind(value, &mut params, inline)
+                                )
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
@@ -175,13 +185,22 @@ impl SqlSource {
         }
     }
 
-    fn key_condition(&self, key: &[(String, Value)], params: &mut Vec<Value>, inline: bool) -> String {
+    fn key_condition(
+        &self,
+        key: &[(String, Value)],
+        params: &mut Vec<Value>,
+        inline: bool,
+    ) -> String {
         key.iter()
             .map(|(field, value)| {
                 if value.is_nullish() {
                     format!("{} IS NULL", self.quote(field))
                 } else {
-                    format!("{} = {}", self.quote(field), self.bind(value, params, inline))
+                    format!(
+                        "{} = {}",
+                        self.quote(field),
+                        self.bind(value, params, inline)
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -200,7 +219,9 @@ impl SqlSource {
             FilterOp::Contains => {
                 let pattern = Value::Text(format!("%{}%", filter.value.display()));
                 match self.kind {
-                    DatabaseKind::Postgres => format!("CAST({field} AS TEXT) ILIKE {}", bind(pattern)),
+                    DatabaseKind::Postgres => {
+                        format!("CAST({field} AS TEXT) ILIKE {}", bind(pattern))
+                    }
                     _ => format!("{field} LIKE {}", bind(pattern)),
                 }
             }
@@ -239,18 +260,23 @@ impl SqlSource {
             });
         }
         let mut grants = text_column(&self.rows("SHOW GRANTS", &[]).await?);
-        let roles = grants.iter().filter_map(|grant| granted_role(grant)).collect::<Vec<_>>();
+        let roles = grants
+            .iter()
+            .filter_map(|grant| granted_role(grant))
+            .collect::<Vec<_>>();
         if !roles.is_empty() {
             let sql = format!("SHOW GRANTS FOR CURRENT_USER() USING {}", roles.join(", "));
             grants.extend(text_column(&self.rows(&sql, &[]).await?));
         }
-        Ok(if mysql_grants_allow_writes(&grants, self.database.as_deref()) {
-            Capability::Writable
-        } else {
-            Capability::ReadOnly {
-                reason: "this user has no INSERT, UPDATE or DELETE grant".to_string(),
-            }
-        })
+        Ok(
+            if mysql_grants_allow_writes(&grants, self.database.as_deref()) {
+                Capability::Writable
+            } else {
+                Capability::ReadOnly {
+                    reason: "this user has no INSERT, UPDATE or DELETE grant".to_string(),
+                }
+            },
+        )
     }
 
     async fn probe_postgres(&self) -> Result<Capability> {
@@ -353,7 +379,9 @@ impl Source for SqlSource {
     async fn describe(&self, collection: &CollectionRef) -> Result<CollectionSchema> {
         let introspection = self.introspection()?;
         let namespace = collection.namespace.as_deref();
-        let columns = introspection.get_columns(namespace, &collection.name).await?;
+        let columns = introspection
+            .get_columns(namespace, &collection.name)
+            .await?;
         let mut primary_key = self.primary_key(collection).await?;
         if primary_key.is_empty() {
             primary_key = columns
@@ -600,7 +628,10 @@ fn sql_literal(kind: DatabaseKind, value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::Bytes(bytes) => {
-            let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            let hex = bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             match kind {
                 DatabaseKind::Postgres => format!("'\\x{hex}'"),
                 _ => format!("X'{hex}'"),
@@ -644,7 +675,9 @@ fn check_read_only_statement(kind: DatabaseKind, text: &str) -> Result<()> {
         .unwrap_or_default();
     let allowed: &[&str] = match kind {
         DatabaseKind::Postgres => &["SELECT", "WITH", "VALUES", "TABLE", "SHOW", "EXPLAIN"],
-        _ => &["SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN"],
+        _ => &[
+            "SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN",
+        ],
     };
     if !allowed.contains(&first.as_str()) {
         bail!("only reading statements run here; `{first}` would need a writable query");
@@ -693,7 +726,9 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
             }
             '/' if next == Some('*') => {
                 index += 2;
-                while index + 1 < characters.len() && !(characters[index] == '*' && characters[index + 1] == '/') {
+                while index + 1 < characters.len()
+                    && !(characters[index] == '*' && characters[index + 1] == '/')
+                {
                     index += 1;
                 }
                 index += 2;
@@ -710,7 +745,9 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
                         let body_start = tag_end + 1;
                         let rest = characters[body_start..].iter().collect::<String>();
                         index = match rest.find(&tag) {
-                            Some(offset) => body_start + rest[..offset].chars().count() + tag.chars().count(),
+                            Some(offset) => {
+                                body_start + rest[..offset].chars().count() + tag.chars().count()
+                            }
                             None => characters.len(),
                         };
                     }
@@ -723,7 +760,9 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
             }
             character if character.is_alphabetic() || character == '_' => {
                 let start = index;
-                while index < characters.len() && (characters[index].is_alphanumeric() || characters[index] == '_') {
+                while index < characters.len()
+                    && (characters[index].is_alphanumeric() || characters[index] == '_')
+                {
                     index += 1;
                 }
                 tokens.push(characters[start..index].iter().collect());
@@ -822,7 +861,12 @@ mod tests {
 
     #[test]
     fn test_mysql_grants() {
-        let grants = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect::<Vec<_>>();
+        let grants = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        };
         assert!(!mysql_grants_allow_writes(
             &grants(&["GRANT SELECT ON *.* TO `reader`@`%`"]),
             Some("ryse")
@@ -863,6 +907,8 @@ mod tests {
         assert!(check("/* SELECT */ DELETE FROM seller").is_err());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SHOW TABLES").is_ok());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 'it\\'s;' # x").is_ok());
-        assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 1 # ;\n; DROP TABLE t").is_err());
+        assert!(
+            check_read_only_statement(DatabaseKind::Mysql, "SELECT 1 # ;\n; DROP TABLE t").is_err()
+        );
     }
 }

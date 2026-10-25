@@ -29,8 +29,14 @@ pub struct FieldDiff {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompareRow {
-    LeftOnly { key: Vec<Value>, row: usize },
-    RightOnly { key: Vec<Value>, row: usize },
+    LeftOnly {
+        key: Vec<Value>,
+        row: usize,
+    },
+    RightOnly {
+        key: Vec<Value>,
+        row: usize,
+    },
     Matched {
         key: Vec<Value>,
         left_row: usize,
@@ -60,11 +66,17 @@ pub struct CompareOutcome {
 
 impl CompareOutcome {
     pub fn left_only(&self) -> usize {
-        self.rows.iter().filter(|row| matches!(row, CompareRow::LeftOnly { .. })).count()
+        self.rows
+            .iter()
+            .filter(|row| matches!(row, CompareRow::LeftOnly { .. }))
+            .count()
     }
 
     pub fn right_only(&self) -> usize {
-        self.rows.iter().filter(|row| matches!(row, CompareRow::RightOnly { .. })).count()
+        self.rows
+            .iter()
+            .filter(|row| matches!(row, CompareRow::RightOnly { .. }))
+            .count()
     }
 
     pub fn changed(&self) -> usize {
@@ -84,9 +96,16 @@ impl CompareOutcome {
 
 /// A keyed diff of two full result sets, which may come from different
 /// engines. Both sides are held in memory and joined by hash.
-pub fn compare(left: CompareSide, right: CompareSide, options: &CompareOptions) -> anyhow::Result<CompareOutcome> {
+pub fn compare(
+    left: CompareSide,
+    right: CompareSide,
+    options: &CompareOptions,
+) -> anyhow::Result<CompareOutcome> {
     anyhow::ensure!(!left.key.is_empty(), "choose a key on the left");
-    anyhow::ensure!(left.key.len() == right.key.len(), "both sides need the same number of key fields");
+    anyhow::ensure!(
+        left.key.len() == right.key.len(),
+        "both sides need the same number of key fields"
+    );
     let left_key = key_indices(left.rows, left.key)?;
     let right_key = key_indices(right.rows, right.key)?;
 
@@ -117,7 +136,10 @@ pub fn compare(left: CompareSide, right: CompareSide, options: &CompareOptions) 
     };
     let mut right_by_key: HashMap<Vec<String>, usize> = HashMap::default();
     for (index, row) in right.rows.rows.iter().enumerate() {
-        if right_by_key.insert(canonical_key(row, &right_key), index).is_some() {
+        if right_by_key
+            .insert(canonical_key(row, &right_key), index)
+            .is_some()
+        {
             outcome.duplicate_right_keys += 1;
         }
     }
@@ -173,7 +195,9 @@ pub fn compare(left: CompareSide, right: CompareSide, options: &CompareOptions) 
         }
     }
     for (right_index, row) in right.rows.rows.iter().enumerate() {
-        if !matched_right[right_index] && right_by_key.get(&canonical_key(row, &right_key)) == Some(&right_index) {
+        if !matched_right[right_index]
+            && right_by_key.get(&canonical_key(row, &right_key)) == Some(&right_index)
+        {
             outcome.rows.push(CompareRow::RightOnly {
                 key: right_key.iter().map(|index| row[*index].clone()).collect(),
                 row: right_index,
@@ -193,7 +217,10 @@ fn field_index(rows: &ResultSet, field: &str) -> anyhow::Result<usize> {
 }
 
 fn canonical_key(row: &[Value], indices: &[usize]) -> Vec<String> {
-    indices.iter().map(|index| key_string(&row[*index])).collect()
+    indices
+        .iter()
+        .map(|index| key_string(&row[*index]))
+        .collect()
 }
 
 fn key_string(value: &Value) -> String {
@@ -240,7 +267,9 @@ fn canonical(value: &Value) -> Canonical {
         Value::Int(value) => Canonical::Number(*value as f64),
         Value::Float(value) => Canonical::Number(*value),
         Value::Text(text) => match text.trim().parse::<f64>() {
-            Ok(number) if !text.trim().is_empty() && number.is_finite() => Canonical::Number(number),
+            Ok(number) if !text.trim().is_empty() && number.is_finite() => {
+                Canonical::Number(number)
+            }
             _ => Canonical::Text(text.clone()),
         },
         Value::Bytes(bytes) => Canonical::Other(format!("{bytes:?}")),
@@ -254,10 +283,18 @@ fn equivalence(left: &Value, right: &Value) -> Equivalence {
     }
     if let (Value::Int(left), Value::Int(right)) = (left, right) {
         // Exact, so large ids beyond 2^53 are not conflated.
-        return if left == right { Equivalence::Same } else { Equivalence::Different };
+        return if left == right {
+            Equivalence::Same
+        } else {
+            Equivalence::Different
+        };
     }
     if let (Value::Float(left), Value::Float(right)) = (left, right) {
-        return if left == right { Equivalence::Same } else { Equivalence::Different };
+        return if left == right {
+            Equivalence::Same
+        } else {
+            Equivalence::Different
+        };
     }
     let (left_canonical, right_canonical) = (canonical(left), canonical(right));
     if left_canonical == right_canonical {
@@ -272,13 +309,18 @@ fn equivalence(left: &Value, right: &Value) -> Equivalence {
         }
         _ => {}
     }
-    if let (Some(left_time), Some(right_time)) = (as_epoch_millis(left, right), as_epoch_millis(right, left))
+    if let (Some(left_time), Some(right_time)) =
+        (as_epoch_millis(left, right), as_epoch_millis(right, left))
         && (left_time - right_time).abs() < 1.0
     {
         return Equivalence::Representation;
     }
-    if let (Value::Json(json), Value::Text(text)) | (Value::Text(text), Value::Json(json)) = (left, right)
-        && serde_json::from_str::<serde_json::Value>(text).ok().as_ref() == Some(json)
+    if let (Value::Json(json), Value::Text(text)) | (Value::Text(text), Value::Json(json)) =
+        (left, right)
+        && serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .as_ref()
+            == Some(json)
     {
         return Equivalence::Representation;
     }
@@ -303,7 +345,11 @@ fn as_epoch_millis(value: &Value, other: &Value) -> Option<f64> {
         _ => return None,
     };
     // Ten digits of seconds cover 2001-2286; anything larger is milliseconds.
-    Some(if number.abs() < 1e11 { number * 1000.0 } else { number })
+    Some(if number.abs() < 1e11 {
+        number * 1000.0
+    } else {
+        number
+    })
 }
 
 fn parse_datetime_millis(text: &str) -> Option<f64> {
@@ -311,7 +357,11 @@ fn parse_datetime_millis(text: &str) -> Option<f64> {
     if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
         return Some(time.timestamp_millis() as f64);
     }
-    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
         if let Ok(time) = chrono::NaiveDateTime::parse_from_str(text, format) {
             return Some(time.and_utc().timestamp_millis() as f64);
         }
@@ -357,24 +407,60 @@ mod tests {
         let left = result_set(
             &["id", "email", "created", "phone"],
             vec![
-                vec![Value::Int(1), Value::Text("a@x.com".into()), Value::Text("2026-10-24 00:00:00".into()), Value::Null],
-                vec![Value::Int(2), Value::Text("b@x.com".into()), Value::Null, Value::Null],
-                vec![Value::Int(3), Value::Text("c@x.com".into()), Value::Null, Value::Null],
+                vec![
+                    Value::Int(1),
+                    Value::Text("a@x.com".into()),
+                    Value::Text("2026-10-24 00:00:00".into()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Text("b@x.com".into()),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    Value::Int(3),
+                    Value::Text("c@x.com".into()),
+                    Value::Null,
+                    Value::Null,
+                ],
             ],
         );
         let right = result_set(
             &["ryseSellerId", "email", "createdAt", "phone"],
             vec![
-                vec![Value::Float(1.0), Value::Text("a@x.com".into()), Value::Float(1_792_800_000_000.0), Value::Missing],
-                vec![Value::Float(2.0), Value::Text("B@x.com".into()), Value::Missing, Value::Missing],
-                vec![Value::Float(4.0), Value::Text("d@x.com".into()), Value::Missing, Value::Missing],
+                vec![
+                    Value::Float(1.0),
+                    Value::Text("a@x.com".into()),
+                    Value::Float(1_792_800_000_000.0),
+                    Value::Missing,
+                ],
+                vec![
+                    Value::Float(2.0),
+                    Value::Text("B@x.com".into()),
+                    Value::Missing,
+                    Value::Missing,
+                ],
+                vec![
+                    Value::Float(4.0),
+                    Value::Text("d@x.com".into()),
+                    Value::Missing,
+                    Value::Missing,
+                ],
             ],
         );
         let left_key = ["id".to_string()];
         let right_key = ["ryseSellerId".to_string()];
         let outcome = compare(
-            CompareSide { rows: &left, key: &left_key },
-            CompareSide { rows: &right, key: &right_key },
+            CompareSide {
+                rows: &left,
+                key: &left_key,
+            },
+            CompareSide {
+                rows: &right,
+                key: &right_key,
+            },
             &CompareOptions {
                 fields: vec![
                     ("email".into(), "email".into()),
@@ -391,18 +477,30 @@ mod tests {
         let CompareRow::Matched { diffs, .. } = &outcome.rows[0] else {
             panic!("row 1 should match");
         };
-        assert!(diffs.iter().all(|diff| diff.representation_only), "{diffs:?}");
+        assert!(
+            diffs.iter().all(|diff| diff.representation_only),
+            "{diffs:?}"
+        );
         let CompareRow::Matched { diffs, .. } = &outcome.rows[1] else {
             panic!("row 2 should match");
         };
-        assert_eq!(diffs.iter().filter(|diff| !diff.representation_only).count(), 1);
+        assert_eq!(
+            diffs
+                .iter()
+                .filter(|diff| !diff.representation_only)
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn test_large_integer_ids_stay_distinct() {
         let left = result_set(&["id"], vec![vec![Value::Int(9_007_199_254_740_993)]]);
         let right = result_set(&["id"], vec![vec![Value::Int(9_007_199_254_740_992)]]);
-        assert_eq!(equivalence(&left.rows[0][0], &right.rows[0][0]), Equivalence::Different);
+        assert_eq!(
+            equivalence(&left.rows[0][0], &right.rows[0][0]),
+            Equivalence::Different
+        );
     }
 
     #[test]
@@ -411,8 +509,14 @@ mod tests {
         let right = result_set(&["id"], vec![vec![Value::Int(1)], vec![Value::Int(1)]]);
         let key = ["id".to_string()];
         let outcome = compare(
-            CompareSide { rows: &left, key: &key },
-            CompareSide { rows: &right, key: &key },
+            CompareSide {
+                rows: &left,
+                key: &key,
+            },
+            CompareSide {
+                rows: &right,
+                key: &key,
+            },
             &CompareOptions::default(),
         )
         .unwrap();

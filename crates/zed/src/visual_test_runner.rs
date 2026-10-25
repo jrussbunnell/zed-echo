@@ -247,6 +247,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     // Run until all initialization tasks complete
     cx.run_until_parked();
 
+    // The database views need live databases (script/database-test-containers),
+    // so they run on their own, and only when asked for.
+    if std::env::var("DATABASE_LIVE_TESTS").is_ok_and(|value| value == "1") {
+        return run_database_visual_tests(app_state, &mut cx);
+    }
+
     // Open workspace window
     let window_size = size(px(1280.0), px(800.0));
     let bounds = Bounds {
@@ -3596,4 +3602,270 @@ fn run_sidebar_duplicate_project_names_visual_tests(
     } else {
         Ok(TestResult::Passed)
     }
+}
+
+/// Polls until `done` holds, letting real I/O (database drivers on Tokio)
+/// finish between runs of the deterministic scheduler.
+#[cfg(target_os = "macos")]
+fn wait_for(
+    cx: &mut VisualTestAppContext,
+    description: &str,
+    mut done: impl FnMut(&mut VisualTestAppContext) -> bool,
+) -> Result<()> {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if done(cx) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!("timed out waiting for {description}")
+}
+
+#[cfg(target_os = "macos")]
+fn run_database_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    use database::{CollectionRef, ConnectionState, DatabaseStore};
+    use database_panel::{CompareView, DatabasePanel, ResultsView, SavedCompare};
+
+    let convex_key = std::fs::read_to_string("/tmp/echo-db-convex-key")
+        .context("run script/database-test-containers first")?;
+    let project_dir = tempfile::tempdir()?.keep().canonicalize()?;
+    std::fs::create_dir_all(project_dir.join(".zed"))?;
+    std::fs::write(
+        project_dir.join(".zed/settings.json"),
+        r#"{ "database": { "connections": {
+            "atlas": { "kind": "convex", "url": "http://127.0.0.1:13210", "environment": "local", "history": true }
+        } } }"#,
+    )?;
+
+    cx.update(|cx| {
+        // The runner's default client answers 404 to everything; ClickHouse
+        // and Convex speak HTTP.
+        cx.set_http_client(Arc::new(reqwest_client::ReqwestClient::new()));
+        database_panel::init(cx);
+        let content: settings::DatabaseSettingsContent = serde_json::from_value(serde_json::json!({
+            "connections": {
+                "ryse-local": { "kind": "mysql", "host": "127.0.0.1", "port": 13306, "user": "root", "database": "echo_test", "ssl_mode": "disable", "environment": "local" },
+                "ryse-replica": { "kind": "mysql", "host": "127.0.0.1", "port": 13306, "user": "reader", "database": "echo_test", "ssl_mode": "disable", "environment": "prod" },
+                "warehouse": { "kind": "clickhouse", "url": "http://127.0.0.1:18123", "user": "default", "environment": "dev" }
+            }
+        }))
+        .expect("valid database settings");
+        gpui::BorrowAppContext::update_global::<settings::SettingsStore, _>(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| settings.project.database = Some(content));
+        });
+    });
+
+    let project = create_project_with_worktree(&project_dir, &app_state, cx)?;
+    let window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: size(px(1400.0), px(820.0)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("opening the workspace window")?;
+    cx.run_until_parked();
+
+    let store = cx.update(|cx| DatabaseStore::for_project(&project, cx));
+    cx.background_executor.allow_parking();
+    for (connection, secret) in [
+        ("ryse-local", "echo"),
+        ("ryse-replica", "reader"),
+        ("warehouse", "echo"),
+        ("atlas", convex_key.trim()),
+    ] {
+        let task = cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_secret(connection, secret.to_string(), cx)
+            })
+        });
+        cx.foreground_executor
+            .block_test(task)
+            .with_context(|| format!("connecting {connection}"))?;
+    }
+
+    let (weak_workspace, async_cx) = window.update(cx, |workspace, window, cx| {
+        (workspace.weak_handle(), window.to_async(cx))
+    })?;
+    let panel = cx
+        .foreground_executor
+        .block_test(DatabasePanel::load(weak_workspace, async_cx))?;
+    window.update(cx, |workspace, window, cx| {
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<DatabasePanel>(window, cx);
+        panel.update(cx, |panel, cx| {
+            for connection in ["ryse-local", "atlas", "warehouse", "ryse-replica"] {
+                panel.toggle_connection(&connection.into(), window, cx);
+            }
+        });
+    })?;
+    wait_for(cx, "tables to load", |cx| {
+        cx.read(|cx| {
+            let store = store.read(cx);
+            ["ryse-local", "atlas", "warehouse"]
+                .iter()
+                .all(|name| store.collections(name).is_some())
+        })
+    })?;
+    cx.read(|cx| {
+        for name in ["ryse-local", "ryse-replica", "atlas", "warehouse"] {
+            println!("  {name}: {:?}", store.read(cx).state(name));
+        }
+    });
+    anyhow::ensure!(
+        cx.read(|cx| matches!(
+            store.read(cx).state("ryse-replica"),
+            ConnectionState::Connected {
+                capability: database::Capability::ReadOnly { .. },
+                ..
+            }
+        )),
+        "the read-only replica should probe as read-only"
+    );
+    save_screenshot("database_panel", window.into(), cx)?;
+
+    let table = window.update(cx, |workspace, window, cx| {
+        ResultsView::open_table(
+            workspace,
+            store.clone(),
+            "ryse-local".into(),
+            CollectionRef::new(Some("echo_test"), "seller"),
+            Vec::new(),
+            window,
+            cx,
+        )
+    })?;
+    wait_for(cx, "seller rows", |cx| {
+        cx.read(|cx| !table.read(cx).is_loading())
+    })?;
+    table.update(cx, |table, cx| table.select(0, 1, cx));
+    wait_for(cx, "row detail", |_| true)?;
+    save_screenshot("database_table", window.into(), cx)?;
+
+    table.update(cx, |table, cx| table.stage_edit(1, 3, "555-0102", cx));
+    window.update(cx, |_, window, cx| {
+        table.update(cx, |table, cx| table.review_changes(window, cx))
+    })?;
+    wait_for(cx, "the change preview", |cx| {
+        window
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<database_panel::ApprovalModal>(cx)
+                    .is_some()
+            })
+            .unwrap_or(false)
+    })?;
+    save_screenshot("database_review", window.into(), cx)?;
+    window.update(cx, |workspace, window, cx| {
+        workspace.hide_modal(window, cx);
+    })?;
+    cx.run_until_parked();
+
+    let query = window.update(cx, |workspace, window, cx| {
+        ResultsView::open_query(
+            workspace,
+            store.clone(),
+            "ryse-local".into(),
+            Some("SELECT s.id, s.email, COUNT(p.id) AS properties\nFROM seller s LEFT JOIN property p ON p.seller_id = s.id\nGROUP BY s.id, s.email\nORDER BY s.id".to_string()),
+            window,
+            cx,
+        )
+    })?;
+    wait_for(cx, "query results", |cx| {
+        cx.read(|cx| !query.read(cx).is_loading())
+    })?;
+    save_screenshot("database_query", window.into(), cx)?;
+
+    let compare = window.update(cx, |workspace, window, cx| {
+        CompareView::open(
+            workspace,
+            store.clone(),
+            "visual-test".to_string(),
+            Some(SavedCompare {
+                name: "Ryse sellers vs Atlas links".to_string(),
+                left: database_panel::SavedSide {
+                    connection: "ryse-local".to_string(),
+                    source: "seller".to_string(),
+                    key: "id".to_string(),
+                },
+                right: database_panel::SavedSide {
+                    connection: "atlas".to_string(),
+                    source: "ryseSellerUserLinks".to_string(),
+                    key: "ryseSellerId".to_string(),
+                },
+                fields: "email=email".to_string(),
+            }),
+            window,
+            cx,
+        )
+    })?;
+    wait_for(cx, "the comparison", |cx| {
+        cx.read(|cx| !compare.read(cx).is_loading())
+    })?;
+    save_screenshot("database_compare", window.into(), cx)?;
+
+    let links = window.update(cx, |workspace, window, cx| {
+        ResultsView::open_table(
+            workspace,
+            store.clone(),
+            "atlas".into(),
+            CollectionRef::new(None, "ryseSellerUserLinks"),
+            Vec::new(),
+            window,
+            cx,
+        )
+    })?;
+    wait_for(cx, "Convex rows", |cx| {
+        cx.read(|cx| !links.read(cx).is_loading())
+    })?;
+    // Let the history index catch up before opening a row.
+    for _ in 0..40 {
+        cx.advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    links.update(cx, |links, cx| links.select(0, 1, cx));
+    wait_for(cx, "row history", |_| true)?;
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    save_screenshot("database_convex_history", window.into(), cx)?;
+    cx.background_executor.forbid_parking();
+    println!("database visual tests: screenshots saved");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn save_screenshot(
+    name: &str,
+    window: gpui::AnyWindowHandle,
+    cx: &mut VisualTestAppContext,
+) -> Result<()> {
+    cx.update_window(window, |_, window, _| window.refresh())?;
+    cx.run_until_parked();
+    let screenshot = cx.capture_screenshot(window)?;
+    let output_dir = std::env::var("VISUAL_TEST_OUTPUT_DIR")
+        .unwrap_or_else(|_| "target/visual_tests".to_string());
+    std::fs::create_dir_all(&output_dir)?;
+    let path = PathBuf::from(&output_dir).join(format!("{name}.png"));
+    screenshot.save(&path)?;
+    println!("  {name}: {}", path.display());
+    Ok(())
 }

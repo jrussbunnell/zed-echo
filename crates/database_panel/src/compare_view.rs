@@ -53,7 +53,11 @@ pub fn load_saved_compares(project_key: &str, cx: &App) -> Vec<SavedCompare> {
         .unwrap_or_default()
 }
 
-fn store_saved_compares(project_key: &str, compares: &[SavedCompare], cx: &App) -> Task<Result<()>> {
+fn store_saved_compares(
+    project_key: &str,
+    compares: &[SavedCompare],
+    cx: &App,
+) -> Task<Result<()>> {
     let key = saved_compares_key(project_key);
     let json = serde_json::to_string(compares);
     let kvp = KeyValueStore::global(cx);
@@ -114,11 +118,14 @@ impl CompareView {
         saved: Option<SavedCompare>,
         window: &mut Window,
         cx: &mut gpui::Context<Workspace>,
-    ) {
+    ) -> Entity<Self> {
         let workspace_handle = cx.entity().downgrade();
         let view = cx.new(|cx| {
             let saved = saved.clone().unwrap_or_default();
-            let editor = |text: &str, placeholder: &str, window: &mut Window, cx: &mut gpui::Context<Self>| {
+            let editor = |text: &str,
+                          placeholder: &str,
+                          window: &mut Window,
+                          cx: &mut gpui::Context<Self>| {
                 cx.new(|cx| {
                     let mut editor = Editor::single_line(window, cx);
                     editor.set_placeholder_text(placeholder, window, cx);
@@ -130,15 +137,30 @@ impl CompareView {
             Self {
                 left: SideInputs {
                     connection: connection(&saved.left.connection),
-                    source: editor(&saved.left.source, "seller  ·  seller where active = true  ·  SELECT …", window, cx),
+                    source: editor(
+                        &saved.left.source,
+                        "seller  ·  seller where active = true  ·  SELECT …",
+                        window,
+                        cx,
+                    ),
                     key: editor(&saved.left.key, "key fields, e.g. id", window, cx),
                 },
                 right: SideInputs {
                     connection: connection(&saved.right.connection),
                     source: editor(&saved.right.source, "ryseSellerUserLinks", window, cx),
-                    key: editor(&saved.right.key, "key fields, e.g. ryseSellerId", window, cx),
+                    key: editor(
+                        &saved.right.key,
+                        "key fields, e.g. ryseSellerId",
+                        window,
+                        cx,
+                    ),
                 },
-                fields: editor(&saved.fields, "fields to compare: email=email, created_at=createdAt (empty: same names)", window, cx),
+                fields: editor(
+                    &saved.fields,
+                    "fields to compare: email=email, created_at=createdAt (empty: same names)",
+                    window,
+                    cx,
+                ),
                 name: editor(&saved.name, "name to save as", window, cx),
                 store,
                 workspace: workspace_handle,
@@ -155,6 +177,14 @@ impl CompareView {
         if saved.is_some() {
             view.update(cx, |view, cx| view.run(cx));
         }
+        view
+    }
+
+    /// Whether either side is still being read.
+    pub fn is_loading(&self) -> bool {
+        self.task.is_some()
+            && self.comparison.is_none()
+            && !self.status.as_ref().is_some_and(|(_, is_error)| *is_error)
     }
 
     fn saved(&self, cx: &App) -> SavedCompare {
@@ -188,13 +218,25 @@ impl CompareView {
         cx.notify();
     }
 
-    fn fetch(&self, side: &SideInputs, key: &[String], cx: &mut gpui::Context<Self>) -> Result<(Task<Result<ResultSet>>, Option<Target>)> {
+    fn fetch(
+        &self,
+        side: &SideInputs,
+        key: &[String],
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<(Task<Result<ResultSet>>, Option<Target>)> {
         let connection = side
             .connection
             .clone()
             .ok_or_else(|| anyhow!("choose a connection on both sides"))?;
         let text = side.source.read(cx).text(cx);
-        let source = fetch_source(&text, query_language(self.store.read(cx), &connection), self.store.read(cx).entry(&connection).map(|entry| entry.spec.kind))?;
+        let source = fetch_source(
+            &text,
+            query_language(self.store.read(cx), &connection),
+            self.store
+                .read(cx)
+                .entry(&connection)
+                .map(|entry| entry.spec.kind),
+        )?;
         let target = match &source {
             FetchSource::Collection { collection, .. } => Some(Target {
                 connection: connection.clone(),
@@ -209,7 +251,13 @@ impl CompareView {
         Ok((task, target))
     }
 
-    fn open_row(&mut self, target: &Target, key: &[database::Value], window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn open_row(
+        &mut self,
+        target: &Target,
+        key: &[database::Value],
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let filters = target
             .key
             .iter()
@@ -224,7 +272,15 @@ impl CompareView {
         let target = target.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                crate::ResultsView::open_table(workspace, store, target.connection, target.collection, filters, window, cx);
+                crate::ResultsView::open_table(
+                    workspace,
+                    store,
+                    target.connection,
+                    target.collection,
+                    filters,
+                    window,
+                    cx,
+                );
             })
             .log_err();
     }
@@ -275,11 +331,23 @@ impl CompareView {
             let result = (|| -> Result<Comparison> {
                 let (left, right) = (left?, right?);
                 let outcome = compare(
-                    CompareSide { rows: &left, key: &left_key },
-                    CompareSide { rows: &right, key: &right_key },
+                    CompareSide {
+                        rows: &left,
+                        key: &left_key,
+                    },
+                    CompareSide {
+                        rows: &right,
+                        key: &right_key,
+                    },
                     &CompareOptions { fields },
                 )?;
-                Ok(Comparison { outcome, left, right, left_target, right_target })
+                Ok(Comparison {
+                    outcome,
+                    left,
+                    right,
+                    left_target,
+                    right_target,
+                })
             })();
             this.update(cx, |this, cx| {
                 match result {
@@ -321,13 +389,20 @@ impl CompareView {
             .enumerate()
             .filter(|(_, row)| match self.show {
                 Show::All => true,
-                Show::Differences => !matches!(row, CompareRow::Matched { diffs, .. } if diffs.is_empty()),
+                Show::Differences => {
+                    !matches!(row, CompareRow::Matched { diffs, .. } if diffs.is_empty())
+                }
             })
             .map(|(index, _)| index)
             .collect()
     }
 
-    fn connection_menu(&self, left: bool, window: &mut Window, cx: &mut gpui::Context<Self>) -> Entity<ContextMenu> {
+    fn connection_menu(
+        &self,
+        left: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Entity<ContextMenu> {
         let names = self
             .store
             .read(cx)
@@ -356,7 +431,12 @@ impl CompareView {
         })
     }
 
-    fn render_side(&self, left: bool, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render_side(
+        &self,
+        left: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
         let inputs = if left { &self.left } else { &self.right };
         let label = inputs
             .connection
@@ -366,10 +446,18 @@ impl CompareView {
         v_flex()
             .flex_1()
             .gap_1()
-            .child(Label::new(if left { "Left" } else { "Right" }).size(LabelSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(if left { "Left" } else { "Right" })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             .child(
                 DropdownMenu::new(
-                    if left { "left-connection" } else { "right-connection" },
+                    if left {
+                        "left-connection"
+                    } else {
+                        "right-connection"
+                    },
                     label,
                     self.connection_menu(left, window, cx),
                 )
@@ -388,11 +476,14 @@ impl CompareView {
         if count == 0 {
             return div()
                 .p_4()
-                .child(Label::new(if comparison.outcome.rows.is_empty() {
-                    "Both sides are empty."
-                } else {
-                    "No differences."
-                }).color(Color::Muted))
+                .child(
+                    Label::new(if comparison.outcome.rows.is_empty() {
+                        "Both sides are empty."
+                    } else {
+                        "No differences."
+                    })
+                    .color(Color::Muted),
+                )
                 .into_any_element();
         }
         Table::new(3)
@@ -422,39 +513,86 @@ impl CompareView {
     }
 }
 
-fn render_compare_row(index: usize, row: &CompareRow, comparison: &Comparison, cx: &mut gpui::Context<CompareView>) -> Vec<AnyElement> {
+fn render_compare_row(
+    index: usize,
+    row: &CompareRow,
+    comparison: &Comparison,
+    cx: &mut gpui::Context<CompareView>,
+) -> Vec<AnyElement> {
     let key = match row {
-        CompareRow::LeftOnly { key, .. } | CompareRow::RightOnly { key, .. } | CompareRow::Matched { key, .. } => key.clone(),
+        CompareRow::LeftOnly { key, .. }
+        | CompareRow::RightOnly { key, .. }
+        | CompareRow::Matched { key, .. } => key.clone(),
     };
-    let key_text = |key: &[database::Value]| key.iter().map(|value| value.display()).collect::<Vec<_>>().join(", ");
-    let open_button = |id: &'static str, label: &'static str, target: Option<Target>, cx: &mut gpui::Context<CompareView>| {
-        let key = key.clone();
-        target.map(|target| {
-            IconButton::new((id, index), IconName::ArrowUpRight)
-                .icon_size(IconSize::XSmall)
-                .tooltip(Tooltip::text(label))
-                .on_click(cx.listener(move |this, _, window, cx| this.open_row(&target, &key, window, cx)))
-        })
+    let key_text = |key: &[database::Value]| {
+        key.iter()
+            .map(|value| value.display())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
+    let open_button =
+        |id: &'static str,
+         label: &'static str,
+         target: Option<Target>,
+         cx: &mut gpui::Context<CompareView>| {
+            let key = key.clone();
+            target.map(|target| {
+                IconButton::new((id, index), IconName::ArrowUpRight)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_row(&target, &key, window, cx)
+                    }))
+            })
+        };
     let has_left = !matches!(row, CompareRow::RightOnly { .. });
     let has_right = !matches!(row, CompareRow::LeftOnly { .. });
     let key_cell = h_flex()
         .gap_1()
         .child(Label::new(key_text(&key)).size(LabelSize::Small))
-        .children(open_button("open-left", "Open the left row", comparison.left_target.clone().filter(|_| has_left), cx))
-        .children(open_button("open-right", "Open the right row", comparison.right_target.clone().filter(|_| has_right), cx))
+        .children(open_button(
+            "open-left",
+            "Open the left row",
+            comparison.left_target.clone().filter(|_| has_left),
+            cx,
+        ))
+        .children(open_button(
+            "open-right",
+            "Open the right row",
+            comparison.right_target.clone().filter(|_| has_right),
+            cx,
+        ))
         .into_any_element();
     let mut cells = match row {
         CompareRow::LeftOnly { row, .. } => vec![
-            Label::new("left only").size(LabelSize::Small).color(Color::Deleted).into_any_element(),
-            Label::new(summarize_row(&comparison.left, *row)).size(LabelSize::Small).color(Color::Muted).single_line().truncate().into_any_element(),
+            Label::new("left only")
+                .size(LabelSize::Small)
+                .color(Color::Deleted)
+                .into_any_element(),
+            Label::new(summarize_row(&comparison.left, *row))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .single_line()
+                .truncate()
+                .into_any_element(),
         ],
         CompareRow::RightOnly { row, .. } => vec![
-            Label::new("right only").size(LabelSize::Small).color(Color::Created).into_any_element(),
-            Label::new(summarize_row(&comparison.right, *row)).size(LabelSize::Small).color(Color::Muted).single_line().truncate().into_any_element(),
+            Label::new("right only")
+                .size(LabelSize::Small)
+                .color(Color::Created)
+                .into_any_element(),
+            Label::new(summarize_row(&comparison.right, *row))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .single_line()
+                .truncate()
+                .into_any_element(),
         ],
         CompareRow::Matched { diffs, .. } => {
-            let real = diffs.iter().filter(|diff| !diff.representation_only).count();
+            let real = diffs
+                .iter()
+                .filter(|diff| !diff.representation_only)
+                .count();
             let (status, color) = match (real, diffs.len()) {
                 (0, 0) => ("identical", Color::Muted),
                 (0, _) => ("type differs", Color::Muted),
@@ -468,14 +606,25 @@ fn render_compare_row(index: usize, row: &CompareRow, comparison: &Comparison, c
                     } else {
                         format!("{}/{}", diff.left_field, diff.right_field)
                     };
-                    Label::new(format!("{field}: {} → {}", diff.left.display(), diff.right.display()))
-                        .size(LabelSize::Small)
-                        .color(if diff.representation_only { Color::Muted } else { Color::Default })
-                        .single_line()
+                    Label::new(format!(
+                        "{field}: {} → {}",
+                        diff.left.display(),
+                        diff.right.display()
+                    ))
+                    .size(LabelSize::Small)
+                    .color(if diff.representation_only {
+                        Color::Muted
+                    } else {
+                        Color::Default
+                    })
+                    .single_line()
                 }))
                 .into_any_element();
             vec![
-                Label::new(status).size(LabelSize::Small).color(color).into_any_element(),
+                Label::new(status)
+                    .size(LabelSize::Small)
+                    .color(color)
+                    .into_any_element(),
                 differences,
             ]
         }
@@ -512,10 +661,18 @@ fn input(editor: Entity<Editor>, cx: &App) -> impl IntoElement {
 
 /// A side's source text is SQL when the connection has a query language and
 /// the text reads like a statement; otherwise it is `table [where filter]`.
-fn fetch_source(text: &str, language: QueryLanguage, kind: Option<DatabaseKind>) -> Result<FetchSource> {
+fn fetch_source(
+    text: &str,
+    language: QueryLanguage,
+    kind: Option<DatabaseKind>,
+) -> Result<FetchSource> {
     let text = text.trim();
     anyhow::ensure!(!text.is_empty(), "enter a table or query on both sides");
-    let first_word = text.split_whitespace().next().unwrap_or_default().to_ascii_uppercase();
+    let first_word = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     if language != QueryLanguage::None && matches!(first_word.as_str(), "SELECT" | "WITH" | "(") {
         return Ok(FetchSource::Query(text.to_string()));
     }
@@ -526,7 +683,9 @@ fn fetch_source(text: &str, language: QueryLanguage, kind: Option<DatabaseKind>)
     };
     let table = table.trim();
     let collection = match table.split_once('.') {
-        Some((namespace, name)) if kind != Some(DatabaseKind::Convex) => CollectionRef::new(Some(namespace), name),
+        Some((namespace, name)) if kind != Some(DatabaseKind::Convex) => {
+            CollectionRef::new(Some(namespace), name)
+        }
         _ => CollectionRef::new(None, table),
     };
     Ok(FetchSource::Collection {
@@ -596,22 +755,30 @@ impl Render for CompareView {
                                     .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
                             )
                             .child(
-                                Button::new("show", match show {
-                                    Show::Differences => "Showing differences",
-                                    Show::All => "Showing all rows",
-                                })
+                                Button::new(
+                                    "show",
+                                    match show {
+                                        Show::Differences => "Showing differences",
+                                        Show::All => "Showing all rows",
+                                    },
+                                )
                                 .tooltip(Tooltip::text("Toggle identical rows"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show = match this.show {
-                                        Show::Differences => Show::All,
-                                        Show::All => Show::Differences,
-                                    };
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.show = match this.show {
+                                            Show::Differences => Show::All,
+                                            Show::All => Show::Differences,
+                                        };
+                                        cx.notify();
+                                    },
+                                )),
                             )
                             .child(div().flex_1())
                             .child(div().w(rems(14.)).child(input(self.name.clone(), cx)))
-                            .child(Button::new("save", "Save").on_click(cx.listener(|this, _, _, cx| this.save(cx)))),
+                            .child(
+                                Button::new("save", "Save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                            ),
                     )
                     .when_some(self.status.clone(), |this, (status, is_error)| {
                         this.child(
@@ -632,19 +799,34 @@ mod tests {
     #[test]
     fn test_fetch_source() {
         assert_eq!(
-            fetch_source("SELECT id FROM seller", QueryLanguage::MySql, Some(DatabaseKind::Mysql)).unwrap(),
+            fetch_source(
+                "SELECT id FROM seller",
+                QueryLanguage::MySql,
+                Some(DatabaseKind::Mysql)
+            )
+            .unwrap(),
             FetchSource::Query("SELECT id FROM seller".into())
         );
-        let FetchSource::Collection { collection, filters } =
-            fetch_source("ryse.seller where active = true", QueryLanguage::MySql, Some(DatabaseKind::Mysql)).unwrap()
+        let FetchSource::Collection {
+            collection,
+            filters,
+        } = fetch_source(
+            "ryse.seller where active = true",
+            QueryLanguage::MySql,
+            Some(DatabaseKind::Mysql),
+        )
+        .unwrap()
         else {
             panic!("expected a collection");
         };
         assert_eq!(collection, CollectionRef::new(Some("ryse"), "seller"));
         assert_eq!(filters.len(), 1);
-        let FetchSource::Collection { collection, .. } =
-            fetch_source("ryseSellerUserLinks", QueryLanguage::None, Some(DatabaseKind::Convex)).unwrap()
-        else {
+        let FetchSource::Collection { collection, .. } = fetch_source(
+            "ryseSellerUserLinks",
+            QueryLanguage::None,
+            Some(DatabaseKind::Convex),
+        )
+        .unwrap() else {
             panic!("expected a collection");
         };
         assert_eq!(collection, CollectionRef::new(None, "ryseSellerUserLinks"));

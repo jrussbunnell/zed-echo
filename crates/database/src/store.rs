@@ -90,7 +90,11 @@ pub struct MissingSecret {
 
 impl std::fmt::Display for MissingSecret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} needs a secret", self.connection)
+        write!(
+            formatter,
+            "{} needs a password or key; set it in the Databases panel (right-click the connection, Set Secret)",
+            self.connection
+        )
     }
 }
 
@@ -337,7 +341,9 @@ impl DatabaseStore {
                 spec: entry.spec.clone(),
                 secret,
             };
-            let response = this.update(cx, |this, cx| this.send(&entry.name, request, cx))?.await;
+            let response = this
+                .update(cx, |this, cx| this.send(&entry.name, request, cx))?
+                .await;
             this.update(cx, |this, cx| match response {
                 Ok(Response::Connected {
                     capability,
@@ -351,7 +357,8 @@ impl DatabaseStore {
                         },
                         cx,
                     );
-                    this.refresh_collections(&entry.name, cx).detach_and_log_err(cx);
+                    this.refresh_collections(&entry.name, cx)
+                        .detach_and_log_err(cx);
                     if entry.history && entry.spec.kind == DatabaseKind::Convex {
                         this.start_history_index(entry.clone(), cx);
                     }
@@ -537,15 +544,16 @@ impl DatabaseStore {
     }
 
     fn record_query(&mut self, entry: QueryHistoryEntry, cx: &mut Context<Self>) {
-        self.query_history
-            .retain(|existing| existing.connection != entry.connection || existing.text != entry.text);
+        self.query_history.retain(|existing| {
+            existing.connection != entry.connection || existing.text != entry.text
+        });
         self.query_history.insert(0, entry);
         self.query_history.truncate(QUERY_HISTORY_LIMIT);
         let json = serde_json::to_string(&self.query_history);
         let kvp = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            kvp.write_kvp(QUERY_HISTORY_KEY.to_string(), json?).await
-        })
+        cx.background_spawn(
+            async move { kvp.write_kvp(QUERY_HISTORY_KEY.to_string(), json?).await },
+        )
         .detach_and_log_err(cx);
         cx.emit(DatabaseStoreEvent::HistoryChanged);
         cx.notify();
@@ -596,7 +604,10 @@ impl DatabaseStore {
                 }
                 Ok(rows)
             }
-            FetchSource::Collection { collection, filters } => {
+            FetchSource::Collection {
+                collection,
+                filters,
+            } => {
                 let mut all = ResultSet::default();
                 let mut cursor = None;
                 loop {
@@ -681,12 +692,7 @@ impl DatabaseStore {
     }
 
     /// Versions of one document, newest first, from the local change index.
-    pub fn row_history(
-        &self,
-        name: &str,
-        id: &str,
-        cx: &App,
-    ) -> Task<Result<Vec<HistoryEntry>>> {
+    pub fn row_history(&self, name: &str, id: &str, cx: &App) -> Task<Result<Vec<HistoryEntry>>> {
         let Some(entry) = self.entry(name) else {
             return Task::ready(Err(anyhow!("no connection named {name}")));
         };
@@ -737,7 +743,9 @@ impl DatabaseStore {
                                 .ok();
                         }
                         if caught_up {
-                            cx.background_executor().timer(Duration::from_secs(10)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_secs(10))
+                                .await;
                         }
                     }
                     Ok(other) => {
@@ -748,7 +756,9 @@ impl DatabaseStore {
                         // Usually the streaming export API being unavailable
                         // on this plan; retrying often would only spam it.
                         log::warn!("database history for {name}: {error:#}");
-                        cx.background_executor().timer(Duration::from_secs(300)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_secs(300))
+                            .await;
                     }
                 }
             }
@@ -759,13 +769,51 @@ impl DatabaseStore {
 
 /// Database passwords and deploy keys always go to the system keychain. The
 /// Dev channel Echo ships on would otherwise use Zed's development
-/// credentials file, which is plaintext; stateless runs (visual tests) keep
-/// that file so they never touch the real keychain.
-fn database_credentials(cx: &App) -> Arc<dyn credentials_provider::CredentialsProvider> {
+/// credentials file, which is plaintext. Stateless runs (visual tests) keep
+/// secrets in memory so they touch neither.
+fn database_credentials(_: &App) -> Arc<dyn credentials_provider::CredentialsProvider> {
+    static MEMORY: std::sync::LazyLock<Arc<MemoryCredentials>> =
+        std::sync::LazyLock::new(Arc::default);
     if *zed_env_vars::ZED_STATELESS {
-        zed_credentials_provider::global(cx)
+        MEMORY.clone()
     } else {
         zed_credentials_provider::keychain()
+    }
+}
+
+#[derive(Default)]
+struct MemoryCredentials(parking_lot::Mutex<HashMap<String, (String, Vec<u8>)>>);
+
+impl credentials_provider::CredentialsProvider for MemoryCredentials {
+    fn read_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _: &'a AsyncApp,
+    ) -> futures::future::LocalBoxFuture<'a, Result<Option<(String, Vec<u8>)>>> {
+        let credentials = self.0.lock().get(url).cloned();
+        Box::pin(async move { Ok(credentials) })
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        _: &'a AsyncApp,
+    ) -> futures::future::LocalBoxFuture<'a, Result<()>> {
+        self.0
+            .lock()
+            .insert(url.to_string(), (username.to_string(), password.to_vec()));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _: &'a AsyncApp,
+    ) -> futures::future::LocalBoxFuture<'a, Result<()>> {
+        self.0.lock().remove(url);
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -773,9 +821,16 @@ fn database_credentials(cx: &App) -> Arc<dyn credentials_provider::CredentialsPr
 /// connection with no stored secret can ask for one instead of just failing.
 fn is_authentication_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_lowercase();
-    ["access denied", "authentication", "password", "unauthorized", "401", "403"]
-        .iter()
-        .any(|needle| message.contains(needle))
+    [
+        "access denied",
+        "authentication",
+        "password",
+        "unauthorized",
+        "401",
+        "403",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// What to read for a comparison.
@@ -868,7 +923,11 @@ fn resolve_connections(project: &Entity<Project>, cx: &mut App) -> Vec<Connectio
             cx,
         );
         for (name, content) in &settings.connections {
-            if content == global.connections.get(name).unwrap_or(&DatabaseConnectionContent::default())
+            if content
+                == global
+                    .connections
+                    .get(name)
+                    .unwrap_or(&DatabaseConnectionContent::default())
                 && global.connections.contains_key(name)
             {
                 continue;
@@ -887,9 +946,8 @@ fn resolve_connections(project: &Entity<Project>, cx: &mut App) -> Vec<Connectio
                     merged.ssl_mode = user.ssl_mode.clone();
                     // A read-only pin and the environment (which drives prod
                     // confirmations) can only be tightened by a project.
-                    merged.read_only = Some(
-                        user.read_only.unwrap_or(false) || content.read_only.unwrap_or(false),
-                    );
+                    merged.read_only =
+                        Some(user.read_only.unwrap_or(false) || content.read_only.unwrap_or(false));
                     merged.environment = user.environment;
                     entry_from_content(name, &merged, settings.write_approval, false)
                 }
@@ -909,18 +967,17 @@ fn entry_from_content(
 ) -> ConnectionEntry {
     let environment = content.environment.unwrap_or(DatabaseEnvironment::Dev);
     let kind = content.kind;
-    let error = match kind {
-        None => Some("set `kind`".into()),
-        Some(DatabaseKind::Mysql | DatabaseKind::Postgres) if content.host.is_none() => {
-            Some("set `host`".into())
-        }
-        Some(DatabaseKind::Clickhouse | DatabaseKind::ClickhouseRelay | DatabaseKind::Convex)
-            if content.url.is_none() =>
-        {
-            Some("set `url`".into())
-        }
-        _ => None,
-    };
+    let error =
+        match kind {
+            None => Some("set `kind`".into()),
+            Some(DatabaseKind::Mysql | DatabaseKind::Postgres) if content.host.is_none() => {
+                Some("set `host`".into())
+            }
+            Some(
+                DatabaseKind::Clickhouse | DatabaseKind::ClickhouseRelay | DatabaseKind::Convex,
+            ) if content.url.is_none() => Some("set `url`".into()),
+            _ => None,
+        };
     ConnectionEntry {
         name: name.clone(),
         spec: ConnectionSpec {
@@ -981,13 +1038,19 @@ impl DatabaseRowHistory {
 
     // ponytail: versions are kept forever. Prune by age if the index grows
     // large enough to matter.
-    async fn store(&self, source: String, entries: Vec<HistoryEntry>, cursor: String) -> Result<()> {
+    async fn store(
+        &self,
+        source: String,
+        entries: Vec<HistoryEntry>,
+        cursor: String,
+    ) -> Result<()> {
         self.write(move |connection| {
-            let mut insert = connection.exec_bound::<(&str, &str, &str, i64, bool, String)>(sql!(
-                INSERT OR REPLACE INTO database_row_history
-                    (source, table_name, document_id, timestamp, deleted, document)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ))?;
+            let mut insert =
+                connection.exec_bound::<(&str, &str, &str, i64, bool, String)>(sql!(
+                    INSERT OR REPLACE INTO database_row_history
+                        (source, table_name, document_id, timestamp, deleted, document)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ))?;
             for entry in &entries {
                 insert((
                     &source,
@@ -1006,12 +1069,13 @@ impl DatabaseRowHistory {
     }
 
     fn versions(&self, source: &str, id: &str) -> Result<Vec<HistoryEntry>> {
-        let rows = self.select_bound::<(&str, &str), (String, String, i64, bool, String)>(sql!(
-            SELECT table_name, document_id, timestamp, deleted, document
-            FROM database_row_history
-            WHERE source = ? AND document_id = ?
-            ORDER BY timestamp DESC
-        ))?((source, id))?;
+        let rows =
+            self.select_bound::<(&str, &str), (String, String, i64, bool, String)>(sql!(
+                SELECT table_name, document_id, timestamp, deleted, document
+                FROM database_row_history
+                WHERE source = ? AND document_id = ?
+                ORDER BY timestamp DESC
+            ))?((source, id))?;
         Ok(rows
             .into_iter()
             .map(|(table, id, timestamp, deleted, document)| HistoryEntry {
@@ -1123,14 +1187,20 @@ mod tests {
         let project = project_with_overrides(cx).await;
         let connections = cx.update(|cx| resolve_connections(&project, cx));
 
-        let ryse = connections.iter().find(|entry| &*entry.name == "ryse-prod").unwrap();
+        let ryse = connections
+            .iter()
+            .find(|entry| &*entry.name == "ryse-prod")
+            .unwrap();
         assert_eq!(ryse.spec.host.as_deref(), Some("replica.internal"));
         assert_eq!(ryse.agent_access, DatabaseAgentAccess::Allow);
         assert!(ryse.spec.read_only, "a project cannot lift a read-only pin");
         assert_eq!(ryse.environment, DatabaseEnvironment::Prod);
         assert!(!ryse.project_defined);
 
-        let atlas = connections.iter().find(|entry| &*entry.name == "atlas").unwrap();
+        let atlas = connections
+            .iter()
+            .find(|entry| &*entry.name == "atlas")
+            .unwrap();
         assert!(atlas.project_defined);
         assert_eq!(atlas.agent_access, DatabaseAgentAccess::Allow);
         assert_eq!(atlas.write_approval, DatabaseWriteApproval::Preview);

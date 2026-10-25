@@ -164,14 +164,22 @@ impl ClickHouseSource {
                 }
                 let response: RelayResponse =
                     serde_json::from_str(&body).context("parsing relay response")?;
-                let columns = response.meta.into_iter().map(Column::from).collect::<Vec<_>>();
+                let columns = response
+                    .meta
+                    .into_iter()
+                    .map(Column::from)
+                    .collect::<Vec<_>>();
                 let rows = response
                     .rows
                     .iter()
                     .map(|row| {
                         columns
                             .iter()
-                            .map(|column| row.get(&column.name).map(decode_json).unwrap_or(Value::Missing))
+                            .map(|column| {
+                                row.get(&column.name)
+                                    .map(decode_json)
+                                    .unwrap_or(Value::Missing)
+                            })
                             .collect()
                     })
                     .collect();
@@ -214,7 +222,10 @@ impl ClickHouseSource {
             .map(|change| {
                 Ok(match change {
                     Change::Update { key, set } => {
-                        anyhow::ensure!(!key.is_empty() && !set.is_empty(), "an update needs a key and fields");
+                        anyhow::ensure!(
+                            !key.is_empty() && !set.is_empty(),
+                            "an update needs a key and fields"
+                        );
                         let condition = key_condition(key);
                         let assignments = set
                             .iter()
@@ -228,8 +239,14 @@ impl ClickHouseSource {
                     }
                     Change::Insert { values } => {
                         anyhow::ensure!(!values.is_empty(), "an insert needs fields");
-                        let fields = values.iter().map(|(field, _)| quote(field)).collect::<Vec<_>>();
-                        let literals = values.iter().map(|(_, value)| literal(value)).collect::<Vec<_>>();
+                        let fields = values
+                            .iter()
+                            .map(|(field, _)| quote(field))
+                            .collect::<Vec<_>>();
+                        let literals = values
+                            .iter()
+                            .map(|(_, value)| literal(value))
+                            .collect::<Vec<_>>();
                         (
                             format!(
                                 "INSERT INTO {table} ({}) VALUES ({})",
@@ -242,7 +259,10 @@ impl ClickHouseSource {
                     Change::Delete { key } => {
                         anyhow::ensure!(!key.is_empty(), "a delete needs a key");
                         let condition = key_condition(key);
-                        (format!("DELETE FROM {table} WHERE {condition}"), Some(condition))
+                        (
+                            format!("DELETE FROM {table} WHERE {condition}"),
+                            Some(condition),
+                        )
                     }
                 })
             })
@@ -305,7 +325,9 @@ impl Source for ClickHouseSource {
                             Some(table.get("database")?.as_str()?),
                             table.get("table")?.as_str()?,
                         ),
-                        kind: collection_kind(table.get("engine").and_then(|engine| engine.as_str())),
+                        kind: collection_kind(
+                            table.get("engine").and_then(|engine| engine.as_str()),
+                        ),
                     })
                 })
                 .collect());
@@ -334,7 +356,10 @@ impl Source for ClickHouseSource {
     }
 
     async fn describe(&self, collection: &CollectionRef) -> Result<CollectionSchema> {
-        let database = collection.namespace.clone().unwrap_or_else(|| "default".to_string());
+        let database = collection
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         if self.is_relay() {
             let path = format!(
                 "describe-table?database={}&table={}",
@@ -342,7 +367,9 @@ impl Source for ClickHouseSource {
                 urlencoding::encode(&collection.name)
             );
             if let Some(description) = self.relay_catalog(&path).await?
-                && let Some(columns) = description.get("columns").and_then(|columns| columns.as_array())
+                && let Some(columns) = description
+                    .get("columns")
+                    .and_then(|columns| columns.as_array())
             {
                 return Ok(CollectionSchema {
                     fields: columns
@@ -419,7 +446,11 @@ impl Source for ClickHouseSource {
         };
         let mut sql = format!("SELECT * FROM {}", table_name(collection));
         if !request.filters.is_empty() {
-            let conditions = request.filters.iter().map(filter_condition).collect::<Vec<_>>();
+            let conditions = request
+                .filters
+                .iter()
+                .map(filter_condition)
+                .collect::<Vec<_>>();
             sql.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
         }
         sql.push_str(&format!(" LIMIT {} OFFSET {offset}", request.page_size + 1));
@@ -455,7 +486,10 @@ impl Source for ClickHouseSource {
         for (_, condition) in &statements {
             if let Some(condition) = condition {
                 let count = self
-                    .run(&format!("SELECT count() FROM {table} WHERE {condition}"), &[])
+                    .run(
+                        &format!("SELECT count() FROM {table} WHERE {condition}"),
+                        &[],
+                    )
                     .await?;
                 let matches = count
                     .rows
@@ -464,12 +498,15 @@ impl Source for ClickHouseSource {
                     .map(|value| value.display().parse::<u64>().unwrap_or(u64::MAX))
                     .unwrap_or(u64::MAX);
                 if matches > 1 {
-                    bail!("refusing to change {table}: `{condition}` matches {matches} rows, not one");
+                    bail!(
+                        "refusing to change {table}: `{condition}` matches {matches} rows, not one"
+                    );
                 }
             }
         }
         for (sql, _) in &statements {
-            self.run(sql, &[("mutations_sync", "2".to_string())]).await?;
+            self.run(sql, &[("mutations_sync", "2".to_string())])
+                .await?;
         }
         Ok(statements.len() as u64)
     }
@@ -501,7 +538,10 @@ fn literal(value: &Value) -> String {
         Value::Float(value) => value.to_string(),
         Value::Bytes(bytes) => format!(
             "unhex('{}')",
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         ),
         Value::Text(_) | Value::Json(_) => {
             let text = match value {
@@ -568,7 +608,10 @@ mod tests {
         assert_eq!(literal(&Value::Text("it's \\".into())), "'it\\'s \\\\'");
         assert_eq!(quote("we`ird"), "`we\\`ird`");
         assert_eq!(
-            key_condition(&[("id".into(), Value::Int(1)), ("deleted_at".into(), Value::Null)]),
+            key_condition(&[
+                ("id".into(), Value::Int(1)),
+                ("deleted_at".into(), Value::Null)
+            ]),
             "`id` = 1 AND `deleted_at` IS NULL"
         );
     }

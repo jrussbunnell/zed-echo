@@ -58,6 +58,11 @@ visual-tests = [
 name = "zedecho"
 path = "src/main.rs"
 
+[[bin]]
+name = "zed_visual_test_runner"
+path = "src/visual_test_runner.rs"
+required-features = ["visual-tests"]
+
 
 [dependencies]
 acp_thread.workspace = true
@@ -95,6 +100,7 @@ copilot_chat.workspace = true
 copilot_ui.workspace = true
 crashes.workspace = true
 dap_adapters.workspace = true
+database.workspace = true
 database_panel.workspace = true
 db.workspace = true
 debug_adapter_extension.workspace = true

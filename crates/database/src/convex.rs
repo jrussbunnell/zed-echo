@@ -56,7 +56,10 @@ impl ConvexSource {
             if value.get("success") == Some(&Json::Bool(false)) {
                 bail!(
                     "{}",
-                    value.get("error").and_then(Json::as_str).unwrap_or("Convex rejected the change")
+                    value
+                        .get("error")
+                        .and_then(Json::as_str)
+                        .unwrap_or("Convex rejected the change")
                 );
             }
             Ok(value)
@@ -86,7 +89,10 @@ impl ConvexSource {
         if !response.status().is_success() {
             bail!(
                 "{}",
-                parsed.get("message").and_then(Json::as_str).unwrap_or(text.trim())
+                parsed
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or(text.trim())
             );
         }
         Ok(parsed)
@@ -113,13 +119,17 @@ impl ConvexSource {
     }
 
     async fn table_numbers(&self) -> Result<HashMap<u64, String>> {
-        let mapping = self.call("query", "_system/frontend/getTableMapping", json!({})).await?;
+        let mapping = self
+            .call("query", "_system/frontend/getTableMapping", json!({}))
+            .await?;
         Ok(mapping
             .as_object()
             .map(|mapping| {
                 mapping
                     .iter()
-                    .filter_map(|(number, name)| Some((number.parse().ok()?, name.as_str()?.to_string())))
+                    .filter_map(|(number, name)| {
+                        Some((number.parse().ok()?, name.as_str()?.to_string()))
+                    })
                     .collect()
             })
             .unwrap_or_default())
@@ -127,13 +137,21 @@ impl ConvexSource {
 
     /// Id fields declared in the active schema, as `(table, field, target)`.
     async fn schema_references(&self) -> Result<Vec<(String, String, String)>> {
-        let schemas = self.call("query", "_system/frontend/getSchemas", json!({})).await?;
+        let schemas = self
+            .call("query", "_system/frontend/getSchemas", json!({}))
+            .await?;
         let Some(active) = schemas.get("active").and_then(Json::as_str) else {
             return Ok(Vec::new());
         };
-        let schema: Json = serde_json::from_str(active).context("parsing the active Convex schema")?;
+        let schema: Json =
+            serde_json::from_str(active).context("parsing the active Convex schema")?;
         let mut references = Vec::new();
-        for table in schema.get("tables").and_then(Json::as_array).into_iter().flatten() {
+        for table in schema
+            .get("tables")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+        {
             let Some(table_name) = table.get("tableName").and_then(Json::as_str) else {
                 continue;
             };
@@ -150,8 +168,17 @@ impl ConvexSource {
         Ok(references)
     }
 
-    async fn page(&self, table: &str, filters: &[Filter], cursor: Option<&str>, page_size: usize) -> Result<(Vec<Map<String, Json>>, Option<String>)> {
-        let clauses = filters.iter().map(filter_clause).collect::<Result<Vec<_>>>()?;
+    async fn page(
+        &self,
+        table: &str,
+        filters: &[Filter],
+        cursor: Option<&str>,
+        page_size: usize,
+    ) -> Result<(Vec<Map<String, Json>>, Option<String>)> {
+        let clauses = filters
+            .iter()
+            .map(filter_clause)
+            .collect::<Result<Vec<_>>>()?;
         let filters = if clauses.is_empty() {
             Json::Null
         } else {
@@ -172,10 +199,17 @@ impl ConvexSource {
         let documents = result
             .get("page")
             .and_then(Json::as_array)
-            .map(|page| page.iter().filter_map(|document| document.as_object().cloned()).collect::<Vec<_>>())
+            .map(|page| {
+                page.iter()
+                    .filter_map(|document| document.as_object().cloned())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         // Invalid filters come back as rows describing the error.
-        if let Some(error) = documents.iter().find_map(|document| document.get("error").and_then(Json::as_str)) {
+        if let Some(error) = documents
+            .iter()
+            .find_map(|document| document.get("error").and_then(Json::as_str))
+        {
             bail!("{error}");
         }
         let done = result.get("isDone").and_then(Json::as_bool).unwrap_or(true);
@@ -200,7 +234,9 @@ impl ConvexSource {
                             .iter()
                             .map(|(field, value)| {
                                 let value = match value {
-                                    Value::Missing => Json::String(UNDEFINED_PLACEHOLDER.to_string()),
+                                    Value::Missing => {
+                                        Json::String(UNDEFINED_PLACEHOLDER.to_string())
+                                    }
                                     value => encode_value(value),
                                 };
                                 (field.clone(), value)
@@ -250,7 +286,10 @@ impl Source for ConvexSource {
             .await?
             .into_iter()
             .map(|name| Collection {
-                reference: CollectionRef { namespace: None, name },
+                reference: CollectionRef {
+                    namespace: None,
+                    name,
+                },
                 kind: CollectionKind::Table,
             })
             .collect())
@@ -271,7 +310,10 @@ impl Source for ConvexSource {
                 }
             }
         }
-        let mut names = fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+        let mut names = fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
         crate::sort_document_fields(&mut names);
         fields.sort_by_key(|field| names.iter().position(|name| name == &field.name));
 
@@ -329,7 +371,12 @@ impl Source for ConvexSource {
 
     async fn browse(&self, collection: &CollectionRef, request: &BrowseRequest) -> Result<Page> {
         let (documents, next_cursor) = self
-            .page(&collection.name, &request.filters, request.cursor.as_deref(), request.page_size)
+            .page(
+                &collection.name,
+                &request.filters,
+                request.cursor.as_deref(),
+                request.page_size,
+            )
             .await?;
         Ok(Page {
             rows: ResultSet::from_documents(documents),
@@ -363,7 +410,9 @@ impl Source for ConvexSource {
         let cursor = cursor.unwrap_or_else(|| "snapshot".to_string());
         if let Some(delta_cursor) = cursor.strip_prefix("delta:") {
             let response = self
-                .get(&format!("/api/document_deltas?cursor={delta_cursor}&format=json"))
+                .get(&format!(
+                    "/api/document_deltas?cursor={delta_cursor}&format=json"
+                ))
                 .await?;
             let next = response
                 .get("cursor")
@@ -372,7 +421,10 @@ impl Source for ConvexSource {
             return Ok(HistoryBatch {
                 entries: history_entries(&response),
                 cursor: format!("delta:{next}"),
-                has_more: response.get("hasMore").and_then(Json::as_bool).unwrap_or(false),
+                has_more: response
+                    .get("hasMore")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false),
             });
         }
         // "snapshot" or "snapshot:<ts>:<page cursor>": walk a consistent
@@ -380,14 +432,20 @@ impl Source for ConvexSource {
         let mut query = "/api/list_snapshot?format=json".to_string();
         let mut parts = cursor.splitn(3, ':').skip(1);
         if let (Some(snapshot), Some(page)) = (parts.next(), parts.next()) {
-            query.push_str(&format!("&snapshot={snapshot}&cursor={}", urlencoding::encode(page)));
+            query.push_str(&format!(
+                "&snapshot={snapshot}&cursor={}",
+                urlencoding::encode(page)
+            ));
         }
         let response = self.get(&query).await?;
         let snapshot = response
             .get("snapshot")
             .and_then(Json::as_i64)
             .context("list_snapshot returned no snapshot")?;
-        let has_more = response.get("hasMore").and_then(Json::as_bool).unwrap_or(false);
+        let has_more = response
+            .get("hasMore")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         let next = match response.get("cursor").and_then(Json::as_str) {
             Some(page) if has_more => format!("snapshot:{snapshot}:{page}"),
             _ => format!("delta:{snapshot}"),
@@ -462,7 +520,11 @@ fn id_target(field_type: &Json) -> Option<String> {
     match field_type.get("type")?.as_str()? {
         "id" => field_type.get("tableName")?.as_str().map(str::to_string),
         // `v.optional(v.id(...))` and `v.union(v.id(...), v.null())`.
-        "union" => field_type.get("value")?.as_array()?.iter().find_map(id_target),
+        "union" => field_type
+            .get("value")?
+            .as_array()?
+            .iter()
+            .find_map(id_target),
         _ => None,
     }
 }
@@ -489,7 +551,9 @@ pub(crate) fn id_table_number(id: &str) -> Option<u64> {
     let mut bit_count = 0;
     let mut bytes = Vec::with_capacity(id.len() * 5 / 8);
     for character in id.bytes() {
-        let digit = ID_ALPHABET.iter().position(|candidate| *candidate == character)? as u64;
+        let digit = ID_ALPHABET
+            .iter()
+            .position(|candidate| *candidate == character)? as u64;
         bits = (bits << 5) | digit;
         bit_count += 5;
         if bit_count >= 8 {
@@ -519,7 +583,9 @@ pub(crate) fn decode_value(value: &Json) -> Value {
         Json::String(text) => Value::Text(text.clone()),
         Json::Object(object) if object.len() == 1 => {
             if let Some(integer) = object.get("$integer").and_then(Json::as_str) {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(integer).ok();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(integer)
+                    .ok();
                 if let Some(bytes) = bytes.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) {
                     return Value::Int(i64::from_le_bytes(bytes));
                 }
@@ -546,7 +612,9 @@ fn encode_value(value: &Value) -> Json {
             .map(Json::Number)
             .unwrap_or(Json::Null),
         Value::Text(text) => Json::String(text.clone()),
-        Value::Bytes(bytes) => json!({ "$bytes": base64::engine::general_purpose::STANDARD.encode(bytes) }),
+        Value::Bytes(bytes) => {
+            json!({ "$bytes": base64::engine::general_purpose::STANDARD.encode(bytes) })
+        }
         Value::Json(value) => value.clone(),
     }
 }
@@ -557,14 +625,22 @@ mod tests {
 
     #[test]
     fn test_id_table_number() {
-        assert_eq!(id_table_number("j571ppjzadhqaz99pz7mv7r3tx8gyc29"), Some(10001));
+        assert_eq!(
+            id_table_number("j571ppjzadhqaz99pz7mv7r3tx8gyc29"),
+            Some(10001)
+        );
         assert_eq!(id_table_number("not-an-id"), None);
         assert_eq!(id_table_number("ilou0000000000000000000000000000"), None);
     }
 
     #[test]
     fn test_value_round_trip() {
-        for value in [Value::Int(-42), Value::Bytes(vec![1, 2, 3]), Value::Float(1.5), Value::Text("x".into())] {
+        for value in [
+            Value::Int(-42),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Float(1.5),
+            Value::Text("x".into()),
+        ] {
             assert_eq!(decode_value(&encode_value(&value)), value);
         }
     }

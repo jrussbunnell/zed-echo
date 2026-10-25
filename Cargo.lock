@@ -23180,6 +23180,7 @@ dependencies = [
  "copilot_ui",
  "crashes",
  "dap_adapters",
+ "database",
  "database_panel",
  "db",
  "debug_adapter_extension",

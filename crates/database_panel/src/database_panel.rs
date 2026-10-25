@@ -23,7 +23,8 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-pub use compare_view::{CompareView, SavedCompare};
+pub use compare_view::{CompareView, SavedCompare, SavedSide};
+pub use modals::ApprovalModal;
 pub use results_view::ResultsView;
 
 use crate::{
@@ -108,15 +109,22 @@ impl DatabasePanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, window, cx| Self::new(workspace, window, cx))
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            Self::new(workspace, window, cx)
+        })
     }
 
-    fn new(workspace: &mut Workspace, _: &mut Window, cx: &mut gpui::Context<Workspace>) -> Entity<Self> {
+    fn new(
+        workspace: &mut Workspace,
+        _: &mut Window,
+        cx: &mut gpui::Context<Workspace>,
+    ) -> Entity<Self> {
         let store = DatabaseStore::for_project(workspace.project(), cx);
         let project_key = project_key(workspace, cx);
         let workspace_handle = cx.entity().downgrade();
         cx.new(|cx| {
-            let subscriptions = vec![cx.observe(&store, |this: &mut Self, _, cx| this.rebuild_rows(cx))];
+            let subscriptions =
+                vec![cx.observe(&store, |this: &mut Self, _, cx| this.rebuild_rows(cx))];
             let mut this = Self {
                 workspace: workspace_handle,
                 store,
@@ -150,16 +158,18 @@ impl DatabasePanel {
             }
             match store.state(&name) {
                 ConnectionState::Connecting => rows.push(Row::Note(name, "Connecting…".into())),
-                ConnectionState::NeedsSecret => {
-                    rows.push(Row::Note(name, "Needs a secret: right-click → Set Secret".into()))
-                }
+                ConnectionState::NeedsSecret => rows.push(Row::Note(
+                    name,
+                    "Needs a secret: right-click → Set Secret".into(),
+                )),
                 ConnectionState::Failed(error) => rows.push(Row::Note(name, error)),
                 ConnectionState::Disconnected => {}
                 ConnectionState::Connected { .. } => match store.collections(&name) {
                     None => rows.push(Row::Note(name, "Loading…".into())),
                     Some([]) => rows.push(Row::Note(name, "No tables".into())),
                     Some(collections) => {
-                        let mut by_namespace: BTreeMap<Option<String>, Vec<&Collection>> = BTreeMap::default();
+                        let mut by_namespace: BTreeMap<Option<String>, Vec<&Collection>> =
+                            BTreeMap::default();
                         for collection in collections {
                             by_namespace
                                 .entry(collection.reference.namespace.clone())
@@ -192,7 +202,12 @@ impl DatabasePanel {
         cx.notify();
     }
 
-    fn toggle_connection(&mut self, name: &Arc<str>, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    pub fn toggle_connection(
+        &mut self,
+        name: &Arc<str>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if !self.expanded.remove(name) {
             self.expanded.insert(name.clone());
             if matches!(
@@ -219,17 +234,30 @@ impl DatabasePanel {
         .detach();
     }
 
-    fn prompt_secret(&mut self, name: &Arc<str>, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn prompt_secret(
+        &mut self,
+        name: &Arc<str>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let store = self.store.clone();
         let name = name.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.toggle_modal(window, cx, |window, cx| SecretModal::new(store, name, window, cx));
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    SecretModal::new(store, name, window, cx)
+                });
             })
             .log_err();
     }
 
-    fn open_collection(&mut self, name: &Arc<str>, collection: &Collection, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn open_collection(
+        &mut self,
+        name: &Arc<str>,
+        collection: &Collection,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let store = self.store.clone();
         let name = name.clone();
         let reference = collection.reference.clone();
@@ -250,7 +278,12 @@ impl DatabasePanel {
             .log_err();
     }
 
-    fn open_compare(&mut self, saved: Option<SavedCompare>, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn open_compare(
+        &mut self,
+        saved: Option<SavedCompare>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let store = self.store.clone();
         let project_key = self.project_key.clone();
         self.workspace
@@ -260,41 +293,78 @@ impl DatabasePanel {
             .log_err();
     }
 
-    fn deploy_context_menu(&mut self, position: Point<Pixels>, name: Arc<str>, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        name: Arc<str>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let store = self.store.read(cx);
         let connected = matches!(store.state(&name), ConnectionState::Connected { .. });
         let has_language = query_language(store, &name) != QueryLanguage::None;
         let this = cx.entity().downgrade();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
-            let action = |handler: fn(&mut Self, &Arc<str>, &mut Window, &mut gpui::Context<Self>)| {
-                let this = this.clone();
-                let name = name.clone();
-                move |window: &mut Window, cx: &mut App| {
-                    this.update(cx, |this, cx| handler(this, &name, window, cx)).log_err();
-                }
-            };
-            menu.entry(if connected { "Reconnect" } else { "Connect" }, None, action(|this, name, window, cx| this.connect(name, window, cx)))
-                .when(connected, |menu| {
-                    menu.entry("Disconnect", None, action(|this, name, _, cx| {
-                        this.store.update(cx, |store, cx| store.disconnect(name, cx));
-                    }))
-                    .entry("Refresh Tables", None, action(|this, name, _, cx| {
+            let action =
+                |handler: fn(&mut Self, &Arc<str>, &mut Window, &mut gpui::Context<Self>)| {
+                    let this = this.clone();
+                    let name = name.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        this.update(cx, |this, cx| handler(this, &name, window, cx))
+                            .log_err();
+                    }
+                };
+            menu.entry(
+                if connected { "Reconnect" } else { "Connect" },
+                None,
+                action(|this, name, window, cx| this.connect(name, window, cx)),
+            )
+            .when(connected, |menu| {
+                menu.entry(
+                    "Disconnect",
+                    None,
+                    action(|this, name, _, cx| {
+                        this.store
+                            .update(cx, |store, cx| store.disconnect(name, cx));
+                    }),
+                )
+                .entry(
+                    "Refresh Tables",
+                    None,
+                    action(|this, name, _, cx| {
                         this.store
                             .update(cx, |store, cx| store.refresh_collections(name, cx))
                             .detach_and_log_err(cx);
-                    }))
-                })
-                .when(has_language, |menu| {
-                    menu.entry("New Query", None, action(|this, name, window, cx| this.new_query(name, window, cx)))
-                })
-                .entry("Compare…", None, action(|this, _, window, cx| this.open_compare(None, window, cx)))
-                .separator()
-                .entry("Set Secret…", None, action(|this, name, window, cx| this.prompt_secret(name, window, cx)))
-                .entry("Forget Secret", None, action(|this, name, _, cx| {
+                    }),
+                )
+            })
+            .when(has_language, |menu| {
+                menu.entry(
+                    "New Query",
+                    None,
+                    action(|this, name, window, cx| this.new_query(name, window, cx)),
+                )
+            })
+            .entry(
+                "Compare…",
+                None,
+                action(|this, _, window, cx| this.open_compare(None, window, cx)),
+            )
+            .separator()
+            .entry(
+                "Set Secret…",
+                None,
+                action(|this, name, window, cx| this.prompt_secret(name, window, cx)),
+            )
+            .entry(
+                "Forget Secret",
+                None,
+                action(|this, name, _, cx| {
                     this.store
                         .update(cx, |store, cx| store.forget_secret(name, cx))
                         .detach_and_log_err(cx);
-                }))
+                }),
+            )
         });
         window.focus(&menu.focus_handle(cx), cx);
         let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
@@ -316,14 +386,37 @@ impl DatabasePanel {
                     return div().into_any_element();
                 };
                 let state = store.state(&name);
-                let (state_icon, state_color, state_text): (IconName, Color, SharedString) = match &state {
-                    ConnectionState::Connected { capability: Capability::Writable, .. } => (IconName::Check, Color::Success, "Connected, writable".into()),
-                    ConnectionState::Connected { capability: Capability::ReadOnly { reason }, .. } => (IconName::Lock, Color::Muted, format!("Connected, read-only: {reason}").into()),
-                    ConnectionState::Connecting => (IconName::ArrowCircle, Color::Muted, "Connecting".into()),
-                    ConnectionState::NeedsSecret => (IconName::Warning, Color::Warning, "Needs a secret".into()),
-                    ConnectionState::Failed(error) => (IconName::XCircle, Color::Error, error.clone()),
-                    ConnectionState::Disconnected => (IconName::Disconnected, Color::Muted, "Not connected".into()),
-                };
+                let (state_icon, state_color, state_text): (IconName, Color, SharedString) =
+                    match &state {
+                        ConnectionState::Connected {
+                            capability: Capability::Writable,
+                            ..
+                        } => (
+                            IconName::Check,
+                            Color::Success,
+                            "Connected, writable".into(),
+                        ),
+                        ConnectionState::Connected {
+                            capability: Capability::ReadOnly { reason },
+                            ..
+                        } => (
+                            IconName::Lock,
+                            Color::Muted,
+                            format!("Connected, read-only: {reason}").into(),
+                        ),
+                        ConnectionState::Connecting => {
+                            (IconName::ArrowCircle, Color::Muted, "Connecting".into())
+                        }
+                        ConnectionState::NeedsSecret => {
+                            (IconName::Warning, Color::Warning, "Needs a secret".into())
+                        }
+                        ConnectionState::Failed(error) => {
+                            (IconName::XCircle, Color::Error, error.clone())
+                        }
+                        ConnectionState::Disconnected => {
+                            (IconName::Disconnected, Color::Muted, "Not connected".into())
+                        }
+                    };
                 let kind = match entry.spec.kind {
                     DatabaseKind::Mysql => "MySQL",
                     DatabaseKind::Postgres => "Postgres",
@@ -336,7 +429,11 @@ impl DatabasePanel {
                 let menu_name = name.clone();
                 ListItem::new(("connection", index))
                     .toggle(Some(self.expanded.contains(&name)))
-                    .start_slot(Icon::new(IconName::DatabaseZap).size(IconSize::Small).color(Color::Muted))
+                    .start_slot(
+                        Icon::new(IconName::DatabaseZap)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(
                         h_flex()
                             .gap_1p5()
@@ -347,14 +444,22 @@ impl DatabasePanel {
                     .end_slot(
                         div()
                             .id(("connection-state", index))
-                            .child(Icon::new(state_icon).size(IconSize::Small).color(state_color))
+                            .child(
+                                Icon::new(state_icon)
+                                    .size(IconSize::Small)
+                                    .color(state_color),
+                            )
                             .tooltip(Tooltip::text(format!("{state_text} · {access}"))),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| this.toggle_connection(&click_name, window, cx)))
-                    .on_secondary_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.deploy_context_menu(event.position, menu_name.clone(), window, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_connection(&click_name, window, cx)
                     }))
+                    .on_secondary_mouse_down(cx.listener(
+                        move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.deploy_context_menu(event.position, menu_name.clone(), window, cx);
+                        },
+                    ))
                     .into_any_element()
             }
             Row::Namespace(name, namespace) => {
@@ -363,7 +468,11 @@ impl DatabasePanel {
                 ListItem::new(("namespace", index))
                     .indent_level(1)
                     .toggle(Some(open))
-                    .start_slot(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
+                    .start_slot(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(Label::new(namespace).size(LabelSize::Small))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.collapsed_namespaces.remove(&key) {
@@ -375,7 +484,10 @@ impl DatabasePanel {
             }
             Row::Collection(name, collection) => {
                 let indent = if collection.reference.namespace.is_some()
-                    && self.rows.iter().any(|row| matches!(row, Row::Namespace(owner, _) if *owner == name))
+                    && self
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row, Row::Namespace(owner, _) if *owner == name))
                 {
                     2
                 } else {
@@ -386,30 +498,52 @@ impl DatabasePanel {
                 ListItem::new(("collection", index))
                     .indent_level(indent)
                     .start_slot(
-                        Icon::new(if is_view { IconName::Eye } else { IconName::Table })
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        Icon::new(if is_view {
+                            IconName::Eye
+                        } else {
+                            IconName::Table
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(Label::new(label).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_collection(&name, &collection, window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_collection(&name, &collection, window, cx)
+                    }))
                     .into_any_element()
             }
             Row::Note(_, text) => ListItem::new(("note", index))
                 .indent_level(1)
-                .child(Label::new(text).size(LabelSize::Small).color(Color::Muted).single_line().truncate())
+                .child(
+                    Label::new(text)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .single_line()
+                        .truncate(),
+                )
                 .into_any_element(),
             Row::ComparesHeader => div()
                 .px_2()
                 .pt_3()
                 .pb_1()
-                .child(Label::new("Saved comparisons").size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    Label::new("Saved comparisons")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
                 .into_any_element(),
             Row::Compare(saved) => {
                 let label = saved.name.clone();
                 ListItem::new(("compare", index))
-                    .start_slot(Icon::new(IconName::Diff).size(IconSize::Small).color(Color::Muted))
+                    .start_slot(
+                        Icon::new(IconName::Diff)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(Label::new(label).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_compare(Some(saved.clone()), window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_compare(Some(saved.clone()), window, cx)
+                    }))
                     .into_any_element()
             }
         }
@@ -483,7 +617,12 @@ impl Panel for DatabasePanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
-    fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut gpui::Context<Self>) {
+    fn set_position(
+        &mut self,
+        position: DockPosition,
+        _: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         self.position = position;
         cx.notify();
     }
@@ -524,25 +663,38 @@ impl Render for DatabasePanel {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
-                    .child(Label::new("Databases").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new("Databases")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(div().flex_1())
                     .child(
                         IconButton::new("compare", IconName::Diff)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Compare tables or queries"))
-                            .on_click(cx.listener(|this, _, window, cx| this.open_compare(None, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_compare(None, window, cx)
+                            })),
                     )
                     .child(
                         IconButton::new("history", IconName::HistoryRerun)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Query history"))
-                            .on_click(|_, window, cx| window.dispatch_action(QueryHistory.boxed_clone(), cx)),
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(QueryHistory.boxed_clone(), cx)
+                            }),
                     )
                     .child(
                         IconButton::new("settings", IconName::Settings)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Edit connections"))
-                            .on_click(|_, window, cx| window.dispatch_action(zed_actions::OpenSettingsFile.boxed_clone(), cx)),
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    zed_actions::OpenSettingsFile.boxed_clone(),
+                                    cx,
+                                )
+                            }),
                     ),
             )
             .map(|this| {
@@ -563,8 +715,13 @@ impl Render for DatabasePanel {
                 }
             })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(anchored().position(*position).anchor(gpui::Anchor::TopLeft).child(menu.clone()))
-                    .with_priority(1)
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
             }))
     }
 }
