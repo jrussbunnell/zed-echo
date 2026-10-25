@@ -4816,6 +4816,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "database_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "collections",
+ "context_server",
+ "database",
+ "db",
+ "editor",
+ "futures 0.3.34",
+ "gpui",
+ "language",
+ "log",
+ "menu",
+ "picker",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "db"
 version = "0.1.0"
 dependencies = [
@@ -23150,6 +23178,7 @@ dependencies = [
  "copilot_ui",
  "crashes",
  "dap_adapters",
+ "database_panel",
  "db",
  "debug_adapter_extension",
  "debugger_tools",
