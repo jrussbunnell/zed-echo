@@ -8,7 +8,8 @@ use acp_thread::{AcpThread, AgentConnection};
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
-use futures::future::Shared;
+use futures::channel::oneshot;
+use futures::future::{BoxFuture, Shared};
 use gpui::{App, Context, Entity, SharedString, Task};
 use project::Project;
 use std::path::Path;
@@ -25,6 +26,10 @@ pub struct Sidecar {
     /// The working session the last question was about, so a question about a
     /// different one is told so.
     about: Option<acp::SessionId>,
+    /// Resolves when the most recent `ask` is done. A second prompt sent while
+    /// a turn runs cancels that turn, so each question waits for the one
+    /// before it.
+    last_ask: Shared<BoxFuture<'static, ()>>,
 }
 
 impl Sidecar {
@@ -54,6 +59,7 @@ impl Sidecar {
             failed: false,
             briefed: false,
             about: None,
+            last_ask: futures::future::ready(()).boxed().shared(),
         }
     }
 
@@ -79,24 +85,43 @@ impl Sidecar {
         cx: &mut Context<Self>,
     ) -> Task<Result<String>> {
         let session = self.session.clone();
+        let previous = self.last_ask.clone();
+        // Dropped when this ask ends however it ends, including being
+        // cancelled, which is what releases the next one.
+        let (done, finished) = oneshot::channel::<()>();
+        self.last_ask = async move {
+            finished.await.ok();
+        }
+        .boxed()
+        .shared();
+
         cx.spawn(async move |this, cx| {
+            let _done = done;
+            previous.await;
             let thread = session.await.map_err(|message| anyhow!(message))?;
-            let prompt = this.update(cx, |sidecar, _| sidecar.prompt_for(question, about))?;
+            let prompt = this.read_with(cx, |sidecar, _| sidecar.prompt_for(&question, &about))?;
+            let (turn_start, sent) = thread.update(cx, |thread, cx| {
+                let turn_start = thread.entries().len();
+                let sent = thread.send(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                    cx,
+                );
+                (turn_start, sent)
+            });
+            sent.await?;
+            this.update(cx, |sidecar, _| {
+                sidecar.briefed = true;
+                if about.is_some() {
+                    sidecar.about = about;
+                }
+            })?;
             thread
-                .update(cx, |thread, cx| {
-                    thread.send(
-                        vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
-                        cx,
-                    )
-                })
-                .await?;
-            thread
-                .read_with(cx, |thread, cx| last_answer(thread, cx))
-                .context("the sidecar finished without answering")
+                .read_with(cx, |thread, cx| answer_since(thread, turn_start, cx))
+                .context("no answer")
         })
     }
 
-    fn prompt_for(&mut self, question: String, about: Option<acp::SessionId>) -> String {
+    fn prompt_for(&self, question: &str, about: &Option<acp::SessionId>) -> String {
         let transcript = || {
             about
                 .as_ref()
@@ -104,36 +129,36 @@ impl Sidecar {
         };
         let opening = if !self.briefed {
             Some(sidecar_briefing(transcript().as_deref()))
-        } else if about.is_some() && about != self.about {
+        } else if about.is_some() && *about != self.about {
             Some(rebriefing(transcript().as_deref()))
         } else {
             None
         };
-        self.briefed = true;
-        if about.is_some() {
-            self.about = about.clone();
-        }
         match opening {
             Some(opening) => format!("{opening}\n\n{question}"),
-            None => question,
+            None => question.to_string(),
         }
     }
 }
 
-/// The most recent assistant message, which is the answer.
+/// The last assistant message of the turn that began at `turn_start`, which
+/// is the answer. Earlier turns are not looked at: a turn that only ran tools
+/// has no answer, rather than the previous question's.
 ///
 /// Built from the message chunks rather than `AssistantMessage::to_markdown`,
 /// which adds a heading and the thinking, neither of which is meant to be
 /// read aloud.
-fn last_answer(thread: &AcpThread, cx: &App) -> Option<String> {
-    let message = thread
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            acp_thread::AgentThreadEntry::AssistantMessage(message) => Some(message),
-            _ => None,
-        })?;
+fn answer_since(thread: &AcpThread, turn_start: usize, cx: &App) -> Option<String> {
+    let message =
+        thread
+            .entries()
+            .get(turn_start..)?
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::AssistantMessage(message) => Some(message),
+                _ => None,
+            })?;
     let text = message
         .chunks
         .iter()
@@ -385,5 +410,112 @@ mod tests {
         let answer = ask(&sidecar, "second", None, cx);
 
         assert_eq!(answer.expect("answered"), "the second answer");
+    }
+
+    fn session_id(sidecar: &Entity<Sidecar>, cx: &mut TestAppContext) -> acp::SessionId {
+        sidecar.read_with(cx, |sidecar, cx| {
+            sidecar
+                .thread
+                .as_ref()
+                .expect("the session started")
+                .read(cx)
+                .session_id()
+                .clone()
+        })
+    }
+
+    fn say(
+        connection: &StubAgentConnection,
+        session_id: &acp::SessionId,
+        text: &str,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into())),
+                cx,
+            )
+        });
+    }
+
+    /// A second prompt sent while a turn runs cancels that turn, so a second
+    /// question asked before the first is answered must wait its turn.
+    #[gpui::test]
+    async fn two_questions_in_flight_each_get_their_own_answer(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let sidecar = new_sidecar(&connection, cx).await;
+
+        let first = sidecar.update(cx, |sidecar, cx| sidecar.ask("first".into(), None, cx));
+        let second = sidecar.update(cx, |sidecar, cx| sidecar.ask("second".into(), None, cx));
+        cx.run_until_parked();
+        assert_eq!(prompts(&sidecar, cx).len(), 1, "the second waits");
+        assert!(
+            connection.take_cancel_calls().is_empty(),
+            "the second question must not cut the first one's turn short"
+        );
+
+        let session_id = session_id(&sidecar, cx);
+        say(&connection, &session_id, "the first answer", cx);
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(prompts(&sidecar, cx).len(), 2);
+
+        say(&connection, &session_id, "the second answer", cx);
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let first = futures::FutureExt::now_or_never(first).expect("first answered");
+        let second = futures::FutureExt::now_or_never(second).expect("second answered");
+        assert_eq!(first.expect("answered"), "the first answer");
+        assert_eq!(second.expect("answered"), "the second answer");
+    }
+
+    #[gpui::test]
+    async fn a_turn_with_no_message_is_an_error_not_the_previous_answer(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let sidecar = new_sidecar(&connection, cx).await;
+
+        reply_with(&connection, "the first answer");
+        ask(&sidecar, "first", None, cx).expect("answered");
+
+        let second = sidecar.update(cx, |sidecar, cx| sidecar.ask("second".into(), None, cx));
+        cx.run_until_parked();
+        connection.end_turn(session_id(&sidecar, cx), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let second = futures::FutureExt::now_or_never(second).expect("second finished");
+        assert_eq!(second.expect_err("no answer").to_string(), "no answer");
+    }
+
+    #[gpui::test]
+    async fn a_failed_first_send_rebriefs_next_time(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let sidecar = new_sidecar(&connection, cx).await;
+
+        let failure = connection.defer_next_prompt_response();
+        let first = sidecar.update(cx, |sidecar, cx| sidecar.ask("first".into(), None, cx));
+        cx.run_until_parked();
+        failure
+            .send(Err(anyhow!("the agent fell over")))
+            .expect("the turn is waiting");
+        cx.run_until_parked();
+        assert!(
+            futures::FutureExt::now_or_never(first)
+                .expect("first finished")
+                .is_err()
+        );
+        assert!(!sidecar.read_with(cx, |sidecar, _| sidecar.is_briefed()));
+
+        reply_with(&connection, "an answer");
+        ask(&sidecar, "second", None, cx).expect("answered");
+
+        let prompts = prompts(&sidecar, cx);
+        assert!(
+            prompts
+                .last()
+                .expect("sent")
+                .contains(&sidecar_briefing(None))
+        );
     }
 }
