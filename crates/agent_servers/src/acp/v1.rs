@@ -9539,7 +9539,7 @@ exit 7
             );
         });
 
-        parent.read_with(cx, |parent, _cx| {
+        parent.read_with(cx, |parent, cx| {
             assert_eq!(
                 parent.entries().len(),
                 1,
@@ -9548,11 +9548,21 @@ exit 7
             );
             let subagents: Vec<_> = parent
                 .subagent_tool_calls()
-                .map(|(_, tool_call, info)| (tool_call.id.clone(), info.session_id.clone()))
+                .map(|(_, tool_call, info)| {
+                    (
+                        tool_call.id.clone(),
+                        info.session_id.clone(),
+                        tool_call.label.read(cx).source().to_string(),
+                    )
+                })
                 .collect();
             assert_eq!(
                 subagents,
-                vec![(acp_v2::ToolCallId::new("toolu_1"), child_session_id.clone())]
+                vec![(
+                    acp_v2::ToolCallId::new("toolu_1"),
+                    child_session_id.clone(),
+                    "Research alternatives".to_string()
+                )]
             );
         });
     }
@@ -11203,9 +11213,23 @@ fn handle_native_delegation_message(
                     if parent.tool_call(&tool_call_id).is_some() {
                         return Ok(());
                     }
+                    // The child's own title is not set yet at launch; the name
+                    // the parent announced it under is what the card should read.
                     let title = parent
                         .subagent(&child_session_id)
-                        .and_then(|child| child.read(cx).title())
+                        .and_then(|child| {
+                            let child = child.read(cx);
+                            child
+                                .subagent_association()
+                                .and_then(|association| {
+                                    association
+                                        .title
+                                        .clone()
+                                        .or_else(|| association.description.clone())
+                                })
+                                .filter(|title| !title.trim().is_empty())
+                                .or_else(|| child.title())
+                        })
                         .map(|title| title.to_string())
                         .unwrap_or_default();
                     // The child's reported state drives the card from here, so
