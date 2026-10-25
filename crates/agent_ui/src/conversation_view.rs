@@ -964,6 +964,31 @@ impl Conversation {
         Some(())
     }
 
+    /// Answers `tool_call_id` in exactly `session_id`, and only while it is
+    /// that session's pending prompt. `None` when it is not, so a prompt
+    /// answered some other way is never mistaken for the next one.
+    #[cfg(target_os = "macos")]
+    pub fn authorize_tool_call_in_session(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &acp_v2::ToolCallId,
+        kind: acp_v2::PermissionOptionKind,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let request = self.pending_permission_request_for_session(session_id, cx)?;
+        if request.legacy_tool_call_id()? != tool_call_id {
+            return None;
+        }
+        let option = permission_option_for_action(request.legacy_options()?, kind)?;
+        self.authorize_permission_request(
+            session_id.clone(),
+            request.id,
+            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind.clone()),
+            cx,
+        );
+        Some(())
+    }
+
     pub fn authorize_with_granularity(
         &mut self,
         session_id: acp_v2::SessionId,
@@ -19765,6 +19790,83 @@ pub(crate) mod tests {
                 cx,
             )
         })
+    }
+
+    /// Adds a subagent under `parent`'s root thread whose tool call
+    /// `tool_call_id` is waiting for permission. Hold on to the returned task:
+    /// it is the pending answer.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn add_blocked_test_subagent(
+        parent: &Entity<ThreadView>,
+        child_id: &str,
+        tool_call_id: &str,
+        cx: &mut VisualTestContext,
+    ) -> (
+        Entity<ThreadView>,
+        Task<acp_thread::RequestPermissionOutcome>,
+    ) {
+        let (root_session_id, conversation, conversation_view) = parent.read_with(cx, |view, _| {
+            (
+                view.session_id.clone(),
+                view.conversation.clone(),
+                view.server_view.clone(),
+            )
+        });
+        let conversation_view = conversation_view
+            .upgrade()
+            .expect("the conversation is open");
+        let child_session_id = acp_v2::SessionId::new(child_id);
+        let child_view = conversation_view.update_in(cx, |view, window, cx| {
+            let child = create_test_acp_thread(
+                Some(root_session_id),
+                child_id,
+                Rc::new(StubAgentConnection::new()),
+                view.project.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(child.clone(), cx);
+            });
+            let child_view =
+                view.new_thread_view(child, conversation.clone(), false, None, window, cx);
+            view.as_connected_mut()
+                .expect("connected")
+                .threads
+                .insert(child_session_id, child_view.clone());
+            child_view
+        });
+        let child = child_view.read_with(cx, |view, _| view.thread.clone());
+        let response = block_on_test_tool_call(&child, tool_call_id, cx);
+        (child_view, response)
+    }
+
+    /// Stops `thread` on a permission prompt for `tool_call_id` with allow and
+    /// reject options. Hold on to the returned task: it is the pending answer.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn block_on_test_tool_call(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &str,
+        cx: &mut VisualTestContext,
+    ) -> Task<acp_thread::RequestPermissionOutcome> {
+        let (_, response) = request_test_tool_authorization_with_options(
+            thread,
+            tool_call_id,
+            PermissionOptions::Flat(vec![
+                acp_v2::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                acp_v2::PermissionOption::new(
+                    "reject",
+                    "Reject",
+                    acp_v2::PermissionOptionKind::RejectOnce,
+                ),
+            ]),
+            cx,
+        );
+        cx.run_until_parked();
+        response
     }
 
     fn request_test_tool_authorization(

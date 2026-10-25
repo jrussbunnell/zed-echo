@@ -445,5 +445,24 @@ mod tests {
             }
         }
         eprintln!("events after cancel and truncate: {seen:?}");
+
+        // Voice mode re-sends the whole session config mid-conversation to
+        // refresh the state block.
+        let mut refreshed = config();
+        refreshed.instructions = "Be brief. Open sessions: none.".into();
+        connection
+            .sender
+            .unbounded_send(ClientEvent::SessionUpdate(refreshed))
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(event) = next(&mut connection, 3).await {
+            if let ServerEvent::Error(message) = &event {
+                panic!(
+                    "a mid-conversation session.update was rejected: {message} (after {seen:?})"
+                );
+            }
+            seen.push(event);
+        }
+        eprintln!("events after a mid-conversation session.update: {seen:?}");
     }
 }

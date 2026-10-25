@@ -116,6 +116,10 @@ pub fn encode(event: &ClientEvent) -> Result<String> {
                     "description": tool.description,
                     "parameters": tool.parameters,
                 })).collect::<Vec<_>>(),
+                // Inworld answers tool outputs on its own by default; voice
+                // mode asks for each response itself, and both together
+                // would answer twice.
+                "providerData": { "auto_tool_response": false },
             },
         }),
         ClientEvent::AppendAudio(samples) => {
@@ -400,6 +404,7 @@ mod tests {
         assert_eq!(session["audio"]["output"]["model"], "inworld-tts-2-flash");
         assert_eq!(session["tools"][0]["type"], "function");
         assert_eq!(session["tools"][0]["name"], "ping");
+        assert_eq!(session["providerData"]["auto_tool_response"], false);
     }
 
     #[test]
