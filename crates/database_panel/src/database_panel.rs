@@ -463,7 +463,7 @@ impl DatabasePanel {
                     .into_any_element()
             }
             Row::Namespace(name, namespace) => {
-                let key = (name.clone(), namespace.clone());
+                let key = (name, namespace.clone());
                 let open = !self.collapsed_namespaces.contains(&key);
                 ListItem::new(("namespace", index))
                     .indent_level(1)

@@ -595,3 +595,109 @@ async fn test_compare_mysql_against_convex() {
     assert_eq!(outcome.left_only(), 0, "{outcome:?}");
     assert_eq!(outcome.right_only(), 0, "{outcome:?}");
 }
+
+/// Serves the shapes Bartr's `warehouse` relay returns: `POST /query` with
+/// `{sql}` answers `{meta, rows}`, `GET /catalog/*` answers its catalog, and
+/// everything needs the `x-relay-secret` header.
+fn fake_relay() -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            let mut secret_ok = false;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim().to_ascii_lowercase();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some(length) = header.strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap();
+                }
+                secret_ok |= header == "x-relay-secret: s3cret";
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let (status, response) = if !secret_ok {
+                ("403 Forbidden", r#"{"error":"Invalid relay secret"}"#.to_string())
+            } else if request_line.starts_with("GET /catalog/tables") {
+                ("200 OK", r#"{"tables":[{"database":"catalog","table":"listings","engine":"ReplacingMergeTree"}]}"#.to_string())
+            } else if request_line.starts_with("GET /catalog/describe-table") {
+                ("200 OK", r#"{"columns":[{"name":"id","type":"UInt64"},{"name":"city","type":"Nullable(String)"}]}"#.to_string())
+            } else if body.contains("boom") {
+                ("400 Bad Request", r#"{"error":"Unknown identifier 'boom'"}"#.to_string())
+            } else {
+                ("200 OK", r#"{"meta":[{"name":"id","type":"UInt64"},{"name":"city","type":"String"}],"rows":[{"id":"1","city":"Austin"},{"id":"2"}],"rowCount":2}"#.to_string())
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    format!("http://{address}/query")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clickhouse_relay() {
+    if !enabled() {
+        return;
+    }
+    let engine = engine();
+    let url = fake_relay();
+    assert!(matches!(
+        connect(&engine, "bartr", http_spec(DatabaseKind::ClickhouseRelay, &url, None), "s3cret").await,
+        Capability::ReadOnly { .. }
+    ));
+    let rows = query(&engine, "bartr", "SELECT id, city FROM catalog.listings", false).await.unwrap();
+    assert_eq!(rows.columns.len(), 2);
+    assert_eq!(rows.rows[0], vec![Value::Text("1".into()), Value::Text("Austin".into())]);
+    assert_eq!(rows.rows[1][1], Value::Missing);
+    let error = query(&engine, "bartr", "SELECT boom", false).await.unwrap_err();
+    assert!(error.to_string().contains("Unknown identifier 'boom'"), "{error}");
+
+    let Response::Collections(collections) = engine
+        .handle(Request::Collections { connection: "bartr".into() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(collections[0].reference, CollectionRef::new(Some("catalog"), "listings"));
+    let Response::Schema(schema) = engine
+        .handle(Request::Describe { connection: "bartr".into(), collection: collections[0].reference.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(schema.fields.len(), 2);
+    assert!(schema.fields[1].nullable);
+    assert_eq!(schema.writable, Some(false));
+    assert!(apply(&engine, "bartr", ChangeSet {
+        collection: collections[0].reference.clone(),
+        changes: vec![Change::Delete { key: vec![("id".into(), Value::Int(1))] }],
+    })
+    .await
+    .is_err());
+
+    let wrong_secret = engine
+        .handle(Request::Connect {
+            connection: "bad".into(),
+            spec: http_spec(DatabaseKind::ClickhouseRelay, &url, None),
+            secret: Some("nope".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(wrong_secret.to_string().contains("Invalid relay secret"), "{wrong_secret}");
+}
