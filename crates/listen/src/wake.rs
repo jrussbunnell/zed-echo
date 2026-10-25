@@ -363,6 +363,15 @@ mod macos {
         source: S,
         mut echo_canceller: audio::EchoCanceller,
     ) -> impl rodio::Source {
+        cancelled_by(source, move |buffer| echo_canceller.process_stream(buffer))
+    }
+
+    /// [`cancelled_input`] with the canceller passed as a closure, so tests can
+    /// observe exactly what the canceller is handed.
+    pub(crate) fn cancelled_by<S: rodio::Source>(
+        source: S,
+        mut cancel: impl FnMut(&mut [i16]) -> Result<()>,
+    ) -> impl rodio::Source {
         use rodio::cpal::Sample as _;
 
         source
@@ -370,7 +379,7 @@ mod macos {
             .process_buffer::<{ audio::BUFFER_SIZE }, _>(move |buffer| {
                 let mut cancelled: [i16; audio::BUFFER_SIZE] =
                     buffer.map(|sample| sample.to_sample());
-                if echo_canceller.process_stream(&mut cancelled).is_err() {
+                if cancel(&mut cancelled).is_err() {
                     // A failed frame leaves un-cancelled audio rather than
                     // silence: the wake word still has to be heard through it.
                     return;
@@ -505,3 +514,5 @@ mod macos {
 
 #[cfg(target_os = "macos")]
 pub use macos::SpeechWake;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::cancelled_by;

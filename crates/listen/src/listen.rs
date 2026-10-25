@@ -5,6 +5,8 @@ mod inworld_stt;
 mod listener;
 mod provider;
 mod realtime;
+#[cfg(target_os = "macos")]
+mod realtime_audio;
 mod wake;
 
 pub use conversation::{Activity, DEFAULT_WINDOW, SILENCE_ENDS_UTTERANCE, Window, activity};
@@ -18,6 +20,10 @@ pub use listener::{COMMAND_TIMEOUT, ListenEvent, Listener, WakeSignal, WakeSourc
 pub use provider::FakeStt;
 pub use provider::{SttProvider, Transcript};
 pub use realtime::*;
+#[cfg(target_os = "macos")]
+pub use realtime_audio::{
+    Microphone, PlayedAudio, VoiceLevels, VoicePlayback, rms, start_microphone, to_realtime_frame,
+};
 #[cfg(target_os = "macos")]
 pub use wake::SpeechWake;
 pub use wake::contains_wake_word;
