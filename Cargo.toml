@@ -49,6 +49,7 @@ members = [
     "crates/credentials_provider",
     "crates/dap",
     "crates/dap_adapters",
+    "crates/database",
     "crates/db",
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
@@ -332,6 +333,7 @@ crashes = { path = "crates/crashes" }
 credentials_provider = { path = "crates/credentials_provider" }
 dap = { path = "crates/dap" }
 dap_adapters = { path = "crates/dap_adapters" }
+database = { path = "crates/database" }
 db = { path = "crates/db" }
 debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
@@ -1033,6 +1035,10 @@ xkbcommon = { version = "0.8", default-features = false }
 yaml-rust2 = { version = "0.8", default-features = false }
 yawc = { version = "0.4", default-features = false }
 zeroize = "1.8"
+# Database drivers borrowed from ZQLZ (GPL-3.0-or-later), pinned to a rev.
+zqlz-core = { git = "https://github.com/samurmaykrr/zqlz", rev = "d94a6133a8dc7d0d5a20524cbb9d1aa05e726d13" }
+zqlz-driver-mysql = { git = "https://github.com/samurmaykrr/zqlz", rev = "d94a6133a8dc7d0d5a20524cbb9d1aa05e726d13" }
+zqlz-driver-postgres = { git = "https://github.com/samurmaykrr/zqlz", rev = "d94a6133a8dc7d0d5a20524cbb9d1aa05e726d13" }
 zstd = { version = "0.13", default-features = false, features = ["legacy", "arrays"] }
 
 [workspace.dependencies.windows]

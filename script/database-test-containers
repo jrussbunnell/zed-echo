@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Starts throwaway MySQL, Postgres, ClickHouse and Convex containers seeded for
+# the database crate's live tests, then runs them:
+#
+#   script/database-test-containers          # start, seed, test
+#   script/database-test-containers --stop   # remove the containers
+set -euo pipefail
+
+names=(echo-db-test-mysql echo-db-test-postgres echo-db-test-clickhouse echo-db-test-convex)
+
+if [[ "${1:-}" == "--stop" ]]; then
+    docker rm -f "${names[@]}" >/dev/null
+    exit 0
+fi
+
+docker rm -f "${names[@]}" >/dev/null 2>&1 || true
+docker run -d --name echo-db-test-mysql -e MYSQL_ROOT_PASSWORD=echo -e MYSQL_DATABASE=echo_test -p 13306:3306 mysql:8.4 >/dev/null
+docker run -d --name echo-db-test-postgres -e POSTGRES_PASSWORD=echo -e POSTGRES_DB=echo_test -p 15432:5432 postgres:16-alpine >/dev/null
+docker run -d --name echo-db-test-clickhouse -e CLICKHOUSE_PASSWORD=echo -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 -p 18123:8123 clickhouse/clickhouse-server:26.3 >/dev/null
+docker run -d --name echo-db-test-convex -p 13210:3210 -p 13211:3211 \
+    -e CONVEX_CLOUD_ORIGIN=http://127.0.0.1:13210 -e CONVEX_SITE_ORIGIN=http://127.0.0.1:13211 \
+    ghcr.io/convex/convex-backend:latest >/dev/null
+
+wait_for() {
+    local description=$1
+    shift
+    for _ in $(seq 1 60); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "timed out waiting for $description" >&2
+    exit 1
+}
+
+wait_for mysql docker exec echo-db-test-mysql mysql -uroot -pecho -e "SELECT 1" echo_test
+wait_for postgres docker exec echo-db-test-postgres psql -U postgres -c "SELECT 1" echo_test
+wait_for clickhouse curl -sf "http://127.0.0.1:18123/ping"
+wait_for convex curl -sf "http://127.0.0.1:13210/version"
+
+docker exec -i echo-db-test-mysql mysql -uroot -pecho echo_test 2>/dev/null <<'SQL'
+CREATE TABLE seller (id BIGINT PRIMARY KEY, email VARCHAR(255) NOT NULL, created_at DATETIME NULL, phone VARCHAR(32) NULL);
+CREATE TABLE property (id BIGINT PRIMARY KEY, seller_id BIGINT NOT NULL, address VARCHAR(255), FOREIGN KEY (seller_id) REFERENCES seller(id));
+CREATE TABLE tag (name VARCHAR(32), color VARCHAR(16));
+INSERT INTO seller VALUES (1,'a@x.com','2026-10-24 00:00:00',NULL),(2,'b@x.com',NULL,NULL),(3,'c@x.com',NULL,'555');
+INSERT INTO property VALUES (10,1,'1 Main St'),(11,1,'2 Main St'),(12,3,'3 Oak');
+INSERT INTO tag VALUES ('dup','red'),('dup','blue');
+CREATE USER 'reader'@'%' IDENTIFIED BY 'reader';
+GRANT SELECT ON echo_test.* TO 'reader'@'%';
+SQL
+
+docker exec -i echo-db-test-postgres psql -U postgres echo_test -q <<'SQL'
+CREATE TABLE seller (id BIGINT PRIMARY KEY, email TEXT NOT NULL, created_at TIMESTAMP NULL, phone TEXT NULL);
+CREATE TABLE property (id BIGINT PRIMARY KEY, seller_id BIGINT NOT NULL REFERENCES seller(id), address TEXT);
+INSERT INTO seller VALUES (1,'a@x.com','2026-10-24 00:00:00',NULL),(2,'b@x.com',NULL,NULL),(3,'c@x.com',NULL,'555');
+INSERT INTO property VALUES (10,1,'1 Main St'),(11,1,'2 Main St'),(12,3,'3 Oak');
+CREATE ROLE reader LOGIN PASSWORD 'reader';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader;
+SQL
+
+clickhouse() {
+    curl -sf "http://127.0.0.1:18123/" -u default:echo --data-binary "$1" >/dev/null
+}
+clickhouse "CREATE TABLE default.events (id UInt64, seller_id UInt64, kind String) ENGINE = MergeTree ORDER BY id"
+clickhouse "INSERT INTO default.events VALUES (1,1,'signup'),(2,1,'advance'),(3,2,'signup')"
+clickhouse "CREATE USER reader IDENTIFIED BY 'reader' SETTINGS readonly = 1"
+clickhouse "GRANT SELECT ON default.* TO reader"
+
+key=$(docker exec echo-db-test-convex ./generate_admin_key.sh | tail -1)
+echo "$key" > /tmp/echo-db-convex-key
+curl -sf -X POST http://127.0.0.1:13210/api/mutation \
+    -H "Authorization: Convex $key" -H 'content-type: application/json' \
+    -d '{"path":"_system/frontend/addDocument","args":{"table":"ryseSellerUserLinks","documents":[{"ryseSellerId":1,"email":"a@x.com"},{"ryseSellerId":2,"email":"b@x.com"},{"ryseSellerId":3,"email":"c@x.com"}]},"format":"json"}' >/dev/null
+
+DATABASE_LIVE_TESTS=1 cargo test -p database --test live -- --test-threads=1

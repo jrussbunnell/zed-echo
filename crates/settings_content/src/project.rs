@@ -85,12 +85,16 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    /// Database connections for the database panel and agent database tools.
+    pub database: Option<DatabaseSettingsContent>,
 }
 
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        database,
     },
     defaults: { lsp, dap, context_servers },
 });
@@ -1368,4 +1372,106 @@ mod tests {
         };
         assert_eq!(command.args, vec!["hello".to_string()]);
     }
+}
+
+/// Database connections and the rules agents follow when using them.
+///
+/// Connections defined in a project's `.zed/settings.json` merge over user
+/// connections of the same name, so a project can override a single field
+/// (such as `agent_access`) without redefining the connection.
+#[with_fallible_options]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DatabaseSettingsContent {
+    /// Connections keyed by name. Passwords and keys are never stored here;
+    /// they are kept in the system keychain.
+    pub connections: Option<BTreeMap<Arc<str>, DatabaseConnectionContent>>,
+    /// How writes requested by agents are approved.
+    ///
+    /// Default: preview
+    pub write_approval: Option<DatabaseWriteApproval>,
+}
+
+#[with_fallible_options]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct DatabaseConnectionContent {
+    /// The kind of database.
+    pub kind: Option<DatabaseKind>,
+    /// Host name, for MySQL and Postgres.
+    pub host: Option<String>,
+    /// Port, for MySQL and Postgres. Defaults to the engine's standard port.
+    pub port: Option<u16>,
+    /// Database name.
+    pub database: Option<String>,
+    /// User name.
+    pub user: Option<String>,
+    /// Base URL, for ClickHouse (HTTP interface), ClickHouse relays and Convex
+    /// deployments (cloud or self-hosted).
+    pub url: Option<String>,
+    /// TLS mode for MySQL and Postgres: "disable", "prefer", "require",
+    /// "verify_ca" or "verify_full". "prefer" and "require" encrypt without
+    /// checking the server's certificate; use "verify_full" for anything
+    /// reached over the internet.
+    ///
+    /// Default: disable
+    pub ssl_mode: Option<String>,
+    /// Which environment this connection points at. Drives colour,
+    /// confirmations and default agent access.
+    ///
+    /// Default: dev
+    pub environment: Option<DatabaseEnvironment>,
+    /// Treat the connection as read-only even if the credentials allow
+    /// writes.
+    ///
+    /// Default: false
+    pub read_only: Option<bool>,
+    /// What agents may do with this connection. Defaults by environment:
+    /// prod is off, dev asks per query, local is allowed.
+    pub agent_access: Option<DatabaseAgentAccess>,
+    /// Overrides `write_approval` for this connection.
+    pub write_approval: Option<DatabaseWriteApproval>,
+    /// Convex only: keep a local index of document changes so row history is
+    /// available. Requires the streaming export API.
+    ///
+    /// Default: false
+    pub history: Option<bool>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseKind {
+    Mysql,
+    Postgres,
+    Clickhouse,
+    /// A ClickHouse query relay: SQL is POSTed to `url` with an
+    /// `x-relay-secret` header. Always read-only.
+    ClickhouseRelay,
+    Convex,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseEnvironment {
+    Local,
+    Dev,
+    Prod,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseAgentAccess {
+    /// Agents cannot see the connection.
+    Off,
+    /// Every agent query and write is approved first.
+    Approve,
+    /// Agents read freely; writes are still approved.
+    Allow,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseWriteApproval {
+    /// Echo shows the exact statement or patch and asks before running it.
+    Preview,
+    /// Rely on the agent's own tool permission prompt.
+    Prompt,
 }
