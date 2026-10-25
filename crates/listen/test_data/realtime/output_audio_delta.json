@@ -1,0 +1,9 @@
+{
+  "event_id": "db78fe3c-96a7-4d55-a8c2-a60c33480aef",
+  "type": "response.output_audio.delta",
+  "response_id": "954969c7-1bf3-4ed8-b485-0c4d7b41ac5d",
+  "item_id": "5ad0eb15-5775-4104-b53c-1fdc658e9726",
+  "output_index": 0,
+  "content_index": 1,
+  "delta": "BwAAAOb/3f/h/wIA+//g//7/+P+6/7L/5v/d/7H/wv/J/9r/7v/B/4//5/+3/6L///+t/7T/xf+C/5L/iv83/xH/Gv9T/5n/x//X/6z/b/9q/67/0v+4/77/tP/t/0QAeQC7AAwB+gDqABUBYAFqAXQBQwF9AdkBxgHgARwCIQIbAukB"
+}

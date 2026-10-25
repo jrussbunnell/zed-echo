@@ -1,0 +1,9 @@
+{
+  "event_id": "d43df50c-236f-438b-8c21-29b22b90c571",
+  "type": "response.output_audio_transcript.delta",
+  "response_id": "ab20ddeb-2b9b-4469-8327-fe83b96e5d7b",
+  "item_id": "7508f1e6-206c-444b-b49f-d1f2942d79a7",
+  "output_index": 0,
+  "content_index": 1,
+  "delta": "Hi."
+}

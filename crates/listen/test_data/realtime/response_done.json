@@ -1,0 +1,52 @@
+{
+  "event_id": "f59745e4-32f1-4e61-85b7-e79ff7a3dad5",
+  "type": "response.done",
+  "response": {
+    "id": "954969c7-1bf3-4ed8-b485-0c4d7b41ac5d",
+    "object": "realtime.response",
+    "status": "completed",
+    "output": [
+      {
+        "id": "5ad0eb15-5775-4104-b53c-1fdc658e9726",
+        "type": "message",
+        "object": "realtime.item",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "It is 1:29 PM UTC.",
+            "transcript": "It is 1:29 PM UTC."
+          },
+          {
+            "type": "output_audio",
+            "transcript": "It is 1:29 PM UTC."
+          }
+        ]
+      }
+    ],
+    "usage": {
+      "total_tokens": 107,
+      "input_tokens": 97,
+      "output_tokens": 10,
+      "input_token_details": {
+        "text_tokens": 97
+      },
+      "output_token_details": {
+        "text_tokens": 10
+      },
+      "llm": {
+        "model": "google-ai-studio/gemini-3.1-flash-lite"
+      },
+      "tts": {
+        "model": "inworld-tts-2-flash",
+        "characters": 18,
+        "audio_seconds": 3.11
+      },
+      "stt": {
+        "model": "inworld/inworld-stt-1",
+        "audio_seconds": 1.439
+      }
+    }
+  }
+}

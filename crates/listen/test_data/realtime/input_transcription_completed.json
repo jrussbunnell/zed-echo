@@ -1,0 +1,7 @@
+{
+  "event_id": "765978db-d937-4950-9dc1-a96b3c99fd3d",
+  "type": "conversation.item.input_audio_transcription.completed",
+  "item_id": "c57439c6-bc9c-47e9-80db-b17024e4e1ae",
+  "content_index": 0,
+  "transcript": "What time is it?"
+}

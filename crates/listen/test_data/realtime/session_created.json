@@ -1,0 +1,53 @@
+{
+  "event_id": "4dc84a0c-356c-4475-a803-f2212a949653",
+  "type": "session.created",
+  "session": {
+    "type": "realtime",
+    "id": "beaming-colt-9670:8e9a6ee9-d8e6-482d-b7e6-e1f38dbe42cd",
+    "object": "realtime.session",
+    "output_modalities": [
+      "audio",
+      "text"
+    ],
+    "instructions": "You are a helpful AI assistant.",
+    "audio": {
+      "input": {
+        "format": {
+          "type": "audio/pcm",
+          "rate": 24000
+        },
+        "transcription": null,
+        "noise_reduction": null,
+        "turn_detection": {
+          "type": "semantic_vad",
+          "eagerness": "medium",
+          "create_response": true,
+          "interrupt_response": true
+        }
+      },
+      "output": {
+        "format": {
+          "type": "audio/pcm",
+          "rate": 24000
+        },
+        "voice": "Sarah",
+        "model": "inworld-tts-2",
+        "speed": 1
+      }
+    },
+    "tools": [],
+    "tool_choice": "auto",
+    "temperature": 1,
+    "max_output_tokens": "inf",
+    "truncation": "auto",
+    "prompt": null,
+    "tracing": null,
+    "model": "google-ai-studio/gemini-3.1-flash-lite",
+    "expires_at": 1792904627,
+    "include": null,
+    "providerData": {
+      "user_id": "beaming-colt-9670:8e9a6ee9-d8e6-482d-b7e6-e1f38dbe42cd",
+      "auto_tool_response": true
+    }
+  }
+}
