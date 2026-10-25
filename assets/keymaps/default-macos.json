@@ -305,6 +305,8 @@
       "down": "agent::ScrollOutputLineDown",
       "shift-pageup": "agent::ScrollOutputToPreviousMessage",
       "shift-pagedown": "agent::ScrollOutputToNextMessage",
+      "alt-pageup": "agent::ScrollOutputToPreviousNarration",
+      "alt-pagedown": "agent::ScrollOutputToNextNarration",
       "ctrl-pageup": "agent::ScrollOutputPageUp",
       "ctrl-pagedown": "agent::ScrollOutputPageDown",
       "ctrl-home": "agent::ScrollOutputToTop",

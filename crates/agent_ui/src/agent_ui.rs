@@ -25,6 +25,7 @@ mod mode_selector;
 mod model_search;
 mod model_selector;
 mod model_selector_popover;
+pub mod narration_peek;
 mod profile_selector;
 mod subagent_notifications;
 pub mod subagents;
@@ -406,6 +407,14 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Scroll the output to the agent's previous message or thought.
+        ScrollOutputToPreviousNarration,
+        /// Scroll the output to the agent's next message or thought.
+        ScrollOutputToNextNarration,
+        /// Fold tool calls so the agent's messages and thoughts stand out.
+        ToggleNarrationOnly,
+        /// Show the agent's recent messages and thoughts, and what it is doing now.
+        PeekNarration,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).

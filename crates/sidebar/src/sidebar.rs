@@ -6496,6 +6496,12 @@ impl Sidebar {
                 .contains(&thread.metadata.thread_id);
 
         let subagent_counts = subagent_counts(&thread.subagents);
+        let live_thread = match (&thread.workspace, &thread.metadata.session_id) {
+            (ThreadEntryWorkspace::Open(workspace), Some(session_id)) if thread.is_live => {
+                live_root_thread(workspace, session_id, cx)
+            }
+            _ => None,
+        };
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
@@ -6511,6 +6517,9 @@ impl Sidebar {
             .worktrees(worktrees)
             .subagents(subagent_counts.total, subagent_counts.summary_color())
             .timestamp(timestamp)
+            .activity(live_thread.as_ref().and_then(|live_thread| {
+                agent_ui::narration_peek::current_activity(live_thread.read(cx), cx)
+            }))
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
@@ -6714,7 +6723,24 @@ impl Sidebar {
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
                     let subagent_menu_label = subagent_menu_label.clone();
+                    let live_thread = live_thread.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
+                        if let Some((live_thread, workspace)) =
+                            live_thread.clone().zip(thread_workspace.clone())
+                        {
+                            menu = menu.entry("Peek Narration", None, move |window, cx| {
+                                let live_thread = live_thread.clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    agent_ui::narration_peek::open_narration_peek(
+                                        workspace,
+                                        live_thread,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            });
+                        }
+
                         if let Some(label) = subagent_menu_label.clone() {
                             menu = menu.entry(label, None, {
                                 let sidebar = sidebar.clone();
@@ -6882,6 +6908,14 @@ impl Sidebar {
     ) -> AnyElement {
         let status = subagent.summary.status;
         let label = subagent.summary.label.clone();
+        let live_thread = subagent_thread(subagent, cx);
+        let activity = (status == SubagentStatus::Running)
+            .then(|| {
+                live_thread.as_ref().and_then(|live_thread| {
+                    agent_ui::narration_peek::current_activity(live_thread.read(cx), cx)
+                })
+            })
+            .flatten();
         let colors = cx.theme().colors();
         let rail_color = status.color().color(cx);
 
@@ -6898,7 +6932,7 @@ impl Sidebar {
                 .into_any_element()
         };
 
-        h_flex()
+        let row = h_flex()
             .id(("subagent-entry", ix))
             .group("subagent-item")
             .w_full()
@@ -6936,12 +6970,17 @@ impl Sidebar {
                             .truncate(),
                     ),
             )
-            .child(
-                Label::new(status.label())
+            .child(match activity {
+                Some(activity) => Label::new(activity)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .italic()
+                    .truncate(),
+                None => Label::new(status.label())
                     .size(LabelSize::XSmall)
                     .color(status.color())
                     .flex_shrink_0(),
-            )
+            })
             .tooltip(Tooltip::element(move |_, _| {
                 v_flex()
                     .gap_0p5()
@@ -6957,6 +6996,30 @@ impl Sidebar {
                 let subagent = subagent.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.open_subagent(&subagent, window, cx);
+                })
+            });
+
+        let Some(live_thread) = live_thread else {
+            return row.into_any_element();
+        };
+        let workspace = subagent.workspace.clone();
+        right_click_menu(("subagent-context-menu", ix))
+            .trigger(move |_, _, _| row)
+            .menu(move |window, cx| {
+                let live_thread = live_thread.clone();
+                let workspace = workspace.clone();
+                ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.entry("Peek Narration", None, move |window, cx| {
+                        let live_thread = live_thread.clone();
+                        workspace.update(cx, |workspace, cx| {
+                            agent_ui::narration_peek::open_narration_peek(
+                                workspace,
+                                live_thread,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
                 })
             })
             .into_any_element()
@@ -8564,6 +8627,36 @@ fn all_thread_infos_for_workspace(
         });
 
     Some(threads).into_iter().flatten()
+}
+
+/// The loaded root thread of `session_id` in `workspace`'s agent panel.
+fn live_root_thread(
+    workspace: &Entity<Workspace>,
+    session_id: &acp::SessionId,
+    cx: &App,
+) -> Option<Entity<acp_thread::AcpThread>> {
+    let agent_panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+    agent_panel
+        .read(cx)
+        .conversation_views()
+        .into_iter()
+        .find_map(|conversation_view| {
+            let conversation_view = conversation_view.read(cx);
+            if conversation_view.root_session_id() != Some(session_id) {
+                return None;
+            }
+            let thread_view = conversation_view.root_thread_view()?;
+            Some(thread_view.read(cx).thread.clone())
+        })
+}
+
+/// The subagent's own thread, once its conversation has loaded it.
+fn subagent_thread(subagent: &SubagentEntry, cx: &App) -> Option<Entity<acp_thread::AcpThread>> {
+    let conversation_view = subagent.conversation_view.upgrade()?;
+    let thread_view = conversation_view
+        .read(cx)
+        .thread_view(&subagent.summary.session_id)?;
+    Some(thread_view.read(cx).thread.clone())
 }
 
 fn subagent_counts(subagents: &[SubagentEntry]) -> SubagentCounts {

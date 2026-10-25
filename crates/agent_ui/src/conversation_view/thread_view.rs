@@ -907,6 +907,9 @@ pub struct ThreadView {
     /// new" about forty entries nobody ever heard. Cancelling in the middle of
     /// looking at a second session is the brief's own headline case.
     read_aloud_catch_up_in_flight: Option<CatchUpInFlight>,
+    /// Shows each run of tool calls as a single line, leaving the agent's
+    /// messages and thoughts readable on their own.
+    narration_only: bool,
 }
 
 /// How a message typed to a subagent is addressed when its parent relays it.
@@ -1709,6 +1712,7 @@ impl ThreadView {
             read_aloud_catch_up_unfinished: HashSet::default(),
             read_aloud_catch_up_since: None,
             read_aloud_catch_up_in_flight: None,
+            narration_only: false,
         };
 
         this.init_read_aloud(cx);
@@ -8078,6 +8082,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_narration_only_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -10123,6 +10128,9 @@ impl ThreadView {
                         .into_any()
                 }
             }
+            AgentThreadEntry::ToolCall(_) if self.is_folded_tool_call(entry) => {
+                return self.render_folded_tool_calls(entry_ix, cx);
+            }
             AgentThreadEntry::ToolCall(tool_call) => {
                 // A canceled tool call that produced visible output is still worth
                 // showing, but one that was canceled before producing anything just
@@ -10935,6 +10943,110 @@ impl ThreadView {
             });
             cx.notify();
         }
+    }
+
+    fn scroll_to_narration(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        let is_narration =
+            |ix: &usize| matches!(entries.get(*ix), Some(AgentThreadEntry::AssistantMessage(_)));
+        let target_ix = if forward {
+            (current_ix + 1..entries.len()).find(is_narration)
+        } else {
+            (0..current_ix).rev().find(is_narration)
+        };
+        if let Some(target_ix) = target_ix {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: target_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    fn toggle_narration_only(&mut self, cx: &mut Context<Self>) {
+        self.narration_only = !self.narration_only;
+        // Every tool call entry changes height.
+        let entry_count = self.thread.read(cx).entries().len();
+        self.list_state.splice(0..entry_count, entry_count);
+        cx.notify();
+    }
+
+    pub(crate) fn peek_narration(
+        &self,
+        thread: Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::narration_peek::open_narration_peek(workspace, thread, window, cx);
+            })
+            .log_err();
+    }
+
+    /// Whether narration-only mode folds `entry` into a run of tool calls. A
+    /// subagent's card and a call waiting on the user stay visible.
+    fn is_folded_tool_call(&self, entry: &AgentThreadEntry) -> bool {
+        self.narration_only
+            && matches!(
+                entry,
+                AgentThreadEntry::ToolCall(tool_call)
+                    if tool_call.subagent_session_info.is_none()
+                        && tool_call.status() != ToolCallStatus::WaitingForConfirmation
+            )
+    }
+
+    fn render_folded_tool_calls(&self, entry_ix: usize, cx: &Context<Self>) -> AnyElement {
+        let entries = self.thread.read(cx).entries();
+        let starts_run = entry_ix
+            .checked_sub(1)
+            .and_then(|previous_ix| entries.get(previous_ix))
+            .is_none_or(|previous| !self.is_folded_tool_call(previous));
+        if !starts_run {
+            return Empty.into_any();
+        }
+        let run_length = entries[entry_ix..]
+            .iter()
+            .take_while(|entry| self.is_folded_tool_call(entry))
+            .count();
+        let label = if run_length == 1 {
+            "1 tool call".to_string()
+        } else {
+            format!("{run_length} tool calls")
+        };
+        h_flex()
+            .id(("folded-tool-calls", entry_ix))
+            .px_5()
+            .py_1()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::ToolHammer)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .tooltip(Tooltip::text("Show Tool Calls"))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_narration_only(cx)))
+            .into_any()
+    }
+
+    fn render_narration_only_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        IconButton::new("narration-only", IconName::ListCollapse)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .toggle_state(self.narration_only)
+            .tooltip(move |_window, cx| {
+                Tooltip::with_meta(
+                    "Narration Only",
+                    Some(&crate::ToggleNarrationOnly),
+                    "Fold tool calls so the agent's messages and thoughts stand out.",
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_narration_only(cx)))
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -13956,6 +14068,14 @@ impl ThreadView {
                     )
                     .child(tool_icon),
             )
+            .when_some(Self::running_tool_call_elapsed(tool_call), |this, elapsed| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(elapsed),
+                )
+            })
             .child(if has_location {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))
@@ -14003,6 +14123,15 @@ impl ThreadView {
                     .into_any()
             })
             .when(!is_edit, |this| this.child(gradient_overlay))
+    }
+
+    /// How long a call has been running, once that is long enough to notice.
+    fn running_tool_call_elapsed(tool_call: &ToolCall) -> Option<String> {
+        if tool_call.status() != ToolCallStatus::InProgress || tool_call.is_subagent() {
+            return None;
+        }
+        let elapsed = tool_call.started_at.elapsed();
+        (elapsed >= Duration::from_secs(3)).then(|| crate::narration_peek::format_elapsed(elapsed))
     }
 
     fn open_tool_call_location(
@@ -14614,6 +14743,12 @@ impl ThreadView {
         let has_no_title_or_canceled = !has_title || is_failed_or_canceled;
 
         let title = state.title(thread_title);
+        let elapsed = is_running
+            .then(|| self.thread.read(cx).tool_call(card_id))
+            .flatten()
+            .map(|(_, tool_call)| {
+                crate::narration_peek::format_elapsed(tool_call.started_at.elapsed())
+            });
 
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
@@ -14716,6 +14851,24 @@ impl ThreadView {
                                                         .color(Color::Muted)
                                                         .truncate(),
                                                 )
+                                            })
+                                            .when_some(elapsed, |this, elapsed| {
+                                                this.child(
+                                                    Label::new(format!("· {elapsed}"))
+                                                        .size(LabelSize::Custom(
+                                                            self.tool_name_font_size(),
+                                                        ))
+                                                        .color(Color::Muted),
+                                                )
+                                            })
+                                            .when(is_pending_tool_call, |this| {
+                                                this.child(
+                                                    Label::new("· Needs approval")
+                                                        .size(LabelSize::Custom(
+                                                            self.tool_name_font_size(),
+                                                        ))
+                                                        .color(Color::Warning),
+                                                )
                                             }),
                                     )
                                     .when(files_changed > 0, |this| {
@@ -14791,6 +14944,37 @@ impl ThreadView {
                                     }))
                             }),
                     )
+                    .when_some(thread.clone(), |buttons, thread| {
+                        let report = (state.status == CardStatus::Completed)
+                            .then(|| Self::subagent_report(&thread, cx))
+                            .flatten();
+                        buttons
+                            .child(
+                                IconButton::new(format!("peek-subagent-{}", entry_ix), IconName::Eye)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Peek Narration"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.peek_narration(thread.clone(), window, cx);
+                                    })),
+                            )
+                            .when_some(report, |buttons, report| {
+                                buttons.child(
+                                    IconButton::new(
+                                        format!("copy-subagent-report-{}", entry_ix),
+                                        IconName::Copy,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Copy Report"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            report.clone(),
+                                        ));
+                                    }),
+                                )
+                            })
+                    })
                     .when(state.can_stop && subagent_session_id.is_some(), |buttons| {
                         buttons.child(
                             IconButton::new(format!("stop-subagent-{}", entry_ix), IconName::Stop)
@@ -14888,6 +15072,14 @@ impl ThreadView {
                 }
             })
             .into_any_element()
+    }
+
+    /// What a subagent said after it was last prompted: its answer, for a
+    /// finished one.
+    fn subagent_report(thread: &Entity<AcpThread>, cx: &App) -> Option<String> {
+        let entries = thread.read(cx).entries();
+        let last_index = entries.len().checked_sub(1)?;
+        Self::get_agent_message_content(entries, last_index, cx)
     }
 
     fn render_subagent_expanded_content(
@@ -16391,6 +16583,18 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(|this, _: &crate::ScrollOutputToPreviousNarration, _, cx| {
+                this.scroll_to_narration(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ScrollOutputToNextNarration, _, cx| {
+                this.scroll_to_narration(true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ToggleNarrationOnly, _, cx| {
+                this.toggle_narration_only(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::PeekNarration, window, cx| {
+                this.peek_narration(this.thread.clone(), window, cx);
+            }))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);

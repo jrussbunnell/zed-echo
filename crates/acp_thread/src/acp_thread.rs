@@ -317,6 +317,14 @@ pub fn sandbox_not_applied_from_meta(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// One of the agent's messages or thoughts. See [`AcpThread::recent_narration`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Narration {
+    pub entry_index: usize,
+    pub is_thought: bool,
+    pub text: SharedString,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentSessionInfo {
     /// The session id of the subagent sessiont that was spawned
@@ -1309,6 +1317,9 @@ pub struct ToolCall {
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
+    /// When this client first saw the call. A call restored from history was
+    /// seen at load time, so this only means anything while it is running.
+    pub started_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1611,6 +1622,7 @@ impl ToolCall {
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
+            started_at: Instant::now(),
         };
         result.update_raw_output_content(&language_registry, cx);
         Ok(result)
@@ -4205,6 +4217,59 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    /// The agent's last `limit` messages and thoughts, oldest first, with the
+    /// tool calls between them left out.
+    pub fn recent_narration(&self, limit: usize, cx: &App) -> Vec<Narration> {
+        let mut narration = Vec::new();
+        for (entry_index, entry) in self.entries.iter().enumerate().rev() {
+            let AgentThreadEntry::AssistantMessage(message) = entry else {
+                continue;
+            };
+            for chunk in message.chunks.iter().rev() {
+                let (is_thought, block) = match chunk {
+                    AssistantMessageChunk::Message { block, .. } => (false, block),
+                    AssistantMessageChunk::Thought { block, .. } => (true, block),
+                };
+                let text = block.to_markdown(cx);
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                narration.push(Narration {
+                    entry_index,
+                    is_thought,
+                    text: text.to_string().into(),
+                });
+                if narration.len() == limit {
+                    narration.reverse();
+                    return narration;
+                }
+            }
+        }
+        narration.reverse();
+        narration
+    }
+
+    /// The tool call the agent is in the middle of, if it is working.
+    pub fn current_tool_call(&self) -> Option<&ToolCall> {
+        if self.status() != ThreadStatus::Generating {
+            return None;
+        }
+        self.entries.iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call)
+                if matches!(
+                    tool_call.status(),
+                    ToolCallStatus::Pending
+                        | ToolCallStatus::InProgress
+                        | ToolCallStatus::WaitingForConfirmation
+                ) =>
+            {
+                Some(tool_call)
+            }
+            _ => None,
+        })
     }
 
     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
@@ -14954,6 +15019,66 @@ mod tests {
             assert_eq!(
                 agent_message.identity,
                 MessageIdentity::Legacy(Some("agent_user_chunk".into()))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_recent_narration_skips_tool_calls(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for update in [
+                acp_v1::SessionUpdate::AgentThoughtChunk(
+                    acp_v1::ContentChunk::new("First thought".into()).message_id("thought_1"),
+                ),
+                acp_v1::SessionUpdate::ToolCall(acp_v1::ToolCall::new(
+                    acp_v1::ToolCallId::new("read"),
+                    "Read main.rs",
+                )),
+                acp_v1::SessionUpdate::AgentMessageChunk(
+                    acp_v1::ContentChunk::new("Found it".into()).message_id("message_1"),
+                ),
+                acp_v1::SessionUpdate::ToolCall(acp_v1::ToolCall::new(
+                    acp_v1::ToolCallId::new("edit"),
+                    "Edit main.rs",
+                )),
+                acp_v1::SessionUpdate::AgentThoughtChunk(
+                    acp_v1::ContentChunk::new("Now fix it".into()).message_id("thought_2"),
+                ),
+            ] {
+                thread.handle_session_update(update, cx).unwrap();
+            }
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let texts = |narration: Vec<Narration>| {
+                narration
+                    .into_iter()
+                    .map(|item| (item.is_thought, item.text.to_string()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                texts(thread.recent_narration(10, cx)),
+                vec![
+                    (true, "First thought".to_string()),
+                    (false, "Found it".to_string()),
+                    (true, "Now fix it".to_string()),
+                ]
+            );
+            assert_eq!(
+                texts(thread.recent_narration(2, cx)),
+                vec![(false, "Found it".to_string()), (true, "Now fix it".to_string())]
             );
         });
     }

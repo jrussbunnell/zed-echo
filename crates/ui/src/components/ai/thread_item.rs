@@ -47,6 +47,7 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
+    activity: Option<SharedString>,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -85,6 +86,7 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
+            activity: None,
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -109,6 +111,12 @@ impl ThreadItem {
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
         self.timestamp = timestamp.into();
+        self
+    }
+
+    /// What the agent is doing right now, shown on a line of its own.
+    pub fn activity(mut self, activity: Option<SharedString>) -> Self {
+        self.activity = activity;
         self
     }
 
@@ -503,6 +511,21 @@ impl RenderOnce for ThreadItem {
                         })
                     }),
             )
+            .when_some(self.activity, |this, activity| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(icon_container()) // Icon Spacing
+                        .child(
+                            Label::new(activity)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .italic()
+                                .truncate(),
+                        ),
+                )
+            })
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
