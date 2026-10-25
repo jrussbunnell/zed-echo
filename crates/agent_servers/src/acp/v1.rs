@@ -9456,6 +9456,107 @@ exit 7
         });
     }
 
+    /// Claude Code hides the Agent call that launches a child session and
+    /// sends the parent the prompt as a message instead. The card still has to
+    /// appear, and the child's report back must not land in the parent.
+    #[gpui::test]
+    async fn test_native_subagent_card_without_launch_tool_call(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _load_count, _close_count, _updates, _gate, _keep_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let session_id = acp_v2::SessionId::new("session-1");
+        let child_session_id = acp_v2::SessionId::new("agent-1");
+        let parent = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load parent session");
+
+        let send = |session_id: &str, update: acp::SessionUpdate| {
+            agent
+                .send_notification(acp::SessionNotification::new(
+                    acp::SessionId::new(session_id),
+                    update,
+                ))
+                .expect("send session notification");
+        };
+        let delegation = |message_id: &str, sender: &str, recipient: &str, text: &str| {
+            acp::SessionUpdate::SessionMessage(
+                acp::SessionMessage::new(message_id.to_string())
+                    .sender_session_id(acp::SessionId::new(sender))
+                    .recipient_session_id(acp::SessionId::new(recipient))
+                    .content(vec![text.into()]),
+            )
+        };
+
+        send(
+            "session-1",
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("agent-1")
+                    .description("Research alternatives")
+                    .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+            ),
+        );
+        send(
+            "session-1",
+            delegation("toolu_1", "session-1", "agent-1", "Find the options"),
+        );
+        send(
+            "agent-1",
+            delegation("toolu_1", "session-1", "agent-1", "Find the options"),
+        );
+        send(
+            "session-1",
+            delegation("toolu_1:reply", "agent-1", "session-1", "Here are the options"),
+        );
+        // In hand-back mode the report comes as both views of one message.
+        send(
+            "agent-1",
+            delegation("toolu_h", "agent-1", "session-1", "Handed back report"),
+        );
+        send(
+            "session-1",
+            delegation("toolu_h", "agent-1", "session-1", "Handed back report"),
+        );
+        cx.run_until_parked();
+
+        let child = parent
+            .read_with(cx, |parent, _| parent.subagent(&child_session_id).cloned())
+            .expect("the parent should own the child session's thread");
+        child.read_with(cx, |child, cx| {
+            let markdown = child.to_markdown(cx);
+            assert!(
+                markdown.contains("Handed back report"),
+                "the child's report should show in its own thread, got:\n{markdown}"
+            );
+        });
+
+        parent.read_with(cx, |parent, _cx| {
+            assert_eq!(
+                parent.entries().len(),
+                1,
+                "the parent should hold only the card, got {:?}",
+                parent.entries()
+            );
+            let subagents: Vec<_> = parent
+                .subagent_tool_calls()
+                .map(|(_, tool_call, info)| (tool_call.id.clone(), info.session_id.clone()))
+                .collect();
+            assert_eq!(
+                subagents,
+                vec![(acp_v2::ToolCallId::new("toolu_1"), child_session_id.clone())]
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_subagent_stamp_waits_for_its_tool_call(cx: &mut gpui::TestAppContext) {
         let (connection, project, _load_count, _close_count, updates, _gate, _keep_alive) =
@@ -11056,6 +11157,77 @@ fn announce_native_children(
     }
 }
 
+/// Handles a parent's side of a delegation to one of its ACP subagent
+/// sessions. Returns whether `update` was such a message.
+///
+/// Claude Code never shows the parent the Agent call that launches a child
+/// session: it sends the parent the prompt as a message to the child instead,
+/// so the call the card belongs on has to be made here. The child's messages
+/// back to the parent repeat what its own transcript already shows, so they
+/// are not added to the parent's.
+fn handle_native_delegation_message(
+    session_id: &acp_v2::SessionId,
+    thread: &WeakEntity<AcpThread>,
+    update: &acp::SessionUpdate,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) -> bool {
+    let acp::SessionUpdate::SessionMessage(message) = update else {
+        return false;
+    };
+    let child_of_session = |other: Option<&acp::SessionId>| {
+        let other = acp_v2::SessionId::new(other?.0.clone());
+        ctx.derived_subagents
+            .borrow()
+            .native_children
+            .get(&other)
+            .is_some_and(|child| &child.parent_session_id == session_id)
+            .then_some(other)
+    };
+
+    if let Some(child_session_id) = child_of_session(message.recipient_session_id.as_ref()) {
+        let tool_call_id = acp_v2::ToolCallId::new(message.message_id.0.clone());
+        let is_launch = {
+            let mut derived = ctx.derived_subagents.borrow_mut();
+            let Some(child) = derived.native_children.get_mut(&child_session_id) else {
+                return true;
+            };
+            let spawning_tool_call_id = child
+                .spawning_tool_call_id
+                .get_or_insert_with(|| tool_call_id.clone());
+            !child.announced && *spawning_tool_call_id == tool_call_id
+        };
+        if is_launch {
+            thread
+                .update(cx, |parent, cx| {
+                    if parent.tool_call(&tool_call_id).is_some() {
+                        return Ok(());
+                    }
+                    let title = parent
+                        .subagent(&child_session_id)
+                        .and_then(|child| child.read(cx).title())
+                        .map(|title| title.to_string())
+                        .unwrap_or_default();
+                    // The child's reported state drives the card from here, so
+                    // the call itself only has to not read as still running.
+                    parent.apply_session_update(
+                        acp::SessionUpdate::ToolCall(
+                            acp::ToolCall::new(acp::ToolCallId::new(tool_call_id.0.clone()), title)
+                                .kind(acp::ToolKind::Think)
+                                .status(acp::ToolCallStatus::Completed),
+                        ),
+                        cx,
+                    )
+                })
+                .flatten_acp()
+                .log_err();
+        }
+        return true;
+    }
+
+    child_of_session(message.sender_session_id.as_ref()).is_some()
+}
+
 fn apply_v1_subagent_update(
     parent: &Entity<AcpThread>,
     update: acp::SubagentUpdate,
@@ -11160,6 +11332,11 @@ fn handle_session_notification(
                 log::error!("Failed to apply subagent update for {session_id:?}: {error:?}");
             }
         }
+        return;
+    }
+
+    if handle_native_delegation_message(&session_id, &thread, &notification.update, cx, ctx) {
+        announce_native_children(&session_id, &thread, cx, ctx);
         return;
     }
 

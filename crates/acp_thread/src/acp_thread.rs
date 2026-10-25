@@ -5108,10 +5108,29 @@ impl AcpThread {
                 );
             }
             // A native subagent's prompt, and each message its parent sends it
-            // later, arrive as messages to its session. Only incoming ones are
-            // shown: the parent already shows what it sent as its own tool call.
+            // later, arrive as messages to its session. The parent shows what it
+            // sent as the subagent's card. A subagent's report to its parent is
+            // shown as its own message: the parent's transcript leaves it out,
+            // and in hand-back mode it is nowhere else.
             acp_v1::SessionUpdate::SessionMessage(message) => {
-                if self.is_incoming_session_message(message.recipient_session_id.as_ref())
+                let is_report_to_parent = self.parent_session_id.as_ref().is_some_and(|parent| {
+                    message
+                        .recipient_session_id
+                        .as_ref()
+                        .is_some_and(|recipient| recipient.0 == parent.0)
+                });
+                if is_report_to_parent && let MaybeUndefined::Value(content) = message.content {
+                    for block in content {
+                        let block = content::from_v1(block).map_err(acp_v1::Error::from)?;
+                        self.push_assistant_content_block_with_message_id(
+                            Some(message.message_id.clone()),
+                            block,
+                            false,
+                            false,
+                            cx,
+                        );
+                    }
+                } else if self.is_incoming_session_message(message.recipient_session_id.as_ref())
                     && let MaybeUndefined::Value(content) = message.content
                 {
                     for block in content {
