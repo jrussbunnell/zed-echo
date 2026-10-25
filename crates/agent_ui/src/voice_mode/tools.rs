@@ -12,6 +12,7 @@ pub struct SessionSummary {
     pub status: SharedString,
     pub activity: Option<SharedString>,
     pub pending_approval: Option<SharedString>,
+    pub is_subagent: bool,
     pub candidate: VoiceCandidate,
 }
 
@@ -20,6 +21,14 @@ pub enum SessionMatch {
     One(acp::SessionId),
     Ambiguous(Vec<SharedString>),
     NoMatch,
+}
+
+fn words_of(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn match_session(reference: &str, sessions: &[SessionSummary]) -> SessionMatch {
@@ -42,19 +51,28 @@ pub fn match_session(reference: &str, sessions: &[SessionSummary]) -> SessionMat
         return SessionMatch::One(exact.session_id.clone());
     }
 
-    // Short words ("the", "one") are filler in speech, not identifying.
-    let words: Vec<&str> = reference
-        .split_whitespace()
-        .filter(|word| word.chars().count() > 2)
-        .collect();
-    if words.is_empty() {
+    // Spoken references carry filler ("the booking one") that is not in titles.
+    const FILLER: [&str; 6] = ["the", "one", "that", "this", "session", "thread"];
+    let mut wants_subagent = false;
+    let mut words: Vec<String> = Vec::new();
+    for word in words_of(&reference) {
+        if matches!(word.as_str(), "subagent" | "subagents") {
+            wants_subagent = true;
+        } else if !FILLER.contains(&word.as_str()) {
+            words.push(word);
+        }
+    }
+    if words.is_empty() && !wants_subagent {
         return SessionMatch::NoMatch;
     }
     let matches: Vec<&SessionSummary> = sessions
         .iter()
         .filter(|session| {
-            let title = session.title.to_lowercase();
-            words.iter().all(|word| title.contains(word))
+            if wants_subagent && !session.is_subagent {
+                return false;
+            }
+            let title_words = words_of(&session.title);
+            words.iter().all(|word| title_words.contains(word))
         })
         .collect();
     match matches.as_slice() {
@@ -191,11 +209,13 @@ pub enum GateOutcome {
     AlreadyAnswered,
 }
 
-/// A spoken "yes" is easy to mishear, so an approval that grants access is
-/// read back and only applied after the user speaks again.
+/// A spoken "yes" is easy to mishear, and the voice model reads untrusted
+/// session text, so every allow is read back and applied only after the user
+/// speaks again. The read-back is bound to the exact session, prompt and
+/// decision that was read, so it cannot confirm a different one.
 #[derive(Default)]
 pub struct ApprovalGate {
-    read_back: Option<acp::ToolCallId>,
+    read_back: Option<(acp::SessionId, acp::ToolCallId, Decision)>,
     user_turn_since_read_back: bool,
 }
 
@@ -206,32 +226,28 @@ impl ApprovalGate {
 
     pub fn request(
         &mut self,
+        session_id: &acp::SessionId,
         tool_call_id: &acp::ToolCallId,
         still_pending: bool,
         decision: Decision,
-        confirm_approvals: bool,
     ) -> GateOutcome {
+        let key = (session_id.clone(), tool_call_id.clone(), decision);
         if !still_pending {
-            if self.read_back.as_ref() == Some(tool_call_id) {
+            if self.read_back.as_ref() == Some(&key) {
                 self.read_back = None;
             }
             return GateOutcome::AlreadyAnswered;
         }
         // Rejecting is the safe direction, so it never needs confirming.
-        let needs_confirmation = match decision {
-            Decision::Reject => false,
-            Decision::AllowAlways => true,
-            Decision::AllowOnce => confirm_approvals,
-        };
-        if !needs_confirmation {
+        if decision == Decision::Reject {
             return GateOutcome::Apply;
         }
-        if self.read_back.as_ref() == Some(tool_call_id) && self.user_turn_since_read_back {
+        if self.read_back.as_ref() == Some(&key) && self.user_turn_since_read_back {
             self.read_back = None;
             return GateOutcome::Apply;
         }
-        if self.read_back.as_ref() != Some(tool_call_id) {
-            self.read_back = Some(tool_call_id.clone());
+        if self.read_back.as_ref() != Some(&key) {
+            self.read_back = Some(key);
             self.user_turn_since_read_back = false;
         }
         GateOutcome::ReadBackFirst
@@ -250,6 +266,7 @@ mod tests {
             status: "idle".into(),
             activity: None,
             pending_approval: None,
+            is_subagent: false,
             candidate: VoiceCandidate {
                 session_id: acp::SessionId::new(id),
                 blocked_on_approval: false,
@@ -335,52 +352,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_booking_one_matches_the_booking_session() {
+        let sessions = [summary("a", "Fix booking N+1"), summary("b", "Add search")];
+        assert_eq!(
+            match_session("the booking one", &sessions),
+            SessionMatch::One(acp::SessionId::new("a"))
+        );
+    }
+
+    #[test]
+    fn the_subagent_matches_the_only_subagent() {
+        let mut child = summary("b", "Research alternatives");
+        child.is_subagent = true;
+        let sessions = [summary("a", "Fix booking"), child];
+        assert_eq!(
+            match_session("the subagent", &sessions),
+            SessionMatch::One(acp::SessionId::new("b"))
+        );
+    }
+
+    #[test]
+    fn two_subagents_are_ambiguous_for_the_subagent() {
+        let mut first = summary("a", "Research alternatives");
+        first.is_subagent = true;
+        let mut second = summary("b", "Check docs");
+        second.is_subagent = true;
+        assert_eq!(
+            match_session("the subagent", &[first, second]),
+            SessionMatch::Ambiguous(vec!["Research alternatives".into(), "Check docs".into()])
+        );
+    }
+
+    #[test]
+    fn matching_is_by_whole_word() {
+        let sessions = [summary("a", "Prefix cache")];
+        assert_eq!(match_session("fix", &sessions), SessionMatch::NoMatch);
+    }
+
     fn call(id: &str) -> acp::ToolCallId {
         acp::ToolCallId::new(id)
+    }
+
+    fn session(id: &str) -> acp::SessionId {
+        acp::SessionId::new(id)
     }
 
     #[test]
     fn reject_applies_without_a_read_back() {
         let mut gate = ApprovalGate::default();
         assert_eq!(
-            gate.request(&call("a"), true, Decision::Reject, true),
+            gate.request(&session("s"), &call("a"), true, Decision::Reject),
             GateOutcome::Apply
         );
     }
 
     #[test]
-    fn allow_once_needs_a_user_turn_after_the_read_back_when_confirming() {
+    fn allow_once_needs_a_user_turn_after_the_read_back() {
         let mut gate = ApprovalGate::default();
-        let id = call("a");
+        let (s, id) = (session("s"), call("a"));
         assert_eq!(
-            gate.request(&id, true, Decision::AllowOnce, true),
+            gate.request(&s, &id, true, Decision::AllowOnce),
             GateOutcome::ReadBackFirst
         );
         assert_eq!(
-            gate.request(&id, true, Decision::AllowOnce, true),
+            gate.request(&s, &id, true, Decision::AllowOnce),
             GateOutcome::ReadBackFirst
         );
         gate.on_user_turn();
         assert_eq!(
-            gate.request(&id, true, Decision::AllowOnce, true),
+            gate.request(&s, &id, true, Decision::AllowOnce),
             GateOutcome::Apply
         );
     }
 
     #[test]
-    fn allow_once_applies_at_once_when_confirm_is_off() {
+    fn allow_once_needs_a_read_back_even_when_confirm_is_off() {
         let mut gate = ApprovalGate::default();
         assert_eq!(
-            gate.request(&call("a"), true, Decision::AllowOnce, false),
-            GateOutcome::Apply
+            gate.request(&session("s"), &call("a"), true, Decision::AllowOnce),
+            GateOutcome::ReadBackFirst
         );
     }
 
     #[test]
-    fn allow_always_needs_a_read_back_even_when_confirm_is_off() {
+    fn allow_always_needs_a_read_back() {
         let mut gate = ApprovalGate::default();
         assert_eq!(
-            gate.request(&call("a"), true, Decision::AllowAlways, false),
+            gate.request(&session("s"), &call("a"), true, Decision::AllowAlways),
+            GateOutcome::ReadBackFirst
+        );
+    }
+
+    #[test]
+    fn an_allow_once_read_back_does_not_confirm_allow_always() {
+        let mut gate = ApprovalGate::default();
+        let (s, id) = (session("s"), call("a"));
+        gate.request(&s, &id, true, Decision::AllowOnce);
+        gate.on_user_turn();
+        assert_eq!(
+            gate.request(&s, &id, true, Decision::AllowAlways),
+            GateOutcome::ReadBackFirst
+        );
+        assert_eq!(
+            gate.request(&s, &id, true, Decision::AllowAlways),
+            GateOutcome::ReadBackFirst
+        );
+    }
+
+    #[test]
+    fn a_read_back_for_one_session_does_not_confirm_the_same_id_in_another() {
+        let mut gate = ApprovalGate::default();
+        let id = call("a");
+        gate.request(&session("one"), &id, true, Decision::AllowOnce);
+        gate.on_user_turn();
+        assert_eq!(
+            gate.request(&session("two"), &id, true, Decision::AllowOnce),
             GateOutcome::ReadBackFirst
         );
     }
@@ -388,18 +475,19 @@ mod tests {
     #[test]
     fn a_confirmation_for_an_answered_prompt_does_not_carry_over() {
         let mut gate = ApprovalGate::default();
+        let s = session("s");
         let (a, b) = (call("a"), call("b"));
         assert_eq!(
-            gate.request(&a, true, Decision::AllowOnce, true),
+            gate.request(&s, &a, true, Decision::AllowOnce),
             GateOutcome::ReadBackFirst
         );
         gate.on_user_turn();
         assert_eq!(
-            gate.request(&a, false, Decision::AllowOnce, true),
+            gate.request(&s, &a, false, Decision::AllowOnce),
             GateOutcome::AlreadyAnswered
         );
         assert_eq!(
-            gate.request(&b, true, Decision::AllowOnce, true),
+            gate.request(&s, &b, true, Decision::AllowOnce),
             GateOutcome::ReadBackFirst
         );
     }
