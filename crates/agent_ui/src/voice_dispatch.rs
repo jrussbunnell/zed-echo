@@ -140,6 +140,17 @@ use util::ResultExt as _;
 /// exchange.
 const CONFIRMATION_WINDOW: Duration = Duration::from_secs(8);
 
+/// Lets tests start the wake listener without a microphone or an API key.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+pub struct TestListening {
+    pub wake: Arc<dyn listen::WakeSource>,
+    pub stt: Arc<dyn listen::SttProvider>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl gpui::Global for TestListening {}
+
 /// The wake listener, plus what it is waiting to hear back.
 pub struct VoiceSession {
     listener: Entity<Listener>,
@@ -166,6 +177,18 @@ impl AgentPanel {
     pub(crate) fn start_listening(&mut self, window: &Window, cx: &mut Context<Self>) {
         let settings = ListenSettings::get_global(cx).clone();
         if !settings.enabled {
+            return;
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(test_listening) = cx.try_global::<TestListening>().cloned() {
+            self.install_listener(
+                test_listening.stt,
+                test_listening.wake,
+                &settings,
+                window.window_handle(),
+                cx,
+            );
             return;
         }
 
@@ -210,30 +233,62 @@ impl AgentPanel {
                 };
                 let stt: Arc<dyn listen::SttProvider> =
                     Arc::new(listen::InworldStt::new(http_client, api_key));
-
-                let wake_word = settings.wake_word.clone();
-                let conversation = settings.conversation;
-                let conversation_window = settings.conversation_window;
-                let listener = cx.new(|cx| {
-                    let mut listener = Listener::new(stt, wake, cx);
-                    listener.set_wake_word(wake_word);
-                    listener.set_conversation(conversation, conversation_window);
-                    listener
-                });
-                let subscription = cx.subscribe(&listener, Self::handle_listen_event);
-
-                panel.voice = Some(VoiceSession {
-                    listener,
-                    awaiting_confirmation: None,
-                    window,
-                    exchanges: Vec::new(),
-                    sidecar: None,
-                    _subscription: subscription,
-                });
+                panel.install_listener(stt, wake, &settings, window, cx);
             })
             .log_err();
         })
         .detach();
+    }
+
+    fn install_listener(
+        &mut self,
+        stt: Arc<dyn listen::SttProvider>,
+        wake: Arc<dyn listen::WakeSource>,
+        settings: &ListenSettings,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        // Voice mode holds the microphone; it restarts listening on close.
+        #[cfg(target_os = "macos")]
+        if crate::voice_mode::VoiceMode::is_open(cx) {
+            return;
+        }
+        let wake_word = settings.wake_word.clone();
+        let conversation = settings.conversation;
+        let conversation_window = settings.conversation_window;
+        let listener = cx.new(|cx| {
+            let mut listener = Listener::new(stt, wake, cx);
+            listener.set_wake_word(wake_word);
+            listener.set_conversation(conversation, conversation_window);
+            listener
+        });
+        let subscription = cx.subscribe(&listener, Self::handle_listen_event);
+
+        self.voice = Some(VoiceSession {
+            listener,
+            awaiting_confirmation: None,
+            window,
+            exchanges: Vec::new(),
+            sidecar: None,
+            _subscription: subscription,
+        });
+    }
+
+    /// Releases the microphone for voice mode. The wake listener holds it
+    /// for as long as it lives, so it is dropped rather than paused.
+    pub(crate) fn stop_listening(&mut self) {
+        self.voice = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_listening(&self) -> bool {
+        self.voice.is_some()
+    }
+
+    /// Quiets every reader in this panel for voice mode, without latching a
+    /// stop, so narration of new messages resumes once it closes.
+    pub(crate) fn silence_all_narration(&self, cx: &mut Context<Self>) {
+        self.for_each_reader(cx, |read_aloud, cx| read_aloud.silence(cx));
     }
 
     fn handle_listen_event(
@@ -482,8 +537,15 @@ impl AgentPanel {
     /// Without this a voice command that failed would be silent, which to
     /// someone not looking at the screen is indistinguishable from one that
     /// was never heard.
-    fn say_to_the_user(&self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(crate) fn say_to_the_user(&self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
         let line = line.into();
+        // Two Echo voices must never talk over each other, so while voice
+        // mode is open the line goes to it and is said in its voice.
+        #[cfg(target_os = "macos")]
+        if crate::voice_mode::VoiceMode::is_open(cx) {
+            crate::voice_mode::VoiceMode::note(line, cx);
+            return;
+        }
         let reader = self
             .conversation_views()
             .iter()

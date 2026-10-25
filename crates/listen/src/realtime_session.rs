@@ -380,4 +380,70 @@ mod tests {
             "session.update was rejected: {reply:?}"
         );
     }
+    /// Barge-in sends `response.cancel` and `conversation.item.truncate`
+    /// mid-reply; neither shape is in the recorded fixtures.
+    #[gpui::test]
+    #[ignore = "needs INWORLD_API_KEY and the network"]
+    async fn inworld_accepts_cancel_and_truncate_mid_reply(cx: &mut TestAppContext) {
+        let api_key = std::env::var("INWORLD_API_KEY").expect("INWORLD_API_KEY is not set");
+        cx.executor().allow_parking();
+        cx.update(gpui_tokio::init);
+        let realtime = InworldRealtime::new(api_key);
+        let mut connection = cx
+            .update(|cx| realtime.connect(config(), cx))
+            .await
+            .unwrap();
+        let next = async |connection: &mut RealtimeConnection, seconds: u64| {
+            futures::select! {
+                event = connection.events.next() => event,
+                _ = futures::FutureExt::fuse(cx.background_executor.timer(std::time::Duration::from_secs(seconds))) => None,
+            }
+        };
+        assert_eq!(
+            next(&mut connection, 5).await,
+            Some(ServerEvent::SessionCreated)
+        );
+        let send = |event| connection.sender.unbounded_send(event).unwrap();
+        send(ClientEvent::UserText(
+            "Count slowly from one to twenty.".into(),
+        ));
+        send(ClientEvent::ResponseCreate);
+
+        let (item_id, content_index, samples) = loop {
+            match next(&mut connection, 10).await {
+                Some(ServerEvent::AudioDelta {
+                    item_id,
+                    content_index,
+                    samples,
+                }) => break (item_id, content_index, samples.len()),
+                Some(ServerEvent::Error(message)) => panic!("error before audio: {message}"),
+                Some(_) => continue,
+                None => panic!("no audio arrived"),
+            }
+        };
+        let audio_end_ms = u32::try_from(samples * 1_000 / 24_000).unwrap();
+        connection
+            .sender
+            .unbounded_send(ClientEvent::ResponseCancel)
+            .unwrap();
+        connection
+            .sender
+            .unbounded_send(ClientEvent::Truncate {
+                item_id,
+                content_index,
+                audio_end_ms,
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        while let Some(event) = next(&mut connection, 3).await {
+            if let ServerEvent::Error(message) = &event {
+                panic!("cancel or truncate was rejected: {message} (after {seen:?})");
+            }
+            if !matches!(event, ServerEvent::AudioDelta { .. }) {
+                seen.push(event);
+            }
+        }
+        eprintln!("events after cancel and truncate: {seen:?}");
+    }
 }

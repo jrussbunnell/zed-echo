@@ -43,6 +43,7 @@ pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
 pub mod voice_dispatch;
+#[cfg(target_os = "macos")]
 mod voice_mode;
 
 use std::rc::Rc;
@@ -423,6 +424,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Opens or closes a spoken, real-time conversation with Echo.
+        ToggleVoiceMode,
     ]
 );
 
@@ -766,6 +769,15 @@ pub fn init(
     })
     .detach();
     cx.observe_new(ManageProfilesModal::register).detach();
+    #[cfg(target_os = "macos")]
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(|_, _: &ToggleVoiceMode, window, cx| {
+            // Deferred because opening and closing update this workspace,
+            // which is mid-update while its own action runs.
+            window.defer(cx, voice_mode::VoiceMode::toggle);
+        });
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             |workspace: &mut Workspace,

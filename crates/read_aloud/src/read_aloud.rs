@@ -972,6 +972,18 @@ impl ReadAloud {
         self.stopped_by_user = true;
     }
 
+    /// Quiets this reader while voice mode speaks: everything a stop drops is
+    /// dropped, but no stop is latched, so narration of new messages resumes
+    /// from live once voice mode closes. A reader paused by hand is left
+    /// paused rather than turned into a stopped one.
+    pub fn silence(&mut self, cx: &mut Context<Self>) {
+        if self.playback_state(cx).is_some_and(|state| state.paused) {
+            return;
+        }
+        self.park(cx);
+        cx.notify();
+    }
+
     /// Parks playback and drops everything queued, without saying whose
     /// decision it was — [`Self::stop`] and [`Self::deactivate`] each add
     /// their own latch on top.
@@ -3063,6 +3075,42 @@ mod tests {
             provider.spoken(),
             vec!["It put the poll loop on a timer.".to_string()],
             "only the message narrated after suppression cleared is heard"
+        );
+    }
+
+    #[gpui::test]
+    async fn narration_resumes_for_new_messages_after_voice_mode_closes(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let read_aloud = narration_reader(&provider, &sink, cx);
+        let model = FakeSummaryModel::new("It put the poll loop on a timer.");
+        read_aloud.update(cx, |read_aloud, _| {
+            read_aloud.set_summary_model(Some(Rc::new(model.clone())));
+        });
+
+        let before = markdown_entity(&long_message_source(), cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![before.clone()], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.spoken().len(), 1);
+
+        // Voice mode opens, then closes.
+        cx.update(|cx| set_suppressed(true, cx));
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.silence(cx));
+        cx.run_until_parked();
+        cx.update(|cx| set_suppressed(false, cx));
+
+        let after = markdown_entity(&long_message_source(), cx);
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.narrate_message(vec![after.clone()], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.spoken().len(),
+            2,
+            "a message after voice mode closed must be narrated, got {:?}",
+            provider.spoken()
         );
     }
 

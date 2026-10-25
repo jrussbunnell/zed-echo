@@ -15,11 +15,10 @@ const REALTIME_FRAME_SAMPLES: usize = 1_920;
 /// One realtime frame's worth of the echo canceller's 48 kHz stereo.
 const INPUT_SAMPLES_PER_FRAME: usize = REALTIME_FRAME_SAMPLES * 2 * 2;
 
-const PLAYBACK_SAMPLE_RATE: rodio::SampleRate =
-    match rodio::SampleRate::new(REALTIME_SAMPLE_RATE) {
-        Some(rate) => rate,
-        None => panic!("the realtime sample rate is not zero"),
-    };
+const PLAYBACK_SAMPLE_RATE: rodio::SampleRate = match rodio::SampleRate::new(REALTIME_SAMPLE_RATE) {
+    Some(rate) => rate,
+    None => panic!("the realtime sample rate is not zero"),
+};
 
 /// 20 ms of played audio per output level update.
 const OUTPUT_METER_SAMPLES: usize = 480;
@@ -83,10 +82,7 @@ fn cancel_then_convert(
 ) -> impl Iterator<Item = Vec<i16>> {
     let mut cancelled = cancelled_by(source, cancel);
     std::iter::from_fn(move || {
-        let input: Vec<f32> = cancelled
-            .by_ref()
-            .take(INPUT_SAMPLES_PER_FRAME)
-            .collect();
+        let input: Vec<f32> = cancelled.by_ref().take(INPUT_SAMPLES_PER_FRAME).collect();
         (input.len() == INPUT_SAMPLES_PER_FRAME).then(|| to_realtime_frame(&input))
     })
 }
@@ -99,6 +95,16 @@ pub struct Microphone {
 impl Drop for Microphone {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Microphone {
+    /// A microphone that captures nothing, for tests that feed frames by hand.
+    pub fn for_test() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -232,6 +238,30 @@ impl VoicePlayback {
     pub fn is_playing(&self) -> bool {
         !self.player.empty()
     }
+
+    /// How much of the current item the audio thread has pulled, for
+    /// noticing an output stream that has stopped sounding.
+    pub fn played_samples(&self) -> u64 {
+        self.current
+            .as_ref()
+            .map_or(0, |current| current.played_samples.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl VoicePlayback {
+    /// Playback on a mixer nothing pulls from, so nothing is ever heard.
+    pub fn for_test(levels: Arc<VoiceLevels>) -> Self {
+        let (mixer, _source) = rodio::mixer::mixer(audio::CHANNEL_COUNT, audio::SAMPLE_RATE);
+        Self::new(mixer, levels)
+    }
+
+    /// Pretends the audio thread has played `samples` of the current item.
+    pub fn set_played_samples_for_test(&self, samples: u64) {
+        if let Some(current) = &self.current {
+            current.played_samples.store(samples, Ordering::Relaxed);
+        }
+    }
 }
 
 /// 24 kHz mono PCM that counts and meters samples as the audio thread pulls
@@ -274,6 +304,16 @@ impl Iterator for MeteredSource {
             self.meter_window.clear();
         }
         Some(sample.to_sample())
+    }
+}
+
+// A source dropped mid-stream (the player was replaced on barge-in) never
+// reaches its end, so without this the glow would keep showing its last level.
+impl Drop for MeteredSource {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.levels.set_output(0.0);
+        }
     }
 }
 
@@ -331,7 +371,11 @@ mod tests {
             first.len(),
             audio::SAMPLE_RATE.get() as usize / 100 * audio::CHANNEL_COUNT.get() as usize
         );
-        assert!(first[0] > 0 && first[1] < 0, "canceller saw {:?}", &first[..2]);
+        assert!(
+            first[0] > 0 && first[1] < 0,
+            "canceller saw {:?}",
+            &first[..2]
+        );
     }
 
     #[test]
@@ -384,10 +428,27 @@ mod tests {
     fn played_samples_are_counted_and_metered_as_the_audio_thread_pulls_them() {
         let levels = Arc::new(VoiceLevels::default());
         let played_samples = Arc::new(AtomicU64::new(0));
-        let source = MeteredSource::new(vec![i16::MAX; 960], played_samples.clone(), levels.clone());
+        let source =
+            MeteredSource::new(vec![i16::MAX; 960], played_samples.clone(), levels.clone());
         assert_eq!(played_samples.load(Ordering::Relaxed), 0);
         assert_eq!(source.count(), 960);
         assert_eq!(played_samples.load(Ordering::Relaxed), 960);
         assert_eq!(levels.output(), 0.0, "exhausted playback reads as silence");
+    }
+
+    #[test]
+    fn a_source_dropped_mid_stream_reads_as_silence() {
+        let levels = Arc::new(VoiceLevels::default());
+        let mut source = MeteredSource::new(
+            vec![i16::MAX; 960],
+            Arc::new(AtomicU64::new(0)),
+            levels.clone(),
+        );
+        for _ in 0..OUTPUT_METER_SAMPLES {
+            source.next();
+        }
+        assert!(levels.output() > 0.0);
+        drop(source);
+        assert_eq!(levels.output(), 0.0);
     }
 }
