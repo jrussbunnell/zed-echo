@@ -1,9 +1,9 @@
 {
-  "event_id": "f3fb22e2-df55-4cdd-a370-9b9e499388a9",
+  "event_id": "5a500d1c-a063-459f-9a1f-1140c7c4d6d7",
   "type": "session.updated",
   "session": {
     "type": "realtime",
-    "id": "beaming-colt-9670:8e9a6ee9-d8e6-482d-b7e6-e1f38dbe42cd",
+    "id": "beaming-colt-9670:94302e7b-778a-45c5-a8b3-855b21bbffba",
     "object": "realtime.session",
     "output_modalities": [
       "audio",
@@ -22,7 +22,7 @@
         "noise_reduction": null,
         "turn_detection": {
           "type": "semantic_vad",
-          "eagerness": "high",
+          "eagerness": "medium",
           "create_response": true,
           "interrupt_response": true
         }
@@ -62,14 +62,11 @@
     "prompt": null,
     "tracing": null,
     "model": "google/gemini-3.1-flash-lite",
-    "expires_at": 1792904627,
+    "expires_at": 1792904743,
     "include": null,
     "providerData": {
-      "user_id": "beaming-colt-9670:8e9a6ee9-d8e6-482d-b7e6-e1f38dbe42cd",
-      "stt": {
-        "min_end_of_turn_silence": 100,
-        "max_turn_silence": 300
-      },
+      "user_id": "beaming-colt-9670:94302e7b-778a-45c5-a8b3-855b21bbffba",
+      "stt": {},
       "auto_tool_response": true
     }
   }

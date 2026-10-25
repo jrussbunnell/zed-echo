@@ -6,16 +6,33 @@ chars. `error.json` is the server's answer to a retired model id.
 
 ## Setup
 
-- Auth: `Authorization: Basic <key>`. The key is in the macOS keychain as an
-  internet password with server `https://api.inworld.ai` (scheme included;
-  `-s api.inworld.ai` does not match).
+- Auth: `Authorization: Basic <key>`. The key is in the macOS keychain; the
+  correct lookup is `security find-internet-password -s https://api.inworld.ai -w`
+  (scheme included; `-s api.inworld.ai` does not match).
 - Voice `Clive`, input 24 kHz PCM16, 80 ms appends.
 - Speech: `say "what time is it"`, 0.75 s of speech, then silence.
 - Models are listed by `GET https://api.inworld.ai/llm/v1alpha/models`
   (Basic auth). Realtime takes the id as `provider/model`, e.g.
   `google/gemini-3.1-flash-lite` (the list shows `gemini-3.1-flash-lite`).
 
-## Latency (audio-only session, semantic_vad eagerness=high)
+## Latency at eagerness=medium (the pinned setting)
+
+`turn_detection = { type: semantic_vad, eagerness: medium, create_response: true,
+interrupt_response: true }`, no `providerData.stt` overrides, `audio.output.model =
+inworld-tts-2-flash`, 3 runs each. Same measurement points as below.
+
+| Model | First audio after end of speech | After `speech_stopped` |
+|---|---|---|
+| google/gemini-3.1-flash-lite | 1.57, 1.57, 1.64 s | 0.45, 0.38, 0.51 s |
+| google/gemini-2.5-flash-lite | 1.50, 1.42, 1.46 s | 0.31, 0.30, 0.32 s |
+
+At medium, the end-of-speech figure is about 1.4 - 1.6 s for both models, not
+the ~1.0 s seen at high. The gate is not applied here; these are the numbers.
+
+## Latency at eagerness=high (earlier measurement, NOT the pinned setting)
+
+Audio-only session, semantic_vad eagerness=high, some runs with
+`providerData.stt` overrides (see below).
 
 "End of speech" is when the last speech sample was sent. "Stopped" is the
 server's `input_audio_buffer.speech_stopped`.
@@ -38,9 +55,17 @@ moved with `providerData.stt` overrides (`min_end_of_turn_silence` 20-100,
 
 ## Chosen default
 
-`google/gemini-3.1-flash-lite` with `audio.output.model = inworld-tts-2-flash`.
-The gate ("first audio within 1 s of end of speech") is met only at the edge:
-0.94 - 1.00 s. Real microphone speech and network may land above 1 s.
+Exact strings for `session.update`:
+`session.model = "google/gemini-3.1-flash-lite"`,
+`session.audio.output.model = "inworld-tts-2-flash"`.
+
+Fixture provenance: all fixtures except `error.json` come from one run of that
+default at eagerness=medium (re-recorded). `session_updated.json` echoes the
+strings above. `session_created.json` shows `google-ai-studio/gemini-3.1-flash-lite`
+and `inworld-tts-2` because it is the server's default session, sent before our
+`session.update`; the server reports its own provider-qualified model id there.
+Same run, no model difference. `error.json` was recorded with
+`openai/gpt-4.1-nano` (retired).
 
 ## Event names vs the spec table
 

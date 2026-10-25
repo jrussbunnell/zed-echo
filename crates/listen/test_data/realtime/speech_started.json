@@ -1,6 +1,6 @@
 {
-  "event_id": "13ef10d8-9e5d-4824-bc19-ae440b312af2",
+  "event_id": "595fcc45-d682-4093-8c34-5a9e810e8e86",
   "type": "input_audio_buffer.speech_started",
   "audio_start_ms": 159,
-  "item_id": "c57439c6-bc9c-47e9-80db-b17024e4e1ae"
+  "item_id": "7f9ce6ed-24a8-4439-9c69-58b4c2200325"
 }
