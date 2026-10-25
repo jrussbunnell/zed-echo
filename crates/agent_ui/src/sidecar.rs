@@ -10,6 +10,7 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{BoxFuture, Shared};
+use gpui::TaskExt as _;
 use gpui::{App, Context, Entity, SharedString, Task};
 use project::Project;
 use std::path::Path;
@@ -74,6 +75,27 @@ impl Sidecar {
     /// Whether a conversation with it is under way.
     pub fn is_briefed(&self) -> bool {
         self.briefed
+    }
+
+    /// Whether its turn is stopped on a permission prompt. Nothing shows
+    /// its thread, so nobody can answer one.
+    pub fn is_waiting_for_permission(&self, cx: &App) -> bool {
+        self.thread.as_ref().is_some_and(|thread| {
+            thread
+                .read(cx)
+                .pending_permission_requests()
+                .next()
+                .is_some()
+        })
+    }
+
+    /// Stops the turn in progress, for a question given up on.
+    pub fn cancel_turn(&self, cx: &mut App) {
+        if let Some(thread) = &self.thread {
+            thread
+                .update(cx, |thread, cx| thread.cancel(cx))
+                .detach_and_log_err(cx);
+        }
     }
 
     /// Asks the question and resolves to the spoken answer, waiting for the

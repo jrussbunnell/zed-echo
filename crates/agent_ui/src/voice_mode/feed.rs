@@ -25,6 +25,10 @@ pub enum SessionEvent {
         session: SharedString,
         text: SharedString,
     },
+    /// A note its sender already bracketed and sanitized, such as a sidecar
+    /// answer or a line Echo was handed to say. Joshua asked for these, so
+    /// they are spoken at every level and skip the gap.
+    Ready(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +90,7 @@ impl Feed {
                     failed,
                 )
             }
+            SessionEvent::Ready(text) => (text, true, true),
             SessionEvent::Milestone { session, text } => (
                 format!("[{}: {}]", sanitize(&session), sanitize(&text)),
                 self.chattiness == Chattiness::Commentary,

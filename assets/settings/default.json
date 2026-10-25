@@ -738,13 +738,14 @@
     // one doing the work.
     "sidecar": true
   },
-  // Real-time voice mode: a spoken conversation with the agent.
+  // Real-time voice mode: a spoken conversation with the agent. Changes
+  // apply the next time voice mode opens.
   "voice_mode": {
     // "inworld" is the only provider; it needs INWORLD_API_KEY or the keychain.
     "provider": "inworld",
     // The language model that answers. Unset uses the built-in default.
     "model": null,
-    // The provider's voice. Unset uses the provider's default.
+    // The provider's voice. Unset uses read_aloud's voice_id.
     "voice": null,
     // How much is said unprompted: "quiet", "milestones", or "commentary".
     "chattiness": "milestones",

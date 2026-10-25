@@ -246,13 +246,17 @@ pub fn sanitize_up_to(text: &str, max_characters: usize) -> String {
     }
 }
 
+/// Session titles are an agent's words of any length; the state block keeps
+/// them short enough to say.
+const TITLE_LIMIT: usize = 60;
+
 pub fn state_block(sessions: &[SessionSummary]) -> String {
     sessions
         .iter()
         .map(|session| {
             let mut line = format!(
                 "- {} ({}): {}",
-                sanitize(&session.title),
+                sanitize_up_to(&session.title, TITLE_LIMIT),
                 sanitize(&session.project),
                 sanitize(&session.status)
             );
@@ -277,7 +281,7 @@ pub fn instructions_state_block(sessions: &[SessionSummary]) -> String {
         .map(|session| {
             let mut line = format!(
                 "- {} ({}): {}",
-                sanitize(&session.title),
+                sanitize_up_to(&session.title, TITLE_LIMIT),
                 sanitize(&session.project),
                 sanitize(&session.status)
             );
@@ -720,5 +724,14 @@ mod tests {
             instructions_state_block(&[session, summary("b", "Add search")]),
             "- Fix booking (echo): waiting for approval; needs approval\n- Add search (echo): idle"
         );
+    }
+
+    #[test]
+    fn long_titles_are_cut_to_sixty_characters() {
+        let title = "a".repeat(100);
+        let expected = format!("- {}… (echo): idle", "a".repeat(60));
+        let sessions = [summary("a", &title)];
+        assert_eq!(state_block(&sessions), expected);
+        assert_eq!(instructions_state_block(&sessions), expected);
     }
 }

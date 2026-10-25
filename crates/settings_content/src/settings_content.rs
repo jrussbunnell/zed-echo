@@ -746,7 +746,8 @@ pub struct ListenSettingsContent {
     pub sidecar: Option<bool>,
 }
 
-/// Configuration for real-time voice mode.
+/// Configuration for real-time voice mode. Changes apply the next time voice
+/// mode opens.
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct VoiceModeSettingsContent {
@@ -760,7 +761,7 @@ pub struct VoiceModeSettingsContent {
     /// The language model that answers, as the provider names it. Unset uses
     /// the built-in default.
     pub model: Option<String>,
-    /// The provider's voice to speak with. Unset uses the provider's default.
+    /// The provider's voice to speak with. Unset uses `read_aloud.voice_id`.
     pub voice: Option<String>,
     /// How much the agent says unprompted while it works.
     ///
