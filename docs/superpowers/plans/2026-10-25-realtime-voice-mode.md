@@ -339,7 +339,7 @@ fn an_unknown_event_type_is_other_not_an_error() {
 **Interfaces:**
 - Consumes: Tasks 2–5, 7. `read_aloud::{resolve_api_key, set_suppressed, ReadAloudSettings}`, `audio::{Audio::output_mixer, Audio::echo_canceller}`, `thread_worktree_archive::all_open_workspaces`.
 - Produces:
-  - `pub struct VoiceGlow` (a `RenderOnce` element): `VoiceGlow::new(levels: Arc<listen::VoiceLevels>)`.
+  - `pub struct VoiceGlow` (a `RenderOnce` element): `VoiceGlow::new(id: impl Into<ElementId>, input_level: f32, output_level: f32)`. `ui` must not depend on `listen`, so the overlay reads `VoiceLevels` each frame and passes plain numbers. The band envelopes, phase, and elapsed time persist across frames via `window.use_keyed_state`.
   - Pure helpers in `voice_glow.rs`: `pub fn follow(current: f32, target: f32, dt: f32, attack: f32, release: f32) -> f32` and `pub fn lobe_paint(lobe_index: usize, phase: f32, bands_input: [f32; 3], bands_output: [f32; 3], elapsed: f32, scale: f32) -> LobePaint { x: f32, scale_x: f32, scale_y: f32, opacity: f32 }`. The constants (`LOBES`, `ATTACK`, `RELEASE`, `GAIN = 2.5`, `DESIGN_WIDTH = 350`) are copied from `ryse-inc/landing/components/ui/voice-glow.tsx`.
   - `pub enum VoiceModeState { Connecting, Live, Closing }`
   - `pub struct VoiceMode` (a global `Entity` via `impl Global for GlobalVoiceMode(Entity<VoiceMode>)`):
@@ -372,6 +372,7 @@ fn an_unknown_event_type_is_other_not_an_error() {
     - `AudioDelta` goes to `VoicePlayback::append`.
     - `SpeechStarted` while `is_playing`: `stop()`, then send `Truncate`.
     - Transcript deltas update the caption.
+  - **Output device changes:** if playback stalls, rebuild `VoicePlayback` on `audio::Audio::reconnect_output_mixer(cx, true)`, as read-aloud's sink recovery does. A failed microphone start shows a toast and closes the mode.
   - **Closing** reverses each opening step, plays the close sound, and calls `start_listening` on each panel.
   - **Overlay:** `VoiceGlow` about 120 px high, a caption that fades after 4 s, and a status pill with ✕ that calls `toggle`.
   - **`persona()`:** the spec's Persona bullets as a `const &str`. Joshua's name stays in it.
