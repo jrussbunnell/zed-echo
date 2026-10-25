@@ -28,7 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tools::{
     Answer, ApprovalGate, ApprovalKey, Decision, GateOutcome, SessionMatch, SessionSummary,
-    match_session, sanitize, sanitize_up_to, state_block, tool_definitions,
+    instructions_state_block, match_session, sanitize, sanitize_up_to, state_block,
+    tool_definitions,
 };
 use ui::{Tooltip, VoiceGlow, prelude::*};
 use util::ResultExt as _;
@@ -1449,7 +1450,7 @@ fn instructions(sessions: &[LiveSession]) -> String {
     let block = if sessions.is_empty() {
         "None.".to_string()
     } else {
-        state_block(&summaries(sessions))
+        instructions_state_block(&summaries(sessions))
     };
     format!("{PERSONA}\n\nOpen sessions:\n{block}")
 }
@@ -2606,6 +2607,36 @@ mod tests {
         );
 
         assert_eq!(output(&setup, "c2"), "Ask Joshua first.");
+    }
+
+    #[gpui::test]
+    async fn refreshed_instructions_flag_an_approval_without_describing_it(
+        cx: &mut TestAppContext,
+    ) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+        open_blocked_thread(&mut setup, "Fix booking");
+        setup.cx.executor().advance_clock(STATE_REFRESH);
+        setup.cx.run_until_parked();
+
+        let instructions = setup
+            .realtime
+            .sent()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                ClientEvent::SessionUpdate(config) => Some(config.instructions),
+                _ => None,
+            })
+            .expect("the state block was refreshed");
+        assert!(
+            instructions.contains("- Fix booking (project): waiting for approval; needs approval"),
+            "{instructions}"
+        );
+        assert!(
+            !instructions.contains("Run the migration"),
+            "{instructions}"
+        );
     }
 
     #[gpui::test]
