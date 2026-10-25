@@ -1203,13 +1203,16 @@ impl ContextServerStore {
         &self,
         mut settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
     ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+        // Built-ins win over settings, so a project cannot shadow one with a
+        // server of the same name that runs something else.
         for (id, builtin) in &self.builtin_server_settings {
-            settings
-                .entry(id.clone())
-                .or_insert_with(|| ContextServerSettingsEntry {
+            settings.insert(
+                id.clone(),
+                ContextServerSettingsEntry {
                     worktree_id: None,
                     settings: builtin.clone(),
-                });
+                },
+            );
         }
         settings
     }
