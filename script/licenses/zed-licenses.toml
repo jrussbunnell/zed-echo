@@ -23,6 +23,24 @@ accepted = [
     "CDLA-Permissive-2.0",
 ]
 
+# Echo's database drivers come from ZQLZ, which is GPL-3.0-or-later. Echo is
+# itself GPL-3.0-or-later, so these are accepted by name, not added to the
+# list above for every dependency.
+[zqlz-core]
+accepted = ["GPL-3.0-or-later"]
+
+[zqlz-analyzer]
+accepted = ["GPL-3.0-or-later"]
+
+[zqlz-schema-engine]
+accepted = ["GPL-3.0-or-later"]
+
+[zqlz-driver-mysql]
+accepted = ["GPL-3.0-or-later"]
+
+[zqlz-driver-postgres]
+accepted = ["GPL-3.0-or-later"]
+
 [procinfo.clarify]
 license = "MIT"
 [[procinfo.clarify.files]]
