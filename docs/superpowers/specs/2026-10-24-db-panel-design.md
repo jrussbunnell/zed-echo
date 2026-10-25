@@ -1,6 +1,8 @@
 # Echo — databases
 
-Status: draft 2026-10-24. Source of truth for the `db` crates.
+Status: built 2026-10-25 on branch `echo-db`. Source of truth for the
+`database` and `database_panel` crates. See "As built" at the end for where the
+build departed from this design and why.
 
 ## Goal
 
@@ -247,3 +249,52 @@ Agent writes are never unapproved, whichever mode is set.
 - Result-size caps and streaming strategy.
 - Settings schema field names.
 - Order of milestones, as long as Ryse MySQL ↔ Atlas Convex compare is usable early.
+
+## As built (2026-10-25)
+
+Crates: `database` (engine, store, settings, remote host) and `database_panel`
+(panel, views, modals, agent tools). The `db` name was taken by Zed's own
+persistence crate, and the MCP server lives in `database_panel` because its
+approvals need the workspace.
+
+Where the build departed from the design:
+
+| Design | Built | Why |
+|---|---|---|
+| ZQLZ `clickhouse` driver | Own ClickHouse HTTP client, shared with the relay | ZQLZ's driver has no transactions or per-query settings, so it could not run a query read-only; `readonly=1` users also reject any setting sent with a query |
+| Compare streams both sides in key order | Both sides read whole (capped at 200k rows) and hash-joined; past the cap it refuses | Convex cannot order by an arbitrary field without an index. Refusing beats a partial diff that shows false one-sided rows |
+| Secrets in the keychain via Zed's credentials provider | Always the real keychain (`zed_credentials_provider::keychain()`) | On the Dev release channel Echo ships on, Zed's provider writes a plaintext file instead |
+| MCP via `context_server` | Built-in server on `ContextServerStore`, bridged with `/usr/bin/nc -U` | Reaches Claude Code and Zed's agent alike; built-ins override settings so a project cannot shadow them |
+| Agent tools everywhere | Local projects only | A remote project's agent runs on the remote host, which cannot reach this machine's socket |
+
+Security decisions made during the build:
+
+- Read-only queries must be one reading statement, run inside a READ ONLY
+  transaction, and on MySQL with the session itself read-only: MySQL commits
+  implicitly before DDL, which otherwise escapes the transaction (verified).
+- Project settings apply only from trusted worktrees, can never change where a
+  user connection points, and can only tighten `read_only` and `environment`.
+  `agent_access` and `write_approval` may be loosened per repo, as asked.
+- Secrets for connections that run on a remote host are stored per host.
+- Change previews are rendered with literals in the same pass that builds the
+  statements; execution binds parameters. Updates and deletes that would touch
+  more than one row roll the whole change set back.
+
+Testing:
+
+- `script/database-test-containers` starts MySQL, Postgres, ClickHouse and a
+  self-hosted Convex backend, seeds them, and runs the live suite.
+- `DATABASE_LIVE_TESTS=1 cargo run -p zed --bin zed_visual_test_runner
+  --features visual-tests` renders the panel, table, review, query, compare and
+  Convex history views offscreen and saves screenshots.
+
+Known gaps:
+
+- Ryse's ClickHouse access path is unconfirmed (not visible in the Railway
+  account checked). Bartr's goes through the `warehouse` relay.
+- Remote (SSH) projects route project-defined connections to the remote
+  engine, verified through Zed's remote test harness, but not against a real
+  SSH host. Echo's remote server binary must be built from this branch.
+- Query results are buffered whole by the drivers; the row limit bounds what
+  is kept, not what is read.
+- Convex `_creationTime` shows as epoch milliseconds.
