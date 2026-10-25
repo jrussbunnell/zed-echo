@@ -313,7 +313,7 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow!("{name}: {error}")));
         }
         self.set_state(&entry.name, ConnectionState::Connecting, cx);
-        let credentials = zed_credentials_provider::global(cx);
+        let credentials = database_credentials(cx);
         let key = self.credential_key(&entry, cx);
         cx.spawn(async move |this, cx| {
             let secret = credentials
@@ -331,6 +331,7 @@ impl DatabaseStore {
                 }
                 .into());
             }
+            let had_secret = secret.is_some();
             let request = Request::Connect {
                 connection: entry.name.to_string(),
                 spec: entry.spec.clone(),
@@ -357,6 +358,13 @@ impl DatabaseStore {
                     Ok(())
                 }
                 Ok(other) => Err(anyhow!("unexpected response {other:?}")),
+                Err(error) if !had_secret && is_authentication_error(&error) => {
+                    this.set_state(&entry.name, ConnectionState::NeedsSecret, cx);
+                    Err(MissingSecret {
+                        connection: entry.name.clone(),
+                    }
+                    .into())
+                }
                 Err(error) => {
                     this.set_state(
                         &entry.name,
@@ -379,7 +387,7 @@ impl DatabaseStore {
         let Some(entry) = self.entry(name).cloned() else {
             return Task::ready(Err(anyhow!("no connection named {name}")));
         };
-        let credentials = zed_credentials_provider::global(cx);
+        let credentials = database_credentials(cx);
         let key = self.credential_key(&entry, cx);
         cx.spawn(async move |this, cx| {
             credentials
@@ -401,7 +409,7 @@ impl DatabaseStore {
         };
         let key = self.credential_key(&entry, cx);
         self.forget(&entry.name, cx);
-        let credentials = zed_credentials_provider::global(cx);
+        let credentials = database_credentials(cx);
         cx.spawn(async move |_, cx| credentials.delete_credentials(&key, cx).await)
     }
 
@@ -747,6 +755,27 @@ impl DatabaseStore {
         });
         self.indexers.insert(entry.name, task);
     }
+}
+
+/// Database passwords and deploy keys always go to the system keychain. The
+/// Dev channel Echo ships on would otherwise use Zed's development
+/// credentials file, which is plaintext; stateless runs (visual tests) keep
+/// that file so they never touch the real keychain.
+fn database_credentials(cx: &App) -> Arc<dyn credentials_provider::CredentialsProvider> {
+    if *zed_env_vars::ZED_STATELESS {
+        zed_credentials_provider::global(cx)
+    } else {
+        zed_credentials_provider::keychain()
+    }
+}
+
+/// Whether a connect failure looks like missing or wrong credentials, so a
+/// connection with no stored secret can ask for one instead of just failing.
+fn is_authentication_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_lowercase();
+    ["access denied", "authentication", "password", "unauthorized", "401", "403"]
+        .iter()
+        .any(|needle| message.contains(needle))
 }
 
 /// What to read for a comparison.

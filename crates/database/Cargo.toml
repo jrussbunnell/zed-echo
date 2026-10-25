@@ -21,6 +21,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 collections.workspace = true
+credentials_provider.workspace = true
 db.workspace = true
 futures.workspace = true
 gpui.workspace = true
@@ -37,6 +38,7 @@ tokio = { workspace = true, features = ["sync"] }
 urlencoding.workspace = true
 util.workspace = true
 zed_credentials_provider.workspace = true
+zed_env_vars.workspace = true
 zqlz-core.workspace = true
 zqlz-driver-mysql.workspace = true
 zqlz-driver-postgres.workspace = true

@@ -42,6 +42,12 @@ pub fn global(cx: &App) -> Arc<dyn CredentialsProvider> {
         .unwrap_or_else(|| new(cx))
 }
 
+/// The system keychain, regardless of release channel. For secrets that must
+/// never land in the development credentials file, which is plaintext.
+pub fn keychain() -> Arc<dyn CredentialsProvider> {
+    Arc::new(KeychainCredentialsProvider)
+}
+
 fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
     let use_development_provider = match ReleaseChannel::try_global(cx) {
         Some(ReleaseChannel::Dev) => {
