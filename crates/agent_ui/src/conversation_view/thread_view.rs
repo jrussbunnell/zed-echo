@@ -1826,7 +1826,7 @@ impl ThreadView {
 
             this.update(cx, |this, cx| {
                 this.read_aloud_activation = None;
-                let Some(player) = audio::Audio::connect_player(cx) else {
+                let Some(mixer) = audio::Audio::output_mixer(cx) else {
                     this.notify_read_aloud_disabled(
                         "no audio output device available".to_string(),
                         cx,
@@ -1849,7 +1849,7 @@ impl ThreadView {
                 let read_aloud = cx.new(|cx| {
                     let mut read_aloud = read_aloud::ReadAloud::new(
                         provider.clone(),
-                        Box::new(read_aloud::RodioSink::new(player)),
+                        Box::new(read_aloud::RodioSink::new(mixer)),
                         Some(Self::read_aloud_sink_recovery()),
                         cx,
                     );
@@ -1877,8 +1877,8 @@ impl ThreadView {
     /// rendering somewhere the listener is not.
     fn read_aloud_sink_recovery() -> read_aloud::SinkRecovery {
         Arc::new(|cx: &mut App, stalled: bool| {
-            let player = audio::Audio::reconnect_player(cx, stalled)?;
-            Some(Box::new(read_aloud::RodioSink::new(player)) as Box<dyn read_aloud::AudioSink>)
+            let mixer = audio::Audio::reconnect_output_mixer(cx, stalled)?;
+            Some(Box::new(read_aloud::RodioSink::new(mixer)) as Box<dyn read_aloud::AudioSink>)
         })
     }
 
@@ -1888,7 +1888,7 @@ impl ThreadView {
     /// key, no HTTP client, and no model id — just an optional voice name.
     #[cfg(target_os = "macos")]
     fn start_read_aloud_with_system_voice(&mut self, cx: &mut Context<Self>) {
-        let Some(player) = audio::Audio::connect_player(cx) else {
+        let Some(mixer) = audio::Audio::output_mixer(cx) else {
             self.notify_read_aloud_disabled("no audio output device available".to_string(), cx);
             return;
         };
@@ -1907,7 +1907,7 @@ impl ThreadView {
         let read_aloud = cx.new(|cx| {
             let mut read_aloud = read_aloud::ReadAloud::new(
                 provider.clone(),
-                Box::new(read_aloud::RodioSink::new(player)),
+                Box::new(read_aloud::RodioSink::new(mixer)),
                 Some(Self::read_aloud_sink_recovery()),
                 cx,
             );

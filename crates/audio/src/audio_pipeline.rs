@@ -153,9 +153,9 @@ impl Audio {
     ///
     /// Reopening builds a new mixer, which leaves every player handed out
     /// earlier attached to the old one. Callers therefore have to move their
-    /// playback onto the returned player; whatever was queued on the old one is
+    /// playback onto the returned mixer; whatever was queued on the old one is
     /// gone.
-    pub fn reconnect_player(cx: &mut App, force: bool) -> Option<rodio::Player> {
+    pub fn reconnect_output_mixer(cx: &mut App, force: bool) -> Option<rodio::mixer::Mixer> {
         let output_audio_device = AudioSettings::get_global(cx).output_audio_device.clone();
         cx.update_default_global(|this: &mut Self, cx| {
             if !force && !this.output_is_stale(output_audio_device.as_ref()) {
@@ -168,7 +168,7 @@ impl Audio {
                 .ensure_output_exists(output_audio_device, cx)
                 .context("Could not reopen output stream")
                 .log_err()?;
-            Some(rodio::Player::connect_new(output_mixer))
+            Some(output_mixer.clone())
         })
     }
 
@@ -186,19 +186,19 @@ impl Audio {
         });
     }
 
-    /// Connects an independent playback queue to the shared output mixer.
+    /// The shared output mixer, for connecting independent playback queues.
     ///
     /// Callers that need to play arbitrary samples use this instead of
     /// `play_sound`, which only handles the bundled `Sound` assets. Returns
     /// `None` when no output device could be opened.
-    pub fn connect_player(cx: &mut App) -> Option<rodio::Player> {
+    pub fn output_mixer(cx: &mut App) -> Option<rodio::mixer::Mixer> {
         let output_audio_device = AudioSettings::get_global(cx).output_audio_device.clone();
         cx.update_default_global(|this: &mut Self, cx| {
             let output_mixer = this
                 .ensure_output_exists(output_audio_device, cx)
                 .context("Could not get output mixer")
                 .log_err()?;
-            Some(rodio::Player::connect_new(output_mixer))
+            Some(output_mixer.clone())
         })
     }
 

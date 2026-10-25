@@ -1,4 +1,5 @@
 use crate::provider::Pcm;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -139,21 +140,50 @@ impl ChunkQueue {
 }
 
 pub struct RodioSink {
-    player: rodio::Player,
+    /// Kept so `clear` and `stop` can swap in a fresh player rather than
+    /// draining the old one.
+    mixer: rodio::mixer::Mixer,
+    player: RefCell<rodio::Player>,
     /// Guards the chunk bookkeeping. Playback callbacks never touch it; only
     /// the player entity's thread does, so contention is nil.
     chunks: Mutex<ChunkQueue>,
     /// Mirror of the speed handed to rodio, needed to report chunk offsets on
     /// the same output clock rodio's own position uses.
     speed: Mutex<f32>,
+    /// Mirror of the volume handed to rodio, carried over to replacement players.
+    volume: Mutex<f32>,
 }
 
 impl RodioSink {
-    pub fn new(player: rodio::Player) -> Self {
+    pub fn new(mixer: rodio::mixer::Mixer) -> Self {
+        let player = rodio::Player::connect_new(&mixer);
         Self {
-            player,
+            mixer,
+            player: RefCell::new(player),
             chunks: Mutex::new(ChunkQueue::default()),
             speed: Mutex::new(1.0),
+            volume: Mutex::new(1.0),
+        }
+    }
+
+    /// Discards everything queued by dropping the player, which stops its
+    /// sources, and connecting a new one in its place.
+    ///
+    /// rodio's own ways of emptying a queue are unusable on the main thread:
+    /// `Player::clear()`/`stop()` can block in `sleep_until_end()`, and
+    /// `skip_one()` decrements its sound counter unconditionally, so racing a
+    /// source that finishes on the audio thread underflows the counter to
+    /// `usize::MAX` — and a later drain loop over `len()` never ends.
+    fn replace_player(&self, paused: bool) {
+        let player = rodio::Player::connect_new(&self.mixer);
+        player.set_speed(self.speed());
+        player.set_volume(self.volume.lock().map(|volume| *volume).unwrap_or(1.0));
+        if paused {
+            player.pause();
+        }
+        self.player.replace(player);
+        if let Ok(mut chunks) = self.chunks.lock() {
+            chunks.clear();
         }
     }
 
@@ -165,7 +195,7 @@ impl RodioSink {
             log::error!("read_aloud: sink chunk queue poisoned");
             return fallback;
         };
-        chunks.sync(self.player.len());
+        chunks.sync(self.player.borrow().len());
         read(&chunks)
     }
 
@@ -189,12 +219,12 @@ impl AudioSink for RodioSink {
         // than rodio holds, which `sync` would read as a phantom drain.
         match self.chunks.lock() {
             Ok(mut chunks) => {
-                chunks.sync(self.player.len());
+                chunks.sync(self.player.borrow().len());
                 chunks.push(utterance, duration);
             }
             Err(error) => log::error!("read_aloud: sink chunk queue poisoned: {error}"),
         }
-        self.player.append(rodio::buffer::SamplesBuffer::new(
+        self.player.borrow().append(rodio::buffer::SamplesBuffer::new(
             channels,
             sample_rate,
             pcm.samples,
@@ -202,23 +232,7 @@ impl AudioSink for RodioSink {
     }
 
     fn clear(&self) {
-        // `Player::clear()` sets a counter of sounds to drop, then blocks the
-        // calling thread in `sleep_until_end()` until the last appended
-        // source finishes. On the GPUI main thread that is a permanent
-        // freeze whenever nothing is ever going to finish naturally (e.g. we
-        // just want to abandon the queue on seek). `skip_one()` bumps the
-        // same drop counter without waiting, so draining the queue one
-        // `skip_one()` per queued sound achieves the same result
-        // non-blockingly; the sounds are discarded on the queue's next poll.
-        for _ in 0..self.player.len() {
-            self.player.skip_one();
-        }
-        if let Ok(mut chunks) = self.chunks.lock() {
-            chunks.clear();
-        }
-        // `clear` leaves the player stopped; playback must be re-armed or the
-        // next `append` is silent.
-        self.player.play();
+        self.replace_player(false);
     }
 
     fn queued(&self) -> usize {
@@ -229,39 +243,31 @@ impl AudioSink for RodioSink {
         if let Ok(mut current) = self.speed.lock() {
             *current = speed;
         }
-        self.player.set_speed(speed);
+        self.player.borrow().set_speed(speed);
     }
 
     fn set_volume(&self, volume: f32) {
-        self.player.set_volume(volume.clamp(0.0, 1.0));
+        let volume = volume.clamp(0.0, 1.0);
+        if let Ok(mut current) = self.volume.lock() {
+            *current = volume;
+        }
+        self.player.borrow().set_volume(volume);
     }
 
     fn stop(&self) {
-        // `Player::stop()` sets a `stopped` flag; a later `append()` then
-        // blocks (waiting for the flush its own doc comment describes)
-        // until the flag is cleared, which only happens on `append()`'s own
-        // call to `sleep_until_end()`. That is the same main-thread freeze
-        // hazard as `clear()`, so drain the queue with `skip_one()` (see
-        // `clear()` above) instead of setting the flag.
-        for _ in 0..self.player.len() {
-            self.player.skip_one();
-        }
-        if let Ok(mut chunks) = self.chunks.lock() {
-            chunks.clear();
-        }
-        self.player.pause();
+        self.replace_player(true);
     }
 
     fn pause(&self) {
-        self.player.pause();
+        self.player.borrow().pause();
     }
 
     fn resume(&self) {
-        self.player.play();
+        self.player.borrow().play();
     }
 
     fn is_paused(&self) -> bool {
-        self.player.is_paused()
+        self.player.borrow().is_paused()
     }
 
     fn position(&self) -> Duration {
@@ -271,7 +277,7 @@ impl AudioSink for RodioSink {
         // added back to keep the position on the utterance's own clock.
         let speed = self.speed();
         let offset = self.with_synced_chunks(|chunks| chunks.head_offset(speed), Duration::ZERO);
-        offset + self.player.get_pos()
+        offset + self.player.borrow().get_pos()
     }
 }
 
