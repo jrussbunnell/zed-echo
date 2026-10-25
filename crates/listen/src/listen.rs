@@ -109,8 +109,98 @@ impl Settings for ListenSettings {
     }
 }
 
+pub const DEFAULT_REALTIME_MODEL: &str = "google/gemini-3.1-flash-lite";
+pub const INWORLD_REALTIME_PROVIDER: &str = "inworld";
+const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How much voice mode says unprompted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Chattiness {
+    Quiet,
+    #[default]
+    Milestones,
+    Commentary,
+}
+
+impl From<settings::VoiceChattiness> for Chattiness {
+    fn from(chattiness: settings::VoiceChattiness) -> Self {
+        match chattiness {
+            settings::VoiceChattiness::Quiet => Self::Quiet,
+            settings::VoiceChattiness::Milestones => Self::Milestones,
+            settings::VoiceChattiness::Commentary => Self::Commentary,
+        }
+    }
+}
+
+impl From<settings::VoiceTurnEagerness> for TurnEagerness {
+    fn from(eagerness: settings::VoiceTurnEagerness) -> Self {
+        match eagerness {
+            settings::VoiceTurnEagerness::Low => Self::Low,
+            settings::VoiceTurnEagerness::Medium => Self::Medium,
+            settings::VoiceTurnEagerness::High => Self::High,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, RegisterSetting)]
+pub struct VoiceModeSettings {
+    pub provider: String,
+    pub model: String,
+    pub voice: Option<String>,
+    pub chattiness: Chattiness,
+    pub idle_timeout: std::time::Duration,
+    pub turn_eagerness: TurnEagerness,
+}
+
+impl VoiceModeSettings {
+    /// Resolves `voice_mode.provider` to a provider that exists, returning the
+    /// offending value otherwise so the caller can tell the user instead of
+    /// quietly connecting to Inworld.
+    pub fn resolve_provider(&self) -> Result<&'static str, String> {
+        let requested = self.provider.trim();
+        if requested.eq_ignore_ascii_case(INWORLD_REALTIME_PROVIDER) {
+            Ok(INWORLD_REALTIME_PROVIDER)
+        } else {
+            Err(self.provider.clone())
+        }
+    }
+}
+
+impl Settings for VoiceModeSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let voice_mode = content.voice_mode.as_ref();
+        VoiceModeSettings {
+            provider: voice_mode
+                .and_then(|settings| settings.provider.clone())
+                .unwrap_or_else(|| INWORLD_REALTIME_PROVIDER.to_string()),
+            model: voice_mode
+                .and_then(|settings| settings.model.clone())
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_REALTIME_MODEL.to_string()),
+            voice: voice_mode
+                .and_then(|settings| settings.voice.clone())
+                .filter(|voice| !voice.trim().is_empty()),
+            chattiness: voice_mode
+                .and_then(|settings| settings.chattiness)
+                .map(Chattiness::from)
+                .unwrap_or_default(),
+            idle_timeout: voice_mode
+                .and_then(|settings| settings.idle_timeout_seconds)
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .filter(|seconds| *seconds > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT),
+            turn_eagerness: voice_mode
+                .and_then(|settings| settings.turn_eagerness)
+                .map(TurnEagerness::from)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 pub fn init(cx: &mut gpui::App) {
     ListenSettings::register(cx);
+    VoiceModeSettings::register(cx);
 }
 
 #[cfg(test)]
@@ -147,5 +237,67 @@ mod tests {
             settings_with_provider("deepgram").resolve_provider(),
             Err("deepgram".to_string())
         );
+    }
+
+    fn voice_mode_from(json: serde_json::Value) -> VoiceModeSettings {
+        let voice_mode = serde_json::from_value(json).expect("valid voice_mode block");
+        VoiceModeSettings::from_settings(&settings::SettingsContent {
+            voice_mode: Some(voice_mode),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn voice_mode_defaults() {
+        let voice_mode = VoiceModeSettings::from_settings(&settings::SettingsContent::default());
+        assert_eq!(voice_mode.provider, "inworld");
+        assert_eq!(voice_mode.model, DEFAULT_REALTIME_MODEL);
+        assert_eq!(voice_mode.voice, None);
+        assert_eq!(voice_mode.chattiness, Chattiness::Milestones);
+        assert_eq!(voice_mode.idle_timeout, std::time::Duration::from_secs(300));
+        assert_eq!(voice_mode.turn_eagerness, TurnEagerness::High);
+    }
+
+    #[test]
+    fn a_zero_idle_timeout_falls_back_to_the_default() {
+        for seconds in [0, -5] {
+            let voice_mode =
+                voice_mode_from(serde_json::json!({ "idle_timeout_seconds": seconds }));
+            assert_eq!(voice_mode.idle_timeout, std::time::Duration::from_secs(300));
+        }
+        let voice_mode = voice_mode_from(serde_json::json!({ "idle_timeout_seconds": 60 }));
+        assert_eq!(voice_mode.idle_timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn an_unknown_voice_mode_provider_is_reported() {
+        let voice_mode = voice_mode_from(serde_json::json!({ "provider": "deepgram" }));
+        assert_eq!(voice_mode.resolve_provider(), Err("deepgram".to_string()));
+        let voice_mode = voice_mode_from(serde_json::json!({ "provider": "Inworld" }));
+        assert_eq!(voice_mode.resolve_provider(), Ok(INWORLD_REALTIME_PROVIDER));
+    }
+
+    #[test]
+    fn turn_eagerness_parses_each_level() {
+        for (name, expected) in [
+            ("low", TurnEagerness::Low),
+            ("medium", TurnEagerness::Medium),
+            ("high", TurnEagerness::High),
+        ] {
+            let voice_mode = voice_mode_from(serde_json::json!({ "turn_eagerness": name }));
+            assert_eq!(voice_mode.turn_eagerness, expected);
+        }
+    }
+
+    #[test]
+    fn chattiness_parses_each_level() {
+        for (name, expected) in [
+            ("quiet", Chattiness::Quiet),
+            ("milestones", Chattiness::Milestones),
+            ("commentary", Chattiness::Commentary),
+        ] {
+            let voice_mode = voice_mode_from(serde_json::json!({ "chattiness": name }));
+            assert_eq!(voice_mode.chattiness, expected);
+        }
     }
 }
