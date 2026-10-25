@@ -4,6 +4,7 @@ mod inworld_streaming;
 mod inworld_stt;
 mod listener;
 mod provider;
+mod realtime;
 mod wake;
 
 pub use conversation::{Activity, DEFAULT_WINDOW, SILENCE_ENDS_UTTERANCE, Window, activity};
@@ -16,6 +17,7 @@ pub use listener::{COMMAND_TIMEOUT, ListenEvent, Listener, WakeSignal, WakeSourc
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::FakeStt;
 pub use provider::{SttProvider, Transcript};
+pub use realtime::*;
 #[cfg(target_os = "macos")]
 pub use wake::SpeechWake;
 pub use wake::contains_wake_word;
