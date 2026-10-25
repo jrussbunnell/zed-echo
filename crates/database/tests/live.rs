@@ -363,6 +363,17 @@ async fn test_postgres() {
         return;
     }
     exercise_sql(DatabaseKind::Postgres, 15432, "public").await;
+
+    // `x$a$` is one identifier to Postgres; a lexer that reads `$a$` as a
+    // dollar quote would hide the COMMIT and DROP that follow.
+    let engine = engine();
+    connect(&engine, "admin", spec(DatabaseKind::Postgres, 15432, "postgres"), "echo").await;
+    query(&engine, "admin", "CREATE TABLE IF NOT EXISTS canary (id int)", false).await.unwrap();
+    let escape = "SELECT 1 AS x$a$; COMMIT; DROP TABLE canary; SELECT $a$";
+    assert!(query(&engine, "admin", escape, true).await.is_err(), "{escape} ran read-only");
+    query(&engine, "admin", "SELECT COUNT(*) FROM canary", false)
+        .await
+        .expect("the canary table survives");
 }
 
 #[tokio::test(flavor = "multi_thread")]

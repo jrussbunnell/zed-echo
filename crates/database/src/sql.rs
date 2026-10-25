@@ -465,12 +465,18 @@ impl Source for SqlSource {
             // Three layers, because each alone has a hole: a second statement
             // could COMMIT its way out of the transaction, and MySQL commits
             // implicitly before DDL, running it outside a read-only
-            // transaction unless the session itself is read-only.
+            // transaction unless the session itself is read-only. (The
+            // Postgres driver's extended protocol also refuses a second
+            // statement, but that is the driver's choice, not ours.)
             check_read_only_statement(self.kind, text)?;
-            let mysql = self.kind == DatabaseKind::Mysql;
-            if mysql {
-                self.statement("SET SESSION TRANSACTION READ ONLY").await?;
-            }
+            let (session_read_only, session_read_write) = match self.kind {
+                DatabaseKind::Postgres => (
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                ),
+                _ => ("SET SESSION TRANSACTION READ ONLY", "SET SESSION TRANSACTION READ WRITE"),
+            };
+            self.statement(session_read_only).await?;
             let result = match self.statement(self.begin_read_only()).await {
                 Ok(()) => {
                     let result = self.rows(text, &[]).await;
@@ -480,9 +486,7 @@ impl Source for SqlSource {
                 }
                 Err(error) => Err(error),
             };
-            if mysql {
-                self.statement("SET SESSION TRANSACTION READ WRITE").await?;
-            }
+            self.statement(session_read_write).await?;
             result??
         } else {
             self.rows(text, &[]).await?
@@ -761,7 +765,9 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
             character if character.is_alphabetic() || character == '_' => {
                 let start = index;
                 while index < characters.len()
-                    && (characters[index].is_alphanumeric() || characters[index] == '_')
+                    // Both engines allow `$` after the first character, so
+                    // `x$a$` is one identifier, not a dollar quote.
+                    && (characters[index].is_alphanumeric() || matches!(characters[index], '_' | '$'))
                 {
                     index += 1;
                 }
@@ -905,6 +911,8 @@ mod tests {
         assert!(check("SELECT 1; DELETE FROM seller").is_err());
         assert!(check("DROP TABLE seller").is_err());
         assert!(check("/* SELECT */ DELETE FROM seller").is_err());
+        // `x$a$` is one identifier, not the start of a dollar quote.
+        assert!(check("SELECT 1 AS x$a$; COMMIT; DROP TABLE t; SELECT $a$").is_err());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SHOW TABLES").is_ok());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 'it\\'s;' # x").is_ok());
         assert!(
