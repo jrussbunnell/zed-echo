@@ -7,6 +7,7 @@ mod provider;
 mod realtime;
 #[cfg(target_os = "macos")]
 mod realtime_audio;
+mod realtime_session;
 mod wake;
 
 pub use conversation::{Activity, DEFAULT_WINDOW, SILENCE_ENDS_UTTERANCE, Window, activity};
@@ -24,6 +25,9 @@ pub use realtime::*;
 pub use realtime_audio::{
     Microphone, PlayedAudio, VoiceLevels, VoicePlayback, rms, start_microphone, to_realtime_frame,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use realtime_session::FakeRealtime;
+pub use realtime_session::{InworldRealtime, RealtimeConnection, RealtimeVoice};
 #[cfg(target_os = "macos")]
 pub use wake::SpeechWake;
 pub use wake::contains_wake_word;

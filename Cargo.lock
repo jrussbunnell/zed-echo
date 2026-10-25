@@ -10119,12 +10119,15 @@ name = "listen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-tungstenite",
  "audio",
  "base64 0.22.1",
  "block2 0.6.2",
  "futures 0.3.34",
  "gpui",
+ "gpui_tokio",
  "http_client",
+ "http_client_tls",
  "log",
  "objc2 0.6.3",
  "objc2-avf-audio",
@@ -10133,6 +10136,7 @@ dependencies = [
  "rodio",
  "serde_json",
  "settings",
+ "uuid",
 ]
 
 [[package]]
