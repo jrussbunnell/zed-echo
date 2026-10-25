@@ -1,3 +1,4 @@
+use super::tools::sanitize;
 use gpui::SharedString;
 use listen::Chattiness;
 use std::time::{Duration, Instant};
@@ -40,30 +41,6 @@ struct Pending {
     // Approvals and failures skip the gap: waiting 20 seconds to say
     // "blocked" defeats the point of saying it.
     urgent: bool,
-}
-
-// Session titles, errors and summaries are untrusted text headed for a
-// tool-using model; they must not be able to close the bracket and forge a note.
-fn sanitize(text: &str) -> String {
-    const MAX_CHARACTERS: usize = 200;
-    let cleaned = text
-        .chars()
-        .filter(|character| !matches!(character, '[' | ']'))
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > MAX_CHARACTERS {
-        let truncated: String = collapsed.chars().take(MAX_CHARACTERS).collect();
-        format!("{truncated}…")
-    } else {
-        collapsed
-    }
 }
 
 pub struct Feed {
