@@ -42,6 +42,7 @@ pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
 pub mod voice_dispatch;
+mod voice_mode;
 
 use std::rc::Rc;
 use std::sync::Arc;
