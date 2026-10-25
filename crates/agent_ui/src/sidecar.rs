@@ -87,13 +87,16 @@ impl Sidecar {
         let session = self.session.clone();
         let previous = self.last_ask.clone();
         // Dropped when this ask ends however it ends, including being
-        // cancelled, which is what releases the next one.
+        // cancelled. The next one also waits on `previous`, so dropping this
+        // ask while it is still queued cannot let the next skip past it.
         let (done, finished) = oneshot::channel::<()>();
-        self.last_ask = async move {
-            finished.await.ok();
-        }
-        .boxed()
-        .shared();
+        self.last_ask = previous
+            .clone()
+            .then(|()| async move {
+                finished.await.ok();
+            })
+            .boxed()
+            .shared();
 
         cx.spawn(async move |this, cx| {
             let _done = done;
@@ -469,6 +472,44 @@ mod tests {
         let second = futures::FutureExt::now_or_never(second).expect("second answered");
         assert_eq!(first.expect("answered"), "the first answer");
         assert_eq!(second.expect("answered"), "the second answer");
+    }
+
+    /// The one behind a dropped question still has to wait for the one in
+    /// front of it, or it cuts that turn short.
+    #[gpui::test]
+    async fn dropping_a_waiting_question_does_not_skip_the_one_still_running(
+        cx: &mut TestAppContext,
+    ) {
+        let connection = StubAgentConnection::new();
+        let sidecar = new_sidecar(&connection, cx).await;
+
+        let first = sidecar.update(cx, |sidecar, cx| sidecar.ask("first".into(), None, cx));
+        let dropped = sidecar.update(cx, |sidecar, cx| sidecar.ask("dropped".into(), None, cx));
+        let third = sidecar.update(cx, |sidecar, cx| sidecar.ask("third".into(), None, cx));
+        drop(dropped);
+        cx.run_until_parked();
+        assert_eq!(
+            prompts(&sidecar, cx).len(),
+            1,
+            "the third waits for the first"
+        );
+        assert!(connection.take_cancel_calls().is_empty());
+
+        let session_id = session_id(&sidecar, cx);
+        say(&connection, &session_id, "the first answer", cx);
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(prompts(&sidecar, cx).len(), 2);
+
+        say(&connection, &session_id, "the third answer", cx);
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let first = futures::FutureExt::now_or_never(first).expect("first answered");
+        let third = futures::FutureExt::now_or_never(third).expect("third answered");
+        assert_eq!(first.expect("answered"), "the first answer");
+        assert_eq!(third.expect("answered"), "the third answer");
+        assert!(prompts(&sidecar, cx)[1].ends_with("third"));
     }
 
     #[gpui::test]
