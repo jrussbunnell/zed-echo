@@ -271,6 +271,23 @@ impl DatabaseStore {
         project_is_remote && self.entry(name).is_some_and(|entry| entry.project_defined)
     }
 
+    /// The keychain entry for a connection's secret. Connections that run on
+    /// a remote host get their own entry per host, so a secret the user stored
+    /// for local use is never forwarded to a remote machine.
+    fn credential_key(&self, entry: &ConnectionEntry, cx: &App) -> String {
+        let key = entry.spec.credential_key();
+        if !self.runs_remote(&entry.name, cx) {
+            return key;
+        }
+        let host = self
+            .project
+            .upgrade()
+            .and_then(|project| project.read(cx).remote_client())
+            .map(|client| client.read(cx).connection_options().host())
+            .unwrap_or_default();
+        format!("{key}?via={host}")
+    }
+
     /// Sends a raw engine request, without connecting first.
     fn send(&self, name: &str, request: Request, cx: &App) -> Task<Result<Response>> {
         if self.runs_remote(name, cx) {
@@ -297,7 +314,7 @@ impl DatabaseStore {
         }
         self.set_state(&entry.name, ConnectionState::Connecting, cx);
         let credentials = zed_credentials_provider::global(cx);
-        let key = entry.spec.credential_key();
+        let key = self.credential_key(&entry, cx);
         cx.spawn(async move |this, cx| {
             let secret = credentials
                 .read_credentials(&key, cx)
@@ -363,10 +380,11 @@ impl DatabaseStore {
             return Task::ready(Err(anyhow!("no connection named {name}")));
         };
         let credentials = zed_credentials_provider::global(cx);
+        let key = self.credential_key(&entry, cx);
         cx.spawn(async move |this, cx| {
             credentials
                 .write_credentials(
-                    &entry.spec.credential_key(),
+                    &key,
                     entry.spec.user.as_deref().unwrap_or("echo"),
                     secret.as_bytes(),
                     cx,
@@ -381,13 +399,10 @@ impl DatabaseStore {
         let Some(entry) = self.entry(name).cloned() else {
             return Task::ready(Err(anyhow!("no connection named {name}")));
         };
+        let key = self.credential_key(&entry, cx);
         self.forget(&entry.name, cx);
         let credentials = zed_credentials_provider::global(cx);
-        cx.spawn(async move |_, cx| {
-            credentials
-                .delete_credentials(&entry.spec.credential_key(), cx)
-                .await
-        })
+        cx.spawn(async move |_, cx| credentials.delete_credentials(&key, cx).await)
     }
 
     pub fn disconnect(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -841,6 +856,12 @@ fn resolve_connections(project: &Entity<Project>, cx: &mut App) -> Vec<Connectio
                     merged.user = user.user.clone();
                     merged.url = user.url.clone();
                     merged.ssl_mode = user.ssl_mode.clone();
+                    // A read-only pin and the environment (which drives prod
+                    // confirmations) can only be tightened by a project.
+                    merged.read_only = Some(
+                        user.read_only.unwrap_or(false) || content.read_only.unwrap_or(false),
+                    );
+                    merged.environment = user.environment;
                     entry_from_content(name, &merged, settings.write_approval, false)
                 }
                 None => entry_from_content(name, content, settings.write_approval, true),
@@ -1033,6 +1054,7 @@ mod tests {
                                 host: Some("replica.internal".into()),
                                 user: Some("reader".into()),
                                 environment: Some(DatabaseEnvironment::Prod),
+                                read_only: Some(true),
                                 ..Default::default()
                             },
                         )])),
@@ -1052,7 +1074,7 @@ mod tests {
                     "settings.json": r#"{
                         "database": {
                             "connections": {
-                                "ryse-prod": { "agent_access": "allow", "host": "evil.example.com" },
+                                "ryse-prod": { "agent_access": "allow", "host": "evil.example.com", "read_only": false, "environment": "local" },
                                 "atlas": { "kind": "convex", "url": "https://atlas.convex.cloud", "environment": "local" }
                             }
                         }
@@ -1075,6 +1097,8 @@ mod tests {
         let ryse = connections.iter().find(|entry| &*entry.name == "ryse-prod").unwrap();
         assert_eq!(ryse.spec.host.as_deref(), Some("replica.internal"));
         assert_eq!(ryse.agent_access, DatabaseAgentAccess::Allow);
+        assert!(ryse.spec.read_only, "a project cannot lift a read-only pin");
+        assert_eq!(ryse.environment, DatabaseEnvironment::Prod);
         assert!(!ryse.project_defined);
 
         let atlas = connections.iter().find(|entry| &*entry.name == "atlas").unwrap();

@@ -301,6 +301,9 @@ struct ContextServerSettingsEntry {
 pub struct ContextServerStore {
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
+    /// Servers Echo provides itself (such as its database tools), merged
+    /// into the settings-defined ones so agents see them like any other.
+    builtin_server_settings: HashMap<Arc<str>, ContextServerSettings>,
     servers: HashMap<ContextServerId, ContextServerState>,
     server_ids: Vec<ContextServerId>,
     worktree_store: Entity<WorktreeStore>,
@@ -477,7 +480,10 @@ impl ContextServerStore {
             let ai_was_disabled = this.ai_disabled;
             this.ai_disabled = ai_disabled;
 
-            let settings = Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+            let settings = this.with_builtin_servers(Self::resolve_all_context_server_settings(
+                &this.worktree_store,
+                cx,
+            ));
             let settings_changed = this.context_server_settings != settings;
 
             if settings_changed {
@@ -512,8 +518,9 @@ impl ContextServerStore {
                         | WorktreeStoreEvent::WorktreeRemoved(_, _)
                 ) && !DisableAiSettings::get_global(cx).disable_ai
                 {
-                    this.context_server_settings =
-                        Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+                    this.context_server_settings = this.with_builtin_servers(
+                        Self::resolve_all_context_server_settings(&this.worktree_store, cx),
+                    );
                     this.available_context_servers_changed(cx);
                 }
             }));
@@ -524,6 +531,7 @@ impl ContextServerStore {
             state,
             _subscriptions: subscriptions,
             context_server_settings: Self::resolve_all_context_server_settings(&worktree_store, cx),
+            builtin_server_settings: HashMap::default(),
             worktree_store,
             project: weak_project,
             registry,
@@ -1168,6 +1176,44 @@ impl ContextServerStore {
 
     /// Merges context server settings from all visible worktrees so that servers defined
     /// in any project folder in a multi-root workspace are picked up.
+    /// Adds or (with `None`) removes a server Echo provides itself.
+    pub fn set_builtin_server(
+        &mut self,
+        id: Arc<str>,
+        settings: Option<ContextServerSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        match settings {
+            Some(settings) => {
+                self.builtin_server_settings.insert(id, settings);
+            }
+            None => {
+                self.builtin_server_settings.remove(&id);
+            }
+        }
+        self.context_server_settings = self.with_builtin_servers(
+            Self::resolve_all_context_server_settings(&self.worktree_store, cx),
+        );
+        if !DisableAiSettings::get_global(cx).disable_ai {
+            self.available_context_servers_changed(cx);
+        }
+    }
+
+    fn with_builtin_servers(
+        &self,
+        mut settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
+    ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+        for (id, builtin) in &self.builtin_server_settings {
+            settings
+                .entry(id.clone())
+                .or_insert_with(|| ContextServerSettingsEntry {
+                    worktree_id: None,
+                    settings: builtin.clone(),
+                });
+        }
+        settings
+    }
+
     fn resolve_all_context_server_settings(
         worktree_store: &Entity<WorktreeStore>,
         cx: &App,

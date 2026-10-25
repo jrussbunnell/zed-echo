@@ -620,6 +620,12 @@ fn sql_literal(kind: DatabaseKind, value: &Value) -> String {
     }
 }
 
+/// Whether `text` is a single reading statement, as far as a lexer can tell.
+/// Used to decide when to ask before running a human's query on prod.
+pub fn is_reading_statement(kind: DatabaseKind, text: &str) -> bool {
+    check_read_only_statement(kind, text.trim().trim_end_matches(';')).is_ok()
+}
+
 /// Accepts a single statement that starts with a reading keyword. This is a
 /// guard in front of the read-only transaction, not a substitute for it:
 /// `WITH ... DELETE` and `EXPLAIN ANALYZE DELETE` pass here and are stopped by

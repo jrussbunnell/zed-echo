@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub use compare::{CompareOptions, CompareOutcome, CompareRow, CompareSide, FieldDiff, compare};
 pub use engine::{Engine, Request, Response};
+pub use sql::is_reading_statement;
 pub use store::{
     ConnectionEntry, ConnectionState, DatabaseHost, DatabaseSettings, DatabaseStore,
     DatabaseStoreEvent, FetchSource, MissingSecret, QueryHistoryEntry,
