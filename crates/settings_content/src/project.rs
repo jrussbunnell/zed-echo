@@ -1378,7 +1378,10 @@ mod tests {
 ///
 /// Connections defined in a project's `.zed/settings.json` merge over user
 /// connections of the same name, so a project can override a single field
-/// (such as `agent_access`) without redefining the connection.
+/// (such as `agent_access`) without redefining the connection. A project can
+/// never change where a user connection points (`kind`, `host`, `port`,
+/// `database`, `user`, `url`, `ssl_mode`), and database settings from
+/// untrusted worktrees are ignored.
 #[with_fallible_options]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct DatabaseSettingsContent {

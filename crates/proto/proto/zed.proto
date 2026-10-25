@@ -525,6 +525,11 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+
+    // Echo-only messages, numbered far from upstream's range so upstream
+    // merges never collide with them.
+    DatabaseRequest database_request = 9001;
+    DatabaseResponse database_response = 9002;
   }
 
   reserved 87 to 88;

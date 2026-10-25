@@ -117,7 +117,10 @@ impl SqlSource {
         }
     }
 
-    fn statements(&self, changes: &ChangeSet) -> Result<Vec<(String, Vec<Value>)>> {
+    /// Builds the statements for a change set. With `inline`, values are
+    /// rendered as literals in the same pass (for previews) instead of being
+    /// bound, so a value can never be mistaken for a placeholder.
+    fn statements(&self, changes: &ChangeSet, inline: bool) -> Result<Vec<(String, Vec<Value>)>> {
         let table = self.table(&changes.collection);
         changes
             .changes
@@ -131,12 +134,11 @@ impl SqlSource {
                         let assignments = set
                             .iter()
                             .map(|(field, value)| {
-                                params.push(value.clone());
-                                format!("{} = {}", self.quote(field), self.placeholder(params.len()))
+                                format!("{} = {}", self.quote(field), self.bind(value, &mut params, inline))
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let condition = self.key_condition(key, &mut params);
+                        let condition = self.key_condition(key, &mut params, inline);
                         format!("UPDATE {table} SET {assignments} WHERE {condition}")
                     }
                     Change::Insert { values } => {
@@ -148,17 +150,14 @@ impl SqlSource {
                             .join(", ");
                         let placeholders = values
                             .iter()
-                            .map(|(_, value)| {
-                                params.push(value.clone());
-                                self.placeholder(params.len())
-                            })
+                            .map(|(_, value)| self.bind(value, &mut params, inline))
                             .collect::<Vec<_>>()
                             .join(", ");
                         format!("INSERT INTO {table} ({fields}) VALUES ({placeholders})")
                     }
                     Change::Delete { key } => {
                         anyhow::ensure!(!key.is_empty(), "a delete needs a key");
-                        let condition = self.key_condition(key, &mut params);
+                        let condition = self.key_condition(key, &mut params, inline);
                         format!("DELETE FROM {table} WHERE {condition}")
                     }
                 };
@@ -167,14 +166,22 @@ impl SqlSource {
             .collect()
     }
 
-    fn key_condition(&self, key: &[(String, Value)], params: &mut Vec<Value>) -> String {
+    fn bind(&self, value: &Value, params: &mut Vec<Value>, inline: bool) -> String {
+        if inline {
+            sql_literal(self.kind, value)
+        } else {
+            params.push(value.clone());
+            self.placeholder(params.len())
+        }
+    }
+
+    fn key_condition(&self, key: &[(String, Value)], params: &mut Vec<Value>, inline: bool) -> String {
         key.iter()
             .map(|(field, value)| {
                 if value.is_nullish() {
                     format!("{} IS NULL", self.quote(field))
                 } else {
-                    params.push(value.clone());
-                    format!("{} = {}", self.quote(field), self.placeholder(params.len()))
+                    format!("{} = {}", self.quote(field), self.bind(value, params, inline))
                 }
             })
             .collect::<Vec<_>>()
@@ -427,14 +434,28 @@ impl Source for SqlSource {
         let text = text.trim().trim_end_matches(';').trim();
         anyhow::ensure!(!text.is_empty(), "the query is empty");
         let result = if read_only {
-            self.statement(self.begin_read_only()).await?;
-            let result = self.rows(text, &[]).await;
-            // Always end the transaction, even after a failed query, so the
-            // session is not left inside it.
-            let rollback = self.statement("ROLLBACK").await;
-            let result = result?;
-            rollback?;
-            result
+            // Three layers, because each alone has a hole: a second statement
+            // could COMMIT its way out of the transaction, and MySQL commits
+            // implicitly before DDL, running it outside a read-only
+            // transaction unless the session itself is read-only.
+            check_read_only_statement(self.kind, text)?;
+            let mysql = self.kind == DatabaseKind::Mysql;
+            if mysql {
+                self.statement("SET SESSION TRANSACTION READ ONLY").await?;
+            }
+            let result = match self.statement(self.begin_read_only()).await {
+                Ok(()) => {
+                    let result = self.rows(text, &[]).await;
+                    // Always end the transaction, even after a failed query,
+                    // so the session is not left inside it.
+                    self.statement("ROLLBACK").await.map(|()| result)
+                }
+                Err(error) => Err(error),
+            };
+            if mysql {
+                self.statement("SET SESSION TRANSACTION READ WRITE").await?;
+            }
+            result??
         } else {
             self.rows(text, &[]).await?
         };
@@ -478,15 +499,15 @@ impl Source for SqlSource {
 
     fn render_changes(&self, changes: &ChangeSet) -> Result<String> {
         Ok(self
-            .statements(changes)?
+            .statements(changes, true)?
             .iter()
-            .map(|(sql, params)| format!("{};", inline_params(self.kind, sql, params)))
+            .map(|(sql, _)| format!("{sql};"))
             .collect::<Vec<_>>()
             .join("\n"))
     }
 
     async fn apply(&self, changes: &ChangeSet) -> Result<u64> {
-        let statements = self.statements(changes)?;
+        let statements = self.statements(changes, false)?;
         self.statement(self.begin()).await?;
         let mut affected = 0;
         for (sql, params) in &statements {
@@ -599,32 +620,112 @@ fn sql_literal(kind: DatabaseKind, value: &Value) -> String {
     }
 }
 
-fn inline_params(kind: DatabaseKind, sql: &str, params: &[Value]) -> String {
-    match kind {
-        DatabaseKind::Postgres => {
-            // Replace from the highest index down so `$1` never matches the
-            // prefix of `$10`.
-            let mut sql = sql.to_string();
-            for (index, value) in params.iter().enumerate().rev() {
-                sql = sql.replace(&format!("${}", index + 1), &sql_literal(kind, value));
-            }
-            sql
-        }
-        _ => {
-            let mut params = params.iter();
-            let mut rendered = String::with_capacity(sql.len());
-            for character in sql.chars() {
-                match (character, params.clone().next()) {
-                    ('?', Some(value)) => {
-                        params.next();
-                        rendered.push_str(&sql_literal(kind, value));
+/// Accepts a single statement that starts with a reading keyword. This is a
+/// guard in front of the read-only transaction, not a substitute for it:
+/// `WITH ... DELETE` and `EXPLAIN ANALYZE DELETE` pass here and are stopped by
+/// the database.
+fn check_read_only_statement(kind: DatabaseKind, text: &str) -> Result<()> {
+    let tokens = top_level_tokens(kind, text);
+    if let Some(position) = tokens.iter().position(|token| token == ";")
+        && tokens[position + 1..].iter().any(|token| token != ";")
+    {
+        bail!("read-only queries run one statement at a time");
+    }
+    let first = tokens
+        .iter()
+        .find(|token| token.as_str() != "(")
+        .map(|token| token.to_ascii_uppercase())
+        .unwrap_or_default();
+    let allowed: &[&str] = match kind {
+        DatabaseKind::Postgres => &["SELECT", "WITH", "VALUES", "TABLE", "SHOW", "EXPLAIN"],
+        _ => &["SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN"],
+    };
+    if !allowed.contains(&first.as_str()) {
+        bail!("only reading statements run here; `{first}` would need a writable query");
+    }
+    Ok(())
+}
+
+/// Splits SQL into words and punctuation outside strings, quoted
+/// identifiers and comments. Only `;`, `(` and leading words matter to the
+/// caller, so everything else is dropped.
+fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+        match character {
+            '\'' | '"' | '`' => {
+                index += 1;
+                while index < characters.len() {
+                    if characters[index] == '\\' && kind == DatabaseKind::Mysql {
+                        index += 2;
+                        continue;
                     }
-                    _ => rendered.push(character),
+                    if characters[index] == character {
+                        if characters.get(index + 1) == Some(&character) {
+                            index += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            '-' if next == Some('-') => {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
                 }
             }
-            rendered
+            '#' if kind == DatabaseKind::Mysql => {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                index += 2;
+                while index + 1 < characters.len() && !(characters[index] == '*' && characters[index + 1] == '/') {
+                    index += 1;
+                }
+                index += 2;
+            }
+            '$' if kind == DatabaseKind::Postgres => {
+                // Dollar quoting: $tag$ ... $tag$.
+                let tag_end = characters[index + 1..]
+                    .iter()
+                    .position(|candidate| !(candidate.is_alphanumeric() || *candidate == '_'))
+                    .map(|offset| index + 1 + offset);
+                match tag_end {
+                    Some(tag_end) if characters[tag_end] == '$' => {
+                        let tag = characters[index..=tag_end].iter().collect::<String>();
+                        let body_start = tag_end + 1;
+                        let rest = characters[body_start..].iter().collect::<String>();
+                        index = match rest.find(&tag) {
+                            Some(offset) => body_start + rest[..offset].chars().count() + tag.chars().count(),
+                            None => characters.len(),
+                        };
+                    }
+                    _ => index += 1,
+                }
+            }
+            ';' | '(' => {
+                tokens.push(character.to_string());
+                index += 1;
+            }
+            character if character.is_alphabetic() || character == '_' => {
+                let start = index;
+                while index < characters.len() && (characters[index].is_alphanumeric() || characters[index] == '_') {
+                    index += 1;
+                }
+                tokens.push(characters[start..index].iter().collect());
+            }
+            _ => index += 1,
         }
     }
+    tokens
 }
 
 /// Extracts the role names from a `GRANT `role`@`host` TO ...` line.
@@ -744,19 +845,18 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_params() {
-        assert_eq!(
-            inline_params(
-                DatabaseKind::Mysql,
-                "UPDATE `t` SET `a` = ? WHERE `id` = ?",
-                &[Value::Text("it's \\ ok".into()), Value::Int(7)]
-            ),
-            "UPDATE `t` SET `a` = 'it''s \\\\ ok' WHERE `id` = 7"
-        );
-        let params = (1..=11).map(Value::Int).collect::<Vec<_>>();
-        assert_eq!(
-            inline_params(DatabaseKind::Postgres, "$1 $10 $11", &params),
-            "1 10 11"
-        );
+    fn test_read_only_statement_check() {
+        let check = |text: &str| check_read_only_statement(DatabaseKind::Postgres, text);
+        assert!(check("SELECT 1").is_ok());
+        assert!(check("  -- note\n (SELECT ';' FROM t) ;  ").is_ok());
+        assert!(check("WITH x AS (SELECT 1) SELECT * FROM x").is_ok());
+        assert!(check("SELECT $$;$$").is_ok());
+        assert!(check("COMMIT; DROP TABLE seller").is_err());
+        assert!(check("SELECT 1; DELETE FROM seller").is_err());
+        assert!(check("DROP TABLE seller").is_err());
+        assert!(check("/* SELECT */ DELETE FROM seller").is_err());
+        assert!(check_read_only_statement(DatabaseKind::Mysql, "SHOW TABLES").is_ok());
+        assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 'it\\'s;' # x").is_ok());
+        assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 1 # ;\n; DROP TABLE t").is_err());
     }
 }

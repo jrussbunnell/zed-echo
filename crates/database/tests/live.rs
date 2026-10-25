@@ -149,8 +149,22 @@ async fn exercise_sql(kind: DatabaseKind, port: u16, namespace: &str) {
     assert!(attempt.is_err(), "read-only query wrote: {attempt:?}");
     let count = query(&engine, "admin", "SELECT COUNT(*) FROM seller", false).await.unwrap();
     assert!(matches!(count.rows[0][0], Value::Int(3)), "{count:?}");
-    // And the session is usable afterwards (the transaction was ended).
+    // Escapes: DDL (MySQL commits implicitly before it) and statement chains.
+    for escape in [
+        "CREATE TABLE escaped (id INT)",
+        "COMMIT; CREATE TABLE escaped (id INT)",
+        "SELECT 1; DROP TABLE property",
+        "/* SELECT */ DROP TABLE property",
+    ] {
+        assert!(query(&engine, "admin", escape, true).await.is_err(), "{escape} ran read-only");
+    }
+    let escaped = query(&engine, "admin", "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'escaped'", false).await.unwrap();
+    assert!(matches!(escaped.rows[0][0], Value::Int(0)), "{escaped:?}");
+    query(&engine, "admin", "SELECT COUNT(*) FROM property", false).await.unwrap();
+    // And the session is writable again afterwards.
     query(&engine, "admin", "SELECT 1", false).await.unwrap();
+    query(&engine, "admin", "CREATE TABLE scratch (id INT)", false).await.unwrap();
+    query(&engine, "admin", "DROP TABLE scratch", false).await.unwrap();
 
     let first = browse(&engine, "admin", &seller, Vec::new(), None, 2).await;
     assert_eq!(first.rows.rows.len(), 2);
@@ -243,8 +257,15 @@ async fn test_clickhouse() {
     assert_eq!(rows.rows.len(), 3);
     assert_eq!(rows.rows[0][0], Value::Int(1));
 
-    let attempt = query(&engine, "admin", "INSERT INTO default.events VALUES (9, 9, 'x')", true).await;
-    assert!(attempt.is_err(), "read-only query wrote: {attempt:?}");
+    for escape in [
+        "INSERT INTO default.events VALUES (9, 9, 'x')",
+        "CREATE TABLE default.escaped (id UInt8) ENGINE = Memory",
+        "INSERT INTO default.events SETTINGS readonly = 0 VALUES (9, 9, 'x')",
+    ] {
+        assert!(query(&engine, "admin", escape, true).await.is_err(), "{escape} ran read-only");
+    }
+    let count = query(&engine, "admin", "SELECT count() FROM default.events", false).await.unwrap();
+    assert_eq!(count.rows[0][0], Value::Int(3));
 
     let Response::Schema(schema) = engine
         .handle(Request::Describe { connection: "reader".into(), collection: CollectionRef::new(Some("default"), "events") })

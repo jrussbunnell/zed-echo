@@ -67,3 +67,15 @@ message GetTerminalShell {
 message GetTerminalShellResponse {
   Shell shell = 1;
 }
+
+// A database engine request, run on the host that owns the project. The
+// payload is the JSON-serialized `database::Request`, so the engine's request
+// set can grow without proto changes.
+message DatabaseRequest {
+  uint64 project_id = 1;
+  string payload = 2;
+}
+
+message DatabaseResponse {
+  string payload = 1;
+}
