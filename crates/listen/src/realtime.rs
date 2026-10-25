@@ -80,6 +80,10 @@ pub enum ServerEvent {
         item_id: String,
         transcript: String,
     },
+    /// The utterance was heard but could not be transcribed.
+    UserTranscriptFailed {
+        item_id: String,
+    },
     FunctionCall {
         call_id: String,
         name: String,
@@ -227,6 +231,9 @@ pub fn decode(frame: &str) -> Result<ServerEvent> {
                 transcript: text("transcript")?,
             }
         }
+        "conversation.item.input_audio_transcription.failed" => ServerEvent::UserTranscriptFailed {
+            item_id: text("item_id")?,
+        },
         // `arguments` is a JSON string, passed through undecoded.
         "response.function_call_arguments.done" => ServerEvent::FunctionCall {
             call_id: text("call_id")?,
@@ -317,6 +324,15 @@ mod tests {
             panic!("not a transcript delta");
         };
         assert_eq!(text, "Hi.");
+        assert_eq!(
+            decode(
+                r#"{"type":"conversation.item.input_audio_transcription.failed","item_id":"item_2","content_index":0,"error":{"message":"no speech"}}"#
+            )
+            .unwrap(),
+            ServerEvent::UserTranscriptFailed {
+                item_id: "item_2".into()
+            }
+        );
         assert_eq!(
             decode(INPUT_TRANSCRIPT).unwrap(),
             ServerEvent::UserTranscriptCompleted {

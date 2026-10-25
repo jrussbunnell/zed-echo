@@ -23,6 +23,7 @@ use listen::{
 use project::Project;
 use serde::Deserialize;
 use settings::Settings as _;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -192,14 +193,15 @@ struct Session {
     /// does, anything the model does may be that text talking, so nothing
     /// that changes a session is allowed.
     tainted: bool,
-    /// The first utterance Joshua started after the taint. Only its own
-    /// transcript can lift it: speech already under way when the taint
-    /// arrived, and its late transcript, do not count.
-    trust_item: Option<String>,
-    /// That utterance stopped, but whether it was words or a cough is known only
-    /// from its transcript, which can arrive after the model has already
-    /// acted on it. Calls that need trust are held until then.
-    trust_pending: bool,
+    /// Every utterance Joshua started after the taint. Only their transcripts
+    /// can lift it: speech already under way when the taint arrived, and its
+    /// late transcript, do not count. All of them, not just the first, so a
+    /// transcript that never arrives can't leave trust lost for good.
+    trust_items: HashSet<String>,
+    /// Those of them that stopped. Whether one was words or a cough is known
+    /// only from its transcript, which can arrive after the model has already
+    /// acted on it, so calls that need trust are held while any is waiting.
+    pending_trust_items: HashSet<String>,
     held_calls: Vec<(String, String, String)>,
     /// The response that made the held calls ended; the model is asked for
     /// the next one once their outputs are sent.
@@ -210,9 +212,9 @@ struct Session {
     outputs_await_response: bool,
     approvals: ApprovalGate,
     read_back: ReadBack,
-    /// The first utterance Joshua started after the read-back was heard; only
-    /// its transcript answers it.
-    read_back_reply_item: Option<String>,
+    /// Utterances Joshua started after the read-back was heard; the first of
+    /// them with words answers it.
+    read_back_reply_items: HashSet<String>,
     /// The sanitized title of the session read back, for the note that says
     /// how it was answered. The description is the agent's words and is not
     /// repeated there.
@@ -250,8 +252,8 @@ impl Session {
 
     fn mark_tainted(&mut self) {
         self.tainted = true;
-        self.trust_item = None;
-        self.trust_pending = false;
+        self.trust_items.clear();
+        self.pending_trust_items.clear();
     }
 
     /// Answers every held call "Ask Joshua first." at once: trust can't come
@@ -624,15 +626,15 @@ impl VoiceMode {
             state_key: state_key(&sessions),
             // Nothing may act until Joshua has spoken.
             tainted: true,
-            trust_item: None,
-            trust_pending: false,
+            trust_items: HashSet::default(),
+            pending_trust_items: HashSet::default(),
             held_calls: Vec::new(),
             follow_up_after_release: false,
             _hold_timeout: None,
             outputs_await_response: false,
             approvals: ApprovalGate::default(),
             read_back: ReadBack::None,
-            read_back_reply_item: None,
+            read_back_reply_items: HashSet::default(),
             read_back_title: String::new(),
             goodbye_said: false,
             sidecar: None,
@@ -752,11 +754,11 @@ impl VoiceMode {
                 self.start_microphone(cx);
             }
             ServerEvent::SpeechStarted { item_id } => {
-                if session.tainted && session.trust_item.is_none() {
-                    session.trust_item = Some(item_id.clone());
+                if session.tainted {
+                    session.trust_items.insert(item_id.clone());
                 }
-                if session.read_back == ReadBack::Heard && session.read_back_reply_item.is_none() {
-                    session.read_back_reply_item = Some(item_id);
+                if session.read_back == ReadBack::Heard {
+                    session.read_back_reply_items.insert(item_id);
                 }
                 // Barge-in: silence Echo at once, and tell the model how much
                 // of its reply was actually heard.
@@ -790,32 +792,15 @@ impl VoiceMode {
                 item_id,
                 transcript: text,
             } => {
-                if session.trust_item.as_ref() == Some(&item_id) {
-                    session.trust_item = None;
-                    session.trust_pending = false;
-                    if !text.trim().is_empty() {
-                        session.tainted = false;
-                    }
-                    if !session.held_calls.is_empty() {
-                        self.release_held_calls(cx);
-                    }
-                }
-                let Some(session) = self.session.as_mut() else {
-                    return;
-                };
-                // Only speech that began after the read-back was heard can
-                // answer it; a reply already under way when it was spoken
-                // was not a reply to it.
-                if session.read_back_reply_item.as_ref() == Some(&item_id) {
-                    session.read_back_reply_item = None;
-                    session.read_back = ReadBack::None;
-                    self.answer_read_back(&text, cx);
-                }
+                self.handle_transcript(&item_id, Some(&text), cx);
                 let Some(session) = self.session.as_mut() else {
                     return;
                 };
                 session.caption_is_echo = false;
                 self.show_caption(text.into(), cx);
+            }
+            ServerEvent::UserTranscriptFailed { item_id } => {
+                self.handle_transcript(&item_id, None, cx);
             }
             ServerEvent::ResponseDone => {
                 session.caption_is_echo = false;
@@ -851,13 +836,54 @@ impl VoiceMode {
                 arguments,
             } => self.handle_function_call(call_id, name, arguments, cx),
             ServerEvent::SpeechStopped { item_id } => {
-                if session.trust_item.as_ref() == Some(&item_id) {
-                    session.trust_pending = true;
+                if session.trust_items.contains(&item_id) {
+                    session.pending_trust_items.insert(item_id);
                 }
             }
             ServerEvent::Other => {}
         }
         cx.notify();
+    }
+
+    /// What one of Joshua's utterances turned out to be: `None` when its
+    /// transcription failed, which counts as no words.
+    fn handle_transcript(&mut self, item_id: &str, words: Option<&str>, cx: &mut Context<Self>) {
+        let spoke = words.is_some_and(|words| !words.trim().is_empty());
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if session.trust_items.contains(item_id) {
+            if spoke {
+                session.tainted = false;
+                session.trust_items.clear();
+                session.pending_trust_items.clear();
+            } else {
+                session.trust_items.remove(item_id);
+                session.pending_trust_items.remove(item_id);
+            }
+            // Held calls wait while any utterance might still restore trust.
+            if session.pending_trust_items.is_empty() && !session.held_calls.is_empty() {
+                self.release_held_calls(cx);
+            }
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        // Only speech that began after the read-back was heard can answer
+        // it; a reply already under way when it was spoken was not a reply
+        // to it.
+        if session.read_back_reply_items.contains(item_id) {
+            match words.filter(|_| spoke) {
+                Some(words) => {
+                    session.read_back_reply_items.clear();
+                    session.read_back = ReadBack::None;
+                    self.answer_read_back(words, cx);
+                }
+                None => {
+                    session.read_back_reply_items.remove(item_id);
+                }
+            }
+        }
     }
 
     /// Answers the calls held for Joshua's transcript: run as usual if it
@@ -919,7 +945,7 @@ impl VoiceMode {
     ) {
         if let Some(session) = self.session.as_mut()
             && session.tainted
-            && session.trust_pending
+            && !session.pending_trust_items.is_empty()
             && needs_trust(&name, &arguments)
         {
             session.held_calls.push((call_id, name, arguments));
@@ -927,8 +953,10 @@ impl VoiceMode {
                 session._hold_timeout = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(HOLD_TIMEOUT).await;
                     this.update(cx, |this, cx| {
+                        // The items stay eligible: a late transcript can still
+                        // restore trust, just not for these calls.
                         if let Some(session) = this.session.as_mut() {
-                            session.trust_pending = false;
+                            session.pending_trust_items.clear();
                         }
                         this.release_held_calls(cx);
                     })
@@ -1154,7 +1182,7 @@ impl VoiceMode {
                     .map(sanitize)
                     .unwrap_or_else(|| "run a tool".into());
                 session.read_back = ReadBack::Sent;
-                session.read_back_reply_item = None;
+                session.read_back_reply_items.clear();
                 session.read_back_title = title.clone();
                 // The description is the agent's own words.
                 session.taint();
@@ -3041,6 +3069,93 @@ mod tests {
             setup.realtime.sent().last(),
             Some(&ClientEvent::ResponseCreate)
         );
+    }
+
+    fn transcription_failed(item_id: &str) -> ServerEvent {
+        ServerEvent::UserTranscriptFailed {
+            item_id: item_id.into(),
+        }
+    }
+
+    #[gpui::test]
+    async fn a_lost_transcript_does_not_stop_later_speech_restoring_trust(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_thread(
+            &mut setup,
+            acp_thread::StubAgentConnection::new(),
+            "Fix booking",
+        );
+        open_live(&mut setup);
+
+        // One utterance's transcript never arrives; another's fails.
+        emit(&mut setup, started("lost"));
+        emit(&mut setup, stopped("lost"));
+        call(
+            &mut setup,
+            "c1",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+        assert_eq!(outputs(&setup, "c1"), Vec::<String>::new(), "held");
+        setup.cx.executor().advance_clock(HOLD_TIMEOUT);
+        setup.cx.run_until_parked();
+        assert_eq!(output(&setup, "c1"), "Ask Joshua first.");
+        emit(&mut setup, started("failed"));
+        emit(&mut setup, stopped("failed"));
+        emit(&mut setup, transcription_failed("failed"));
+
+        joshua_says(&mut setup, "stop the booking one");
+        call(
+            &mut setup,
+            "c2",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+        assert_eq!(output(&setup, "c2"), "Stopped Fix booking.");
+    }
+
+    #[gpui::test]
+    async fn a_held_call_waits_for_any_utterance_still_being_transcribed(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_thread(
+            &mut setup,
+            acp_thread::StubAgentConnection::new(),
+            "Fix booking",
+        );
+        open_live(&mut setup);
+
+        emit(&mut setup, started("first"));
+        emit(&mut setup, stopped("first"));
+        emit(&mut setup, started("second"));
+        emit(&mut setup, stopped("second"));
+        call(
+            &mut setup,
+            "c1",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+        emit(&mut setup, transcription_failed("first"));
+        assert_eq!(outputs(&setup, "c1"), Vec::<String>::new(), "still held");
+
+        emit(&mut setup, transcript("second", "stop the booking one"));
+        assert_eq!(output(&setup, "c1"), "Stopped Fix booking.");
+    }
+
+    #[gpui::test]
+    async fn a_lost_yes_can_be_said_again(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let (thread_view, _connection) = open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        joshua_says(&mut setup, "approve it");
+        read_back(&mut setup, "c1", "booking");
+
+        // The reply's transcript never arrives.
+        emit(&mut setup, started("lost"));
+        emit(&mut setup, stopped("lost"));
+        assert!(is_blocked(&thread_view, &setup.cx));
+
+        joshua_says(&mut setup, "yes");
+        assert!(!is_blocked(&thread_view, &setup.cx));
     }
 
     #[gpui::test]
