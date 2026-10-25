@@ -60,6 +60,10 @@ const SIDECAR_ANSWER_LIMIT: usize = 1200;
 /// that would restore it.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a read-back that was heard waits for Joshua's answer before it
+/// counts as a no.
+const READ_BACK_WINDOW: Duration = Duration::from_secs(15);
+
 /// Said in place of acting when a response was not prompted by Joshua.
 const ASK_JOSHUA_FIRST: &str = "Ask Joshua first.";
 
@@ -124,6 +128,18 @@ enum Response {
     /// Asked for, but not yet confirmed as started.
     Requested,
     Running,
+}
+
+/// A call that needs trust, made while Joshua's last words were still being
+/// transcribed.
+struct HeldCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+    /// The utterances pending when it was held. Only words from one of these
+    /// can vouch for it: speech that began after the model made the call
+    /// can't have asked for it.
+    waits_on: HashSet<String>,
 }
 
 /// One line of the conversation, kept to remind a reconnected session.
@@ -289,7 +305,7 @@ struct Session {
     /// only from its transcript, which can arrive after the model has already
     /// acted on it, so calls that need trust are held while any is waiting.
     pending_trust_items: HashSet<String>,
-    held_calls: Vec<(String, String, String)>,
+    held_calls: Vec<HeldCall>,
     /// The response that made the held calls ended; the model is asked for
     /// the next one once their outputs are sent.
     follow_up_after_release: bool,
@@ -302,6 +318,8 @@ struct Session {
     /// Utterances Joshua started after the read-back was heard; the first of
     /// them with words answers it.
     read_back_reply_items: HashSet<String>,
+    /// Declines a heard read-back nobody answered in time.
+    _read_back_window: Option<Task<()>>,
     /// The sanitized title of the session read back, for the note that says
     /// how it was answered. The description is the agent's words and is not
     /// repeated there.
@@ -328,9 +346,12 @@ struct Session {
     last_running: Instant,
     /// The last few exchanges, oldest first.
     recent: VecDeque<Turn>,
-    /// Appended to the instructions after a reconnect, so every later
-    /// session update keeps it.
-    recap: String,
+    /// Sent as a note once the reconnected session is created. It repeats
+    /// Echo's words, which agents' notes shaped, so it stays out of the
+    /// instructions.
+    pending_recap: Option<String>,
+    /// Notes that arrived while there was no connection to send them on.
+    queued_notes: Vec<String>,
     reconnected_at: Option<Instant>,
     feed: Feed,
     watched: HashMap<EntityId, WatchedThread>,
@@ -369,9 +390,9 @@ impl Session {
             return false;
         }
         self._hold_timeout = None;
-        for (call_id, _, _) in std::mem::take(&mut self.held_calls) {
+        for held in std::mem::take(&mut self.held_calls) {
             self.send(ClientEvent::FunctionOutput {
-                call_id,
+                call_id: held.call_id,
                 output: ASK_JOSHUA_FIRST.into(),
             });
         }
@@ -397,7 +418,10 @@ impl Session {
     /// The server rejects a second response while one is active, so one
     /// wanted then is asked for when the active one ends.
     fn request_response(&mut self) {
-        if self.response != Response::Idle {
+        // Before the session exists the request would be lost, or answered
+        // without its instructions; it is asked for once the session is
+        // created.
+        if self.response != Response::Idle || !self.connected() {
             self.response_owed = true;
             return;
         }
@@ -406,6 +430,20 @@ impl Session {
         self.send(ClientEvent::ResponseCreate);
         if self.read_back == ReadBack::Sent {
             self.read_back = ReadBack::Speaking;
+        }
+    }
+
+    /// Whether the server has created the session events are sent to.
+    fn connected(&self) -> bool {
+        self.sender.is_some() && self.state != VoiceModeState::Connecting
+    }
+
+    /// Sends a note's text, or keeps it until the session is created.
+    fn send_text(&mut self, text: String) {
+        if self.connected() {
+            self.send(ClientEvent::UserText(text));
+        } else {
+            self.queued_notes.push(text);
         }
     }
 
@@ -596,7 +634,7 @@ impl VoiceMode {
         };
         session.mark_tainted();
         let follow_up_owed = session.refuse_held_calls();
-        session.send(ClientEvent::UserText(text));
+        session.send_text(text);
         if follow_up_owed {
             session.follow_up();
         } else if speak {
@@ -606,7 +644,7 @@ impl VoiceMode {
 
     fn send_outcome_note(&mut self, text: String) {
         if let Some(session) = self.session.as_mut() {
-            session.send(ClientEvent::UserText(text));
+            session.send_text(text);
             session.respond_to_note();
         }
     }
@@ -743,6 +781,7 @@ impl VoiceMode {
             approvals: ApprovalGate::default(),
             read_back: ReadBack::None,
             read_back_reply_items: HashSet::default(),
+            _read_back_window: None,
             read_back_title: String::new(),
             goodbye_said: false,
             sidecar: None,
@@ -771,7 +810,8 @@ impl VoiceMode {
             last_any_speech: now,
             last_running: now,
             recent: VecDeque::new(),
-            recap: String::new(),
+            pending_recap: None,
+            queued_notes: Vec::new(),
             reconnected_at: None,
             feed: Feed::new(chattiness),
             watched,
@@ -867,10 +907,15 @@ impl VoiceMode {
         session.read_back = ReadBack::None;
         session.read_back_reply_items.clear();
         session.approvals = ApprovalGate::default();
+        session._read_back_window = None;
+        session.last_error = None;
+        session.last_user_speech = now;
+        session.last_any_speech = now;
+        session.last_running = now;
         // The recap repeats Echo's words, which agents' notes shaped.
         session.mark_tainted();
-        session.recap = recap(&session.recent);
-        session.config.instructions = format!("{}{}", instructions(&sessions), session.recap);
+        session.pending_recap = recap(&session.recent);
+        session.config.instructions = instructions(&sessions);
         session.state_key = state_key(&sessions);
         let provider = session.provider.clone();
         let config = session.config.clone();
@@ -1072,6 +1117,19 @@ impl VoiceMode {
         match event {
             ServerEvent::SessionCreated => {
                 session.state = VoiceModeState::Live;
+                session.response = Response::Idle;
+                if let Some(recap) = session.pending_recap.take() {
+                    self.send_note(recap, false);
+                }
+                let Some(session) = self.session.as_mut() else {
+                    return;
+                };
+                for note in std::mem::take(&mut session.queued_notes) {
+                    session.send(ClientEvent::UserText(note));
+                }
+                if session.response_owed {
+                    session.request_response();
+                }
                 self.start_microphone(cx);
             }
             ServerEvent::SpeechStarted { item_id } => {
@@ -1145,6 +1203,11 @@ impl VoiceMode {
                 } else {
                     if session.read_back == ReadBack::Speaking {
                         session.read_back = ReadBack::Heard;
+                        session._read_back_window = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(READ_BACK_WINDOW).await;
+                            this.update(cx, |this, cx| this.decline_unanswered_read_back(cx))
+                                .log_err();
+                        }));
                     }
                     if session.state == VoiceModeState::Closing {
                         session.goodbye_said = true;
@@ -1207,11 +1270,8 @@ impl VoiceMode {
                 session.trust_items.remove(item_id);
                 session.pending_trust_items.remove(item_id);
             }
-            // Held calls wait while any utterance might still restore trust.
-            if session.pending_trust_items.is_empty() && !session.held_calls.is_empty() {
-                self.release_held_calls(cx);
-            }
         }
+        self.resolve_held_calls(item_id, spoke, cx);
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1223,6 +1283,7 @@ impl VoiceMode {
                 Some(words) => {
                     session.read_back_reply_items.clear();
                     session.read_back = ReadBack::None;
+                    session._read_back_window = None;
                     self.answer_read_back(words, cx);
                 }
                 None => {
@@ -1232,32 +1293,48 @@ impl VoiceMode {
         }
     }
 
-    /// Answers the calls held for Joshua's transcript: run as usual if it
-    /// restored trust, refused if not.
-    fn release_held_calls(&mut self, cx: &mut Context<Self>) {
+    /// Settles the held calls that were waiting on `item_id`: words run
+    /// them, and a call none of whose utterances held words is refused.
+    fn resolve_held_calls(&mut self, item_id: &str, spoke: bool, cx: &mut Context<Self>) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        session._hold_timeout = None;
-        let held = std::mem::take(&mut session.held_calls);
-        for (call_id, name, arguments) in held {
+        let mut settled = Vec::new();
+        for mut held in std::mem::take(&mut session.held_calls) {
+            if !held.waits_on.contains(item_id) {
+                session.held_calls.push(held);
+            } else if spoke {
+                settled.push((held, true));
+            } else {
+                held.waits_on.remove(item_id);
+                if held.waits_on.is_empty() {
+                    settled.push((held, false));
+                } else {
+                    session.held_calls.push(held);
+                }
+            }
+        }
+        if session.held_calls.is_empty() {
+            session._hold_timeout = None;
+        }
+        for (held, vouched_for) in settled {
             let Some(session) = self.session.as_mut() else {
                 return;
             };
-            if session.tainted {
+            if vouched_for && !session.tainted {
+                self.handle_function_call(held.call_id, held.name, held.arguments, cx);
+            } else {
                 session.send(ClientEvent::FunctionOutput {
-                    call_id,
+                    call_id: held.call_id,
                     output: ASK_JOSHUA_FIRST.into(),
                 });
                 session.outputs_await_response = true;
-            } else {
-                self.handle_function_call(call_id, name, arguments, cx);
             }
         }
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        if std::mem::take(&mut session.follow_up_after_release) {
+        if session.held_calls.is_empty() && std::mem::take(&mut session.follow_up_after_release) {
             session.follow_up();
         }
     }
@@ -1281,7 +1358,7 @@ impl VoiceMode {
             return;
         }
         session.state_key = key;
-        session.config.instructions = format!("{}{}", instructions(&sessions), session.recap);
+        session.config.instructions = instructions(&sessions);
         session.send(ClientEvent::SessionUpdate(session.config.clone()));
     }
 
@@ -1300,17 +1377,25 @@ impl VoiceMode {
             && !session.pending_trust_items.is_empty()
             && needs_trust(&name, &arguments)
         {
-            session.held_calls.push((call_id, name, arguments));
+            let waits_on = session.pending_trust_items.clone();
+            session.held_calls.push(HeldCall {
+                call_id,
+                name,
+                arguments,
+                waits_on,
+            });
             if session._hold_timeout.is_none() {
                 session._hold_timeout = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(HOLD_TIMEOUT).await;
-                    this.update(cx, |this, cx| {
+                    this.update(cx, |this, _| {
                         // The items stay eligible: a late transcript can still
                         // restore trust, just not for these calls.
                         if let Some(session) = this.session.as_mut() {
                             session.pending_trust_items.clear();
+                            if session.refuse_held_calls() {
+                                session.follow_up();
+                            }
                         }
-                        this.release_held_calls(cx);
                     })
                     .log_err();
                 }));
@@ -1535,6 +1620,7 @@ impl VoiceMode {
                     .unwrap_or_else(|| "run a tool".into());
                 session.read_back = ReadBack::Sent;
                 session.read_back_reply_items.clear();
+                session._read_back_window = None;
                 session.read_back_title = title.clone();
                 // The description is the agent's own words.
                 session.taint();
@@ -1582,6 +1668,28 @@ impl VoiceMode {
 
     /// Joshua's first words after hearing a read-back decide it.
     fn answer_read_back(&mut self, transcript: &str, cx: &mut Context<Self>) {
+        let wake_word = listen::ListenSettings::get_global(cx).wake_word.clone();
+        let affirmative = answer_to_confirmation(&listen::parse_intent(transcript, &wake_word))
+            == ConfirmationAnswer::Granted;
+        self.resolve_read_back(affirmative, cx);
+    }
+
+    /// A read-back left unanswered is a no: an approval must not stay open
+    /// for whatever Joshua says much later about something else.
+    fn decline_unanswered_read_back(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        session._read_back_window = None;
+        if session.read_back != ReadBack::Heard {
+            return;
+        }
+        session.read_back = ReadBack::None;
+        session.read_back_reply_items.clear();
+        self.resolve_read_back(false, cx);
+    }
+
+    fn resolve_read_back(&mut self, affirmative: bool, cx: &mut Context<Self>) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1595,9 +1703,6 @@ impl VoiceMode {
         let still_pending = thread_view.as_ref().is_some_and(|thread_view| {
             pending_tool_call(thread_view, cx).as_ref() == Some(&awaiting.tool_call_id)
         });
-        let wake_word = listen::ListenSettings::get_global(cx).wake_word.clone();
-        let affirmative = answer_to_confirmation(&listen::parse_intent(transcript, &wake_word))
-            == ConfirmationAnswer::Granted;
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1938,9 +2043,9 @@ fn first_sentence(text: &str) -> &str {
     text.get(..end).unwrap_or(text).trim()
 }
 
-fn recap(recent: &VecDeque<Turn>) -> String {
+fn recap(recent: &VecDeque<Turn>) -> Option<String> {
     if recent.is_empty() {
-        return String::new();
+        return None;
     }
     let lines = recent
         .iter()
@@ -1950,9 +2055,9 @@ fn recap(recent: &VecDeque<Turn>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "\n\nThe connection dropped and was restored. The conversation so far ended with:\n{lines}"
-    )
+    Some(format!(
+        "[the connection dropped and was restored; the conversation so far ended with:\n{lines}]"
+    ))
 }
 
 fn follow_active_project(
@@ -3611,6 +3716,57 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_sentence_started_after_a_call_was_held_does_not_release_it(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        hold_a_call_after_a_sound(&mut setup);
+
+        // Joshua starts talking only after the model made the call.
+        emit(&mut setup, started("later"));
+        emit(&mut setup, stopped("later"));
+        emit(&mut setup, transcript("later", "stop the booking one"));
+        assert_eq!(outputs(&setup, "c1"), Vec::<String>::new(), "still held");
+
+        // It restores trust for the calls that follow it.
+        call(
+            &mut setup,
+            "c3",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+        assert_eq!(output(&setup, "c3"), "Stopped Fix booking.");
+
+        // The held call's own utterance turns out to have no words.
+        emit(&mut setup, transcription_failed("utterance"));
+        assert_eq!(output(&setup, "c1"), "Ask Joshua first.");
+    }
+
+    #[gpui::test]
+    async fn an_unanswered_read_back_is_declined_after_fifteen_seconds(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let (thread_view, _connection) = open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        joshua_says(&mut setup, "approve it");
+        read_back(&mut setup, "c1", "booking");
+        let declined = "[not approved for Fix booking]".to_string();
+
+        // Replies without words don't answer it.
+        emit(&mut setup, started("cough"));
+        emit(&mut setup, stopped("cough"));
+        emit(&mut setup, transcript("cough", " "));
+        emit(&mut setup, started("lost"));
+        emit(&mut setup, stopped("lost"));
+        emit(&mut setup, transcription_failed("lost"));
+        after(&mut setup, READ_BACK_WINDOW - Duration::from_secs(1));
+        assert!(!notes(&setup).contains(&declined));
+
+        after(&mut setup, Duration::from_secs(1));
+        assert!(notes(&setup).contains(&declined), "{:?}", notes(&setup));
+
+        joshua_says(&mut setup, "yes");
+        assert!(is_blocked(&thread_view, &setup.cx), "too late to approve");
+    }
+
+    #[gpui::test]
     async fn a_lost_yes_can_be_said_again(cx: &mut TestAppContext) {
         let mut setup = setup(cx).await;
         let (thread_view, _connection) = open_blocked_thread(&mut setup, "Fix booking");
@@ -4176,46 +4332,101 @@ mod tests {
         assert!(!is_open(&setup));
     }
 
-    #[gpui::test]
-    async fn one_drop_reconnects_with_the_recent_exchanges(cx: &mut TestAppContext) {
-        let mut setup = setup(cx).await;
-        open_live(&mut setup);
-        joshua_says(&mut setup, "what is the booking one doing");
+    const RECAP: &str = "[the connection dropped and was restored; the conversation so far ended with:\nJoshua: what is the booking one doing\nEcho: It is running the migration.]";
+
+    /// One exchange, then the socket drops and voice mode reconnects.
+    fn talk_then_drop(setup: &mut Setup) {
+        open_live(setup);
+        joshua_says(setup, "what is the booking one doing");
         emit(
-            &mut setup,
+            setup,
             ServerEvent::AssistantTranscriptDelta("It is running ".into()),
         );
         emit(
-            &mut setup,
+            setup,
             ServerEvent::AssistantTranscriptDelta("the migration.".into()),
         );
-        emit(&mut setup, ServerEvent::ResponseDone);
-        assert!(!tainted(&setup));
+        emit(setup, ServerEvent::ResponseDone);
+        assert!(!tainted(setup));
 
         setup.realtime.drop_connection();
         setup.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn one_drop_reconnects_with_the_recent_exchanges(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        talk_then_drop(&mut setup);
 
         assert_eq!(setup.realtime.connections(), 2);
-        let configs = setup.realtime.configs();
-        let instructions = &configs[1].instructions;
-        assert!(
-            instructions.contains("Joshua: what is the booking one doing"),
-            "{instructions}"
-        );
-        assert!(
-            instructions.contains("Echo: It is running the migration."),
-            "{instructions}"
-        );
         assert_eq!(state(&setup), Some(VoiceModeState::Connecting));
-        assert!(tainted(&setup), "Echo's recalled words are not Joshua's");
-
         emit(&mut setup, ServerEvent::SessionCreated);
         assert_eq!(state(&setup), Some(VoiceModeState::Live));
         assert_eq!(setup.microphones_opened.get(), 2);
+        assert_eq!(notes(&setup).last(), Some(&RECAP.to_string()));
         setup.cx.update(|_, cx| VoiceMode::note("[after]", cx));
         setup.cx.run_until_parked();
         assert!(notes(&setup).contains(&"[after]".to_string()));
         assert!(!has_toast(&setup));
+    }
+
+    #[gpui::test]
+    async fn the_reconnect_recap_is_a_note_not_instructions(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        talk_then_drop(&mut setup);
+
+        let configs = setup.realtime.configs();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[1].instructions, configs[0].instructions);
+        assert!(tainted(&setup), "Echo's recalled words are not Joshua's");
+
+        let before = setup.realtime.sent().len();
+        emit(&mut setup, ServerEvent::SessionCreated);
+        assert_eq!(
+            setup.realtime.sent()[before..],
+            [ClientEvent::UserText(RECAP.into())],
+            "only the recap, and no response asked for"
+        );
+        assert!(tainted(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_note_during_reconnect_is_delivered_and_approvals_still_speak(
+        cx: &mut TestAppContext,
+    ) {
+        let mut setup = setup(cx).await;
+        let (thread_view, _connection) = open_thread_that_will_block(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        setup
+            .cx
+            .update(|_, cx| VoiceMode::note("[sidecar answer: it is fine]", cx));
+        setup.cx.run_until_parked();
+        let before = setup.realtime.sent().len();
+
+        emit(&mut setup, ServerEvent::SessionCreated);
+        assert_eq!(
+            setup.realtime.sent()[before..],
+            [
+                ClientEvent::UserText("[sidecar answer: it is fine]".into()),
+                ClientEvent::ResponseCreate,
+            ]
+        );
+        emit(&mut setup, ServerEvent::ResponseCreated);
+        emit(&mut setup, ServerEvent::ResponseDone);
+
+        block(&mut setup, &thread_view);
+        after(&mut setup, FEED_POLL);
+        let sent = setup.realtime.sent();
+        let approval = sent
+            .iter()
+            .position(|event| {
+                matches!(event, ClientEvent::UserText(text) if text.starts_with("[Fix booking needs approval"))
+            })
+            .unwrap_or_else(|| panic!("the approval was sent: {:?}", notes(&setup)));
+        assert_eq!(sent.get(approval + 1), Some(&ClientEvent::ResponseCreate));
     }
 
     #[gpui::test]
