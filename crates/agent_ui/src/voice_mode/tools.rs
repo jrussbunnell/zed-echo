@@ -319,12 +319,22 @@ impl ApprovalGate {
         self.awaiting.as_ref()
     }
 
-    /// Whether a call for `session_id` and `decision` is about the read-back
-    /// already made, so it can only learn how that went and change nothing.
-    pub fn concerns(&self, session_id: &acp::SessionId, decision: Decision) -> bool {
-        let matches = |key: &ApprovalKey| key.session_id == *session_id && key.decision == decision;
-        self.awaiting.as_ref().is_some_and(matches)
-            || self.resolved.as_ref().is_some_and(|(key, _)| matches(key))
+    /// Whether a call is about exactly the read-back already made (same
+    /// session, same pending tool call, same decision), so it can only learn
+    /// how that went and can never start a read-back of its own.
+    pub fn concerns(
+        &self,
+        session_id: &acp::SessionId,
+        pending: Option<&acp::ToolCallId>,
+        decision: Decision,
+    ) -> bool {
+        let same = |key: &ApprovalKey| key.session_id == *session_id && key.decision == decision;
+        self.awaiting
+            .as_ref()
+            .is_some_and(|key| same(key) && pending == Some(&key.tool_call_id))
+            || self.resolved.as_ref().is_some_and(|(key, _)| {
+                same(key) && pending.is_none_or(|pending| *pending == key.tool_call_id)
+            })
     }
 
     /// The model asks to answer `session_id`'s prompt; `pending` is the tool
@@ -658,5 +668,23 @@ mod tests {
             GateOutcome::Apply
         );
         assert_eq!(gate.awaiting(), None);
+    }
+
+    #[test]
+    fn only_the_exact_read_back_call_is_its_concern() {
+        let mut gate = ApprovalGate::default();
+        let s = session("s");
+        let (a, b) = (call("a"), call("b"));
+        gate.request(&s, Some(&a), Decision::AllowOnce);
+        assert!(gate.concerns(&s, Some(&a), Decision::AllowOnce));
+        assert!(!gate.concerns(&s, Some(&b), Decision::AllowOnce));
+        assert!(!gate.concerns(&s, None, Decision::AllowOnce));
+        assert!(!gate.concerns(&s, Some(&a), Decision::AllowAlways));
+        assert!(!gate.concerns(&session("t"), Some(&a), Decision::AllowOnce));
+
+        gate.answer(true, true);
+        assert!(gate.concerns(&s, None, Decision::AllowOnce));
+        assert!(gate.concerns(&s, Some(&a), Decision::AllowOnce));
+        assert!(!gate.concerns(&s, Some(&b), Decision::AllowOnce));
     }
 }

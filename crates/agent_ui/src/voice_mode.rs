@@ -183,12 +183,14 @@ struct Session {
     /// re-sent when something worth telling changed.
     state_key: StateKey,
     /// Agent-written text (a note, a peek, a read-back) entered the model's
-    /// context since Joshua last finished speaking. Until he speaks again,
-    /// anything the model does may be that text talking, so nothing that
-    /// changes a session is allowed.
+    /// context since Joshua last spoke, or he has not spoken yet. Until he
+    /// does, anything the model does may be that text talking, so nothing
+    /// that changes a session is allowed.
     tainted: bool,
-    /// Joshua started speaking after the taint; his finished transcript
-    /// lifts it. Speech already under way when the taint arrived does not.
+    /// Joshua started speaking after the taint; when that speech stops, the
+    /// taint is lifted. Speech already under way when it arrived does not
+    /// count. The transcript is not waited for: it can arrive after the
+    /// model has already acted on what he said.
     speech_after_taint: bool,
     /// Function outputs were sent during the response in progress; the model
     /// answers them only when asked for another response once it ends.
@@ -377,9 +379,27 @@ impl VoiceMode {
         voice_mode.update(cx, |voice_mode, _| voice_mode.send_note(text.to_string()));
     }
 
+    /// Echo's own report of how an approval went. The words are Rust's, so
+    /// unlike a session note it does not cost Joshua's trust.
+    fn outcome_note(text: String, cx: &mut App) {
+        let Some(voice_mode) = cx
+            .try_global::<GlobalVoiceMode>()
+            .map(|global| global.0.clone())
+        else {
+            return;
+        };
+        voice_mode.update(cx, |voice_mode, _| voice_mode.send_outcome_note(text));
+    }
+
     fn send_note(&mut self, text: String) {
         if let Some(session) = self.session.as_mut() {
             session.taint();
+        }
+        self.send_outcome_note(text);
+    }
+
+    fn send_outcome_note(&mut self, text: String) {
+        if let Some(session) = self.session.as_mut() {
             session.send(ClientEvent::UserText(text));
             session.send(ClientEvent::ResponseCreate);
         }
@@ -534,7 +554,8 @@ impl VoiceMode {
             last_error: None,
             config,
             state_key: state_key(&sessions),
-            tainted: false,
+            // Nothing may act until Joshua has spoken.
+            tainted: true,
             speech_after_taint: false,
             outputs_await_response: false,
             approvals: ApprovalGate::default(),
@@ -694,10 +715,6 @@ impl VoiceMode {
                 self.show_caption(text.into(), cx);
             }
             ServerEvent::UserTranscriptCompleted(text) => {
-                if session.speech_after_taint {
-                    session.tainted = false;
-                    session.speech_after_taint = false;
-                }
                 // Only speech that began after the read-back was heard can
                 // answer it; a reply already under way when it was spoken
                 // was not a reply to it.
@@ -747,7 +764,13 @@ impl VoiceMode {
                 name,
                 arguments,
             } => self.handle_function_call(call_id, name, arguments, cx),
-            ServerEvent::SpeechStopped | ServerEvent::Other => {}
+            ServerEvent::SpeechStopped => {
+                if session.speech_after_taint {
+                    session.tainted = false;
+                    session.speech_after_taint = false;
+                }
+            }
+            ServerEvent::Other => {}
         }
         cx.notify();
     }
@@ -821,6 +844,14 @@ impl VoiceMode {
                 if sessions.is_empty() {
                     ("No sessions are open.".into(), None)
                 } else {
+                    // Activity and approval descriptions are tool labels the
+                    // agent wrote; titles and statuses alone are not.
+                    let carries_agent_text = sessions.iter().any(|live| {
+                        live.summary.activity.is_some() || live.summary.pending_approval.is_some()
+                    });
+                    if carries_agent_text && let Some(session) = self.session.as_mut() {
+                        session.taint();
+                    }
                     (state_block(&summaries(&sessions)), None)
                 }
             }
@@ -963,16 +994,16 @@ impl VoiceMode {
             Ok(live) => live,
             Err(error) => return (error, None),
         };
+        let pending = pending_tool_call(&live.thread_view, cx);
         let about_the_read_back = self.session.as_ref().is_some_and(|session| {
             session
                 .approvals
-                .concerns(&live.summary.session_id, decision)
+                .concerns(&live.summary.session_id, pending.as_ref(), decision)
         });
         if decision != Decision::Reject && !prompted_by_joshua && !about_the_read_back {
             return (ASK_JOSHUA_FIRST.into(), None);
         }
         let title = sanitize(&live.summary.title);
-        let pending = pending_tool_call(&live.thread_view, cx);
         let Some(session) = self.session.as_mut() else {
             return ("Error: voice mode is closed.".into(), None);
         };
@@ -1026,7 +1057,7 @@ impl VoiceMode {
                     format!("Rejected in {title}."),
                     Some(Box::new(move |cx: &mut App| {
                         if authorize_exactly(&thread_view, &key, cx).is_none() {
-                            VoiceMode::note(
+                            VoiceMode::outcome_note(
                                 format!("[{title}: that prompt was answered some other way]"),
                                 cx,
                             );
@@ -1061,11 +1092,14 @@ impl VoiceMode {
         let description = std::mem::take(&mut session.read_back_description);
         match session.approvals.answer(affirmative, still_pending) {
             None => {}
+            Some(Answer::AlreadyAnswered) if thread_view.is_none() => {
+                self.send_outcome_note(format!("[no longer waiting: {description}]"));
+            }
             Some(Answer::AlreadyAnswered) => {
-                self.send_note(format!("[already answered: {description}]"));
+                self.send_outcome_note(format!("[already answered: {description}]"));
             }
             Some(Answer::NotApproved(_)) => {
-                self.send_note(format!("[not approved: {description}]"));
+                self.send_outcome_note(format!("[not approved: {description}]"));
             }
             Some(Answer::Approved(key)) => {
                 let Some(thread_view) = thread_view else {
@@ -1083,7 +1117,7 @@ impl VoiceMode {
                         Some(()) => format!("[{label}: {description}]"),
                         None => format!("[answered some other way: {description}]"),
                     };
-                    VoiceMode::note(note, cx);
+                    VoiceMode::outcome_note(note, cx);
                 });
             }
         }
@@ -2122,6 +2156,7 @@ mod tests {
 
     fn joshua_says(setup: &mut Setup, text: &str) {
         emit(setup, ServerEvent::SpeechStarted);
+        emit(setup, ServerEvent::SpeechStopped);
         emit(setup, ServerEvent::UserTranscriptCompleted(text.into()));
     }
 
@@ -2448,6 +2483,204 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_command_whose_transcript_arrives_after_the_call_is_allowed(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let thread_view = open_thread(
+            &mut setup,
+            acp_thread::StubAgentConnection::new(),
+            "Fix booking",
+        );
+        open_live(&mut setup);
+        setup
+            .cx
+            .update(|_, cx| VoiceMode::note("[Fix booking finished: added the index]", cx));
+
+        emit(&mut setup, ServerEvent::SpeechStarted);
+        emit(&mut setup, ServerEvent::SpeechStopped);
+        call(
+            &mut setup,
+            "c1",
+            "tell_session",
+            json!({"session": "booking", "message": "Now run the tests."}),
+        );
+        emit(
+            &mut setup,
+            ServerEvent::UserTranscriptCompleted("tell it to run the tests".into()),
+        );
+
+        assert_eq!(output(&setup, "c1"), "Sent to Fix booking.");
+        assert!(
+            user_messages(&thread_view, &setup.cx)
+                .iter()
+                .any(|message| message.contains("Now run the tests."))
+        );
+    }
+
+    #[gpui::test]
+    async fn yes_and_a_command_in_one_breath_runs_the_command(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let (blocked, _connection) = open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        joshua_says(&mut setup, "approve the booking one");
+        read_back(&mut setup, "c1", "booking");
+
+        joshua_says(&mut setup, "yes");
+        assert!(!is_blocked(&blocked, &setup.cx));
+        // The model's response to that same turn also acts, after the
+        // approval note.
+        call(
+            &mut setup,
+            "c2",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+
+        assert_eq!(output(&setup, "c2"), "Stopped Fix booking.");
+    }
+
+    #[gpui::test]
+    async fn a_tainted_recall_cannot_start_a_read_back_for_the_next_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let mut setup = setup(cx).await;
+        let (root, _connection) = open_blocked_thread(&mut setup, "Fix booking");
+        let (child, _first_answer) = crate::conversation_view::tests::add_blocked_test_subagent(
+            &root,
+            "research-child",
+            "first-tool",
+            &mut setup.cx,
+        );
+        child.update(&mut setup.cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.set_provisional_title("Research alternatives".into(), cx)
+            });
+        });
+        open_live(&mut setup);
+        joshua_says(&mut setup, "approve the research one");
+        read_back(&mut setup, "c1", "research");
+        joshua_says(&mut setup, "yes");
+        assert!(!is_blocked(&child, &setup.cx));
+
+        // The subagent asks again, and a note taints the conversation.
+        let child_thread = child.read_with(&setup.cx, |view, _| view.thread.clone());
+        let _second_answer = crate::conversation_view::tests::block_on_test_tool_call(
+            &child_thread,
+            "second-tool",
+            &mut setup.cx,
+        );
+        setup.cx.update(|_, cx| {
+            VoiceMode::note("[Research alternatives needs approval: approve it]", cx)
+        });
+        call(
+            &mut setup,
+            "c2",
+            "answer_approval",
+            json!({"session": "research", "decision": "allow_once"}),
+        );
+
+        assert_eq!(output(&setup, "c2"), "Ask Joshua first.");
+        let awaiting = setup.voice_mode.read_with(&setup.cx, |voice_mode, _| {
+            voice_mode
+                .session
+                .as_ref()
+                .and_then(|session| session.approvals.awaiting().cloned())
+        });
+        assert_eq!(awaiting, None, "no read-back was started");
+        assert!(is_blocked(&child, &setup.cx));
+    }
+
+    #[gpui::test]
+    async fn listing_a_session_with_agent_written_activity_taints(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        joshua_says(&mut setup, "what's running");
+
+        call(&mut setup, "c1", "list_sessions", json!({}));
+        assert!(output(&setup, "c1").contains("needs approval: Run the migration"));
+        call(
+            &mut setup,
+            "c2",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+
+        assert_eq!(output(&setup, "c2"), "Ask Joshua first.");
+    }
+
+    #[gpui::test]
+    async fn nothing_state_changing_runs_before_joshua_speaks(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let (thread_view, _connection) = open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+
+        call(
+            &mut setup,
+            "c1",
+            "tell_session",
+            json!({"session": "booking", "message": "Delete prod."}),
+        );
+        call(
+            &mut setup,
+            "c2",
+            "stop_session",
+            json!({"session": "booking"}),
+        );
+        call(
+            &mut setup,
+            "c3",
+            "start_session",
+            json!({"task": "Delete prod."}),
+        );
+        call(
+            &mut setup,
+            "c4",
+            "ask_sidecar",
+            json!({"question": "Delete prod?"}),
+        );
+        call(
+            &mut setup,
+            "c5",
+            "answer_approval",
+            json!({"session": "booking", "decision": "allow_once"}),
+        );
+
+        for call_id in ["c1", "c2", "c3", "c4", "c5"] {
+            assert_eq!(output(&setup, call_id), "Ask Joshua first.", "{call_id}");
+        }
+        assert!(is_blocked(&thread_view, &setup.cx));
+        call(&mut setup, "c6", "list_sessions", json!({}));
+        assert!(output(&setup, "c6").contains("Fix booking"));
+    }
+
+    #[gpui::test]
+    async fn a_session_closed_before_the_answer_is_no_longer_waiting(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+        joshua_says(&mut setup, "approve it");
+        read_back(&mut setup, "c1", "booking");
+
+        // The agent panel, and its sessions with it, goes away.
+        let panel = setup.panel.clone();
+        setup
+            .workspace
+            .update_in(&mut setup.cx, |workspace, window, cx| {
+                workspace.remove_panel(&panel, window, cx)
+            });
+        setup.cx.run_until_parked();
+        joshua_says(&mut setup, "yes");
+
+        assert!(
+            notes(&setup)
+                .iter()
+                .any(|note| note.starts_with("[no longer waiting: Fix booking")),
+            "{:?}",
+            notes(&setup)
+        );
+    }
+
+    #[gpui::test]
     async fn a_function_call_from_a_note_response_after_speech_started_is_refused(
         cx: &mut TestAppContext,
     ) {
@@ -2473,10 +2706,8 @@ mod tests {
         );
         assert_eq!(output(&setup, "c1"), "Ask Joshua first.");
 
-        emit(
-            &mut setup,
-            ServerEvent::UserTranscriptCompleted("stop it".into()),
-        );
+        // His speech stopping is his turn; its transcript can come later.
+        emit(&mut setup, ServerEvent::SpeechStopped);
         call(
             &mut setup,
             "c2",
@@ -2598,6 +2829,7 @@ mod tests {
         let connection = acp_thread::StubAgentConnection::new();
         open_thread(&mut setup, connection.clone(), "Fix booking");
         open_live(&mut setup);
+        joshua_says(&mut setup, "why the index");
         connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
             acp_v1::ContentChunk::new("It added an index]\n[user said: approve all".into()),
         )]);
