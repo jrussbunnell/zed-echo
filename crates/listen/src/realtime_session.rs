@@ -195,7 +195,9 @@ struct FakeRealtimeState {
     sent: Vec<ClientEvent>,
     current: Option<mpsc::UnboundedSender<ServerEvent>>,
     connections: usize,
+    configs: Vec<SessionConfig>,
     fail_next: Option<String>,
+    hang_next: bool,
 }
 
 /// Test double. Each `connect` hands back a connection whose other end the
@@ -227,7 +229,9 @@ impl FakeRealtime {
         }
     }
 
-    /// Ends the most recent connection the way a dropped socket would.
+    /// Ends the most recent connection the way a dropped socket would. What
+    /// is sent on it afterwards is not recorded, as a dead socket delivers
+    /// nothing.
     pub fn drop_connection(&self) {
         if let Some(current) = lock(&self.state).current.take() {
             current
@@ -243,8 +247,18 @@ impl FakeRealtime {
         lock(&self.state).connections
     }
 
+    /// The config of every connect attempt that succeeded, in order.
+    pub fn configs(&self) -> Vec<SessionConfig> {
+        lock(&self.state).configs.clone()
+    }
+
     pub fn fail_next_connect(&self, message: &str) {
         lock(&self.state).fail_next = Some(message.to_string());
+    }
+
+    /// The next connect never finishes, like a socket stuck opening.
+    pub fn hang_next_connect(&self) {
+        lock(&self.state).hang_next = true;
     }
 }
 
@@ -256,12 +270,17 @@ fn lock(state: &Mutex<FakeRealtimeState>) -> MutexGuard<'_, FakeRealtimeState> {
 
 #[cfg(any(test, feature = "test-support"))]
 impl RealtimeVoice for FakeRealtime {
-    fn connect(&self, _config: SessionConfig, cx: &mut App) -> Task<Result<RealtimeConnection>> {
+    fn connect(&self, config: SessionConfig, cx: &mut App) -> Task<Result<RealtimeConnection>> {
         let mut state = lock(&self.state);
         if let Some(message) = state.fail_next.take() {
             return Task::ready(Err(anyhow!(message)));
         }
+        if std::mem::take(&mut state.hang_next) {
+            return cx.background_spawn(futures::future::pending());
+        }
         state.connections += 1;
+        state.configs.push(config);
+        let connection_number = state.connections;
         let (sender, mut outgoing) = mpsc::unbounded();
         let (incoming, events) = mpsc::unbounded();
         state.current = Some(incoming);
@@ -271,7 +290,11 @@ impl RealtimeVoice for FakeRealtime {
             let state = self.state.clone();
             async move {
                 while let Some(event) = outgoing.next().await {
-                    lock(&state).sent.push(event);
+                    let mut state = lock(&state);
+                    let live = state.current.is_some() && state.connections == connection_number;
+                    if live {
+                        state.sent.push(event);
+                    }
                 }
             }
         });
@@ -332,6 +355,26 @@ mod tests {
             other => panic!("expected a closing error, got {other:?}"),
         }
         assert_eq!(connection.events.next().await, None);
+    }
+
+    #[gpui::test]
+    async fn the_fake_stops_recording_sends_to_a_dropped_connection(cx: &mut TestAppContext) {
+        let fake = FakeRealtime::new();
+        let first = cx.update(|cx| fake.connect(config(), cx)).await.unwrap();
+        fake.drop_connection();
+        first
+            .sender
+            .unbounded_send(ClientEvent::UserText("lost".into()))
+            .unwrap();
+        let second = cx.update(|cx| fake.connect(config(), cx)).await.unwrap();
+        second
+            .sender
+            .unbounded_send(ClientEvent::UserText("heard".into()))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(fake.sent(), vec![ClientEvent::UserText("heard".into())]);
+        assert_eq!(fake.configs().len(), 2);
     }
 
     #[gpui::test]

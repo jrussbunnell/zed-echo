@@ -89,6 +89,7 @@ pub enum ServerEvent {
         name: String,
         arguments: String,
     },
+    ResponseCreated,
     ResponseDone,
     Error(String),
     Other,
@@ -240,6 +241,7 @@ pub fn decode(frame: &str) -> Result<ServerEvent> {
             name: text("name")?,
             arguments: text("arguments")?,
         },
+        "response.created" => ServerEvent::ResponseCreated,
         "response.done" => ServerEvent::ResponseDone,
         "error" => ServerEvent::Error(
             value
@@ -355,6 +357,13 @@ mod tests {
             decode(RESPONSE_DONE).unwrap(),
             ServerEvent::ResponseDone
         ));
+        assert_eq!(
+            decode(
+                r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+            )
+            .unwrap(),
+            ServerEvent::ResponseCreated
+        );
         let ServerEvent::Error(message) = decode(ERROR).unwrap() else {
             panic!("not an error");
         };

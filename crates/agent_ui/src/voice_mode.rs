@@ -1,5 +1,3 @@
-// Task 11 wires the proactive feed.
-#[allow(dead_code)]
 mod feed;
 mod tools;
 
@@ -8,12 +6,14 @@ use crate::conversation_view::ThreadView;
 use crate::narration_peek::current_activity;
 use crate::sidecar::Sidecar;
 use crate::voice_dispatch::{ConfirmationAnswer, answer_to_confirmation};
-use acp_thread::ThreadStatus;
+use acp_thread::{AcpThread, AcpThreadEvent, AgentThreadEntry, ThreadStatus};
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
-use futures::{StreamExt as _, channel::mpsc};
+use collections::HashMap;
+use feed::{Feed, SessionEvent};
+use futures::{StreamExt as _, channel::mpsc, future::Either};
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, Global, IntoElement, Render,
+    AnyWindowHandle, App, AppContext as _, Context, Entity, EntityId, Global, IntoElement, Render,
     SharedString, Subscription, Task, WeakEntity, Window,
 };
 use listen::{
@@ -23,7 +23,7 @@ use listen::{
 use project::Project;
 use serde::Deserialize;
 use settings::Settings as _;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +67,26 @@ const CAPTION_LIFETIME: Duration = Duration::from_secs(4);
 const CAPTION_FADE: Duration = Duration::from_millis(500);
 const GLOW_HEIGHT: Pixels = px(120.);
 
+/// How often queued session notes are considered, and the idle clocks read.
+const FEED_POLL: Duration = Duration::from_secs(1);
+
+/// A session at work keeps voice mode open past the idle timeout, but not
+/// for longer than this without Joshua saying anything.
+const RUNNING_IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// A message counts as a milestone after this long of tool calls.
+const MILESTONE_AFTER: Duration = Duration::from_secs(60);
+
+/// How long a connect may take before it counts as failed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A drop this soon after reconnecting closes voice mode instead of
+/// reconnecting again.
+const RECONNECT_WINDOW: Duration = Duration::from_secs(30);
+
+/// How many exchanges the reconnected session is reminded of.
+const RECENT_EXCHANGES: usize = 4;
+
 /// How long queued audio may sit unplayed before the output stream is
 /// treated as wedged and reopened, as read-aloud's player does.
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,6 +115,73 @@ enum ReadBack {
     Speaking,
     /// That response ended, so speech starting now is a reply to it.
     Heard,
+}
+
+/// Whether Echo is answering, as far as the server has said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Response {
+    Idle,
+    /// Asked for, but not yet confirmed as started.
+    Requested,
+    Running,
+}
+
+/// One line of the conversation, kept to remind a reconnected session.
+struct Turn {
+    by_echo: bool,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+enum EntryKind {
+    UserMessage,
+    AssistantMessage,
+    ToolCall,
+}
+
+/// Spots milestones: an assistant message after at least
+/// `MILESTONE_AFTER` of tool calls. The message is only reported once the
+/// next tool call starts, because until then it may still be streaming; a
+/// message that ends the turn is the finished-turn summary instead.
+#[derive(Default)]
+struct Milestones {
+    tools_since: Option<Instant>,
+    message: Option<usize>,
+}
+
+impl Milestones {
+    /// Returns the index of a message that turned out to be a milestone.
+    fn on_entry(&mut self, kind: EntryKind, index: usize, now: Instant) -> Option<usize> {
+        match kind {
+            EntryKind::UserMessage => {
+                self.reset();
+                None
+            }
+            EntryKind::AssistantMessage => {
+                if self
+                    .tools_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= MILESTONE_AFTER)
+                {
+                    self.tools_since = None;
+                    self.message = Some(index);
+                }
+                None
+            }
+            EntryKind::ToolCall => {
+                self.tools_since.get_or_insert(now);
+                self.message.take()
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+struct WatchedThread {
+    milestones: Milestones,
+    _subscription: Subscription,
 }
 
 /// One thread as voice mode sees it, with what it takes to act on it.
@@ -230,6 +317,24 @@ struct Session {
     _state_refresh: Task<()>,
     _closing: Option<Task<()>>,
     _sidecar_questions: Vec<Task<()>>,
+    provider: Rc<dyn RealtimeVoice>,
+    response: Response,
+    /// A response was wanted while one was running; asked for when it ends,
+    /// so several notes share one.
+    response_owed: bool,
+    user_speaking: bool,
+    last_user_speech: Instant,
+    last_any_speech: Instant,
+    last_running: Instant,
+    /// The last few exchanges, oldest first.
+    recent: VecDeque<Turn>,
+    /// Appended to the instructions after a reconnect, so every later
+    /// session update keeps it.
+    recap: String,
+    reconnected_at: Option<Instant>,
+    feed: Feed,
+    watched: HashMap<EntityId, WatchedThread>,
+    _feed_poll: Task<()>,
 }
 
 impl Session {
@@ -279,16 +384,43 @@ impl Session {
     /// note before the calls.
     fn respond_to_note(&mut self) {
         if self.held_calls.is_empty() && !self.outputs_await_response {
-            self.send(ClientEvent::ResponseCreate);
+            self.request_response();
         }
     }
 
     /// Asks for the response that answers the outputs just sent.
     fn follow_up(&mut self) {
         self.outputs_await_response = false;
+        self.request_response();
+    }
+
+    /// The server rejects a second response while one is active, so one
+    /// wanted then is asked for when the active one ends.
+    fn request_response(&mut self) {
+        if self.response != Response::Idle {
+            self.response_owed = true;
+            return;
+        }
+        self.response_owed = false;
+        self.response = Response::Requested;
         self.send(ClientEvent::ResponseCreate);
         if self.read_back == ReadBack::Sent {
             self.read_back = ReadBack::Speaking;
+        }
+    }
+
+    fn remember(&mut self, by_echo: bool, text: &str) {
+        match self.recent.back_mut() {
+            Some(turn) if by_echo && turn.by_echo && self.caption_is_echo => {
+                turn.text.push_str(text);
+            }
+            _ => self.recent.push_back(Turn {
+                by_echo,
+                text: text.to_string(),
+            }),
+        }
+        while self.recent.len() > RECENT_EXCHANGES * 2 {
+            self.recent.pop_front();
         }
     }
 
@@ -439,7 +571,9 @@ impl VoiceMode {
             return;
         };
         let text = text.into();
-        voice_mode.update(cx, |voice_mode, _| voice_mode.send_note(text.to_string()));
+        voice_mode.update(cx, |voice_mode, _| {
+            voice_mode.send_note(text.to_string(), true)
+        });
     }
 
     /// Echo's own report of how an approval went. The words are Rust's, so
@@ -454,7 +588,9 @@ impl VoiceMode {
         voice_mode.update(cx, |voice_mode, _| voice_mode.send_outcome_note(text));
     }
 
-    fn send_note(&mut self, text: String) {
+    /// A note carrying text an agent wrote. `speak` asks Echo to mention
+    /// it; otherwise it only goes into the model's context.
+    fn send_note(&mut self, text: String, speak: bool) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -463,7 +599,7 @@ impl VoiceMode {
         session.send(ClientEvent::UserText(text));
         if follow_up_owed {
             session.follow_up();
-        } else {
+        } else if speak {
             session.respond_to_note();
         }
     }
@@ -556,6 +692,10 @@ impl VoiceMode {
     ) {
         let sessions = live_sessions(cx);
         config.instructions = instructions(&sessions);
+        let mut watched = HashMap::default();
+        watch_threads(&sessions, &mut watched, cx);
+        let chattiness = VoiceModeSettings::get_global(cx).chattiness;
+        let now = cx.background_executor().now();
         let levels = Arc::new(VoiceLevels::default());
         let overlay = cx.new({
             let voice_mode = cx.weak_entity();
@@ -575,39 +715,7 @@ impl VoiceMode {
             workspace.set_voice_overlay(Some(overlay.clone().into()), cx);
         });
 
-        let connect = provider.connect(config.clone(), cx);
-        let connection = cx.spawn(async move |this, cx| {
-            let mut connection = match connect.await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.close(
-                            Some(format!("Voice mode couldn't connect: {error:#}").into()),
-                            cx,
-                        );
-                    })
-                    .log_err();
-                    return;
-                }
-            };
-            let sender = connection.sender.clone();
-            let stored = this.update(cx, |this, _| {
-                if let Some(session) = this.session.as_mut() {
-                    session.sender = Some(sender);
-                }
-            });
-            if stored.is_err() {
-                return;
-            }
-            while let Some(event) = connection.events.next().await {
-                if this
-                    .update(cx, |this, cx| this.handle_event(event, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let connection = connect(&provider, config.clone(), cx);
 
         self.session = Some(Session {
             state: VoiceModeState::Connecting,
@@ -655,8 +763,221 @@ impl VoiceMode {
             }),
             _closing: None,
             _sidecar_questions: Vec::new(),
+            provider,
+            response: Response::Idle,
+            response_owed: false,
+            user_speaking: false,
+            last_user_speech: now,
+            last_any_speech: now,
+            last_running: now,
+            recent: VecDeque::new(),
+            recap: String::new(),
+            reconnected_at: None,
+            feed: Feed::new(chattiness),
+            watched,
+            _feed_poll: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(FEED_POLL).await;
+                    if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                        break;
+                    }
+                }
+            }),
         });
         cx.notify();
+    }
+
+    /// Once a second: closes voice mode if it has gone idle, and otherwise
+    /// passes on whatever session notes the feed lets through.
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let running = live_sessions(cx)
+            .iter()
+            .any(|live| live.summary.status != "idle");
+        let idle_timeout = VoiceModeSettings::get_global(cx).idle_timeout;
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if session.state != VoiceModeState::Live {
+            return;
+        }
+        if session.is_playing() {
+            session.last_any_speech = now;
+        }
+        if running {
+            session.last_running = now;
+        }
+        let since = |at: Instant| now.saturating_duration_since(at);
+        let idle = if running {
+            since(session.last_user_speech) >= RUNNING_IDLE_LIMIT
+        } else {
+            since(session.last_any_speech.max(session.last_running)) >= idle_timeout
+        };
+        if idle {
+            self.close(None, cx);
+            return;
+        }
+        if session.sender.is_none() {
+            return;
+        }
+        let echo_speaking = session.response != Response::Idle || session.is_playing();
+        if let Some(note) = session.feed.poll(now, session.user_speaking, echo_speaking) {
+            self.send_note(note.text, note.speak);
+        }
+    }
+
+    /// Reconnects once with the same instructions and a recap of the last
+    /// few exchanges; a second drop soon after closes voice mode.
+    fn connection_lost(&mut self, reason: &str, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let sessions = live_sessions(cx);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let dropped_again = session
+            .reconnected_at
+            .is_some_and(|at| now.saturating_duration_since(at) < RECONNECT_WINDOW);
+        // Already saying goodbye: losing the socket only ends it sooner.
+        if session.state == VoiceModeState::Closing {
+            self.close(None, cx);
+            return;
+        }
+        if dropped_again {
+            let reason = format!("Voice mode lost its connection: {reason}");
+            self.close(Some(reason.into()), cx);
+            return;
+        }
+        log::warn!("voice mode: the connection dropped ({reason}); reconnecting");
+        session.reconnected_at = Some(now);
+        session.state = VoiceModeState::Connecting;
+        session.sender = None;
+        session.microphone = None;
+        session._microphone_pump = None;
+        if let Some(playback) = session.playback.as_mut() {
+            playback.stop();
+        }
+        session.user_speaking = false;
+        session.response = Response::Idle;
+        session.response_owed = false;
+        // The new connection never saw the calls or the read-back.
+        session.held_calls.clear();
+        session._hold_timeout = None;
+        session.follow_up_after_release = false;
+        session.outputs_await_response = false;
+        session.read_back = ReadBack::None;
+        session.read_back_reply_items.clear();
+        session.approvals = ApprovalGate::default();
+        // The recap repeats Echo's words, which agents' notes shaped.
+        session.mark_tainted();
+        session.recap = recap(&session.recent);
+        session.config.instructions = format!("{}{}", instructions(&sessions), session.recap);
+        session.state_key = state_key(&sessions);
+        let provider = session.provider.clone();
+        let config = session.config.clone();
+        let connection = connect(&provider, config, cx);
+        if let Some(session) = self.session.as_mut() {
+            session._connection = connection;
+        }
+    }
+
+    fn on_thread_event(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        thread_view: &WeakEntity<ThreadView>,
+        event: &AcpThreadEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let now = cx.background_executor().now();
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let Some(watched) = session.watched.get_mut(&thread.entity_id()) else {
+            return;
+        };
+        let thread = thread.read(cx);
+        let title = thread.title().unwrap_or_else(|| "Untitled session".into());
+        let is_subagent = thread.parent_session_id().is_some();
+        let failed = |error: &str| {
+            if is_subagent {
+                SessionEvent::SubagentFinished {
+                    label: title.clone(),
+                    failed: true,
+                }
+            } else {
+                SessionEvent::Failed {
+                    session: title.clone(),
+                    error: error.to_string().into(),
+                }
+            }
+        };
+        let event = match event {
+            AcpThreadEvent::ToolAuthorizationRequested(_) => {
+                let what = thread_view
+                    .upgrade()
+                    .and_then(|view| view.read(cx).pending_tool_call_description(cx))
+                    .unwrap_or_else(|| "run a tool".into());
+                Some(SessionEvent::ApprovalNeeded {
+                    session: title.clone(),
+                    what: what.into(),
+                })
+            }
+            AcpThreadEvent::Stopped { stop_reason, .. } => {
+                watched.milestones.reset();
+                match stop_reason {
+                    Some(acp::StopReason::Cancelled) => None,
+                    Some(acp::StopReason::Refusal) => Some(failed("the agent refused")),
+                    Some(acp::StopReason::MaxTokens) => Some(failed("it hit its output limit")),
+                    Some(acp::StopReason::MaxTurnRequests) => {
+                        Some(failed("it hit its request limit"))
+                    }
+                    Some(acp::StopReason::Error(details)) => Some(failed(
+                        details
+                            .error
+                            .as_ref()
+                            .map(|error| error.message.as_str())
+                            .unwrap_or("it stopped because of an error"),
+                    )),
+                    // Ended, or a reason newer than this code: treat as done.
+                    _ => Some(if is_subagent {
+                        SessionEvent::SubagentFinished {
+                            label: title.clone(),
+                            failed: false,
+                        }
+                    } else {
+                        SessionEvent::TurnFinished {
+                            session: title.clone(),
+                            summary: last_message(thread, None, cx)
+                                .map(|message| first_sentence(&message).to_string())
+                                .unwrap_or_else(|| "no message".into())
+                                .into(),
+                        }
+                    }),
+                }
+            }
+            AcpThreadEvent::Error => Some(failed("it stopped because of an error")),
+            AcpThreadEvent::ConnectionLost => Some(failed("it lost its connection to the agent")),
+            AcpThreadEvent::NewEntry => {
+                let index = thread.entries().len().saturating_sub(1);
+                let kind = match thread.entries().last() {
+                    Some(AgentThreadEntry::UserMessage(_)) => Some(EntryKind::UserMessage),
+                    Some(AgentThreadEntry::AssistantMessage(_)) => {
+                        Some(EntryKind::AssistantMessage)
+                    }
+                    Some(AgentThreadEntry::ToolCall(_)) => Some(EntryKind::ToolCall),
+                    _ => None,
+                };
+                kind.and_then(|kind| watched.milestones.on_entry(kind, index, now))
+                    .and_then(|index| last_message(thread, Some(index), cx))
+                    .map(|text| SessionEvent::Milestone {
+                        session: title.clone(),
+                        text: text.into(),
+                    })
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            session.feed.push(event, now);
+        }
     }
 
     /// Moves the overlay onto `workspace`, the active project of `window`.
@@ -754,6 +1075,10 @@ impl VoiceMode {
                 self.start_microphone(cx);
             }
             ServerEvent::SpeechStarted { item_id } => {
+                let now = cx.background_executor().now();
+                session.user_speaking = true;
+                session.last_user_speech = now;
+                session.last_any_speech = now;
                 if session.tainted {
                     session.trust_items.insert(item_id.clone());
                 }
@@ -779,8 +1104,12 @@ impl VoiceMode {
                 item_id,
                 content_index,
                 samples,
-            } => self.play(&item_id, content_index, samples, cx),
+            } => {
+                session.last_any_speech = cx.background_executor().now();
+                self.play(&item_id, content_index, samples, cx);
+            }
             ServerEvent::AssistantTranscriptDelta(delta) => {
+                session.remember(true, &delta);
                 let text = match (&session.caption, session.caption_is_echo) {
                     (Some(caption), true) => format!("{}{delta}", caption.text),
                     _ => delta,
@@ -796,14 +1125,19 @@ impl VoiceMode {
                 let Some(session) = self.session.as_mut() else {
                     return;
                 };
+                if !text.trim().is_empty() {
+                    session.remember(false, &text);
+                }
                 session.caption_is_echo = false;
                 self.show_caption(text.into(), cx);
             }
             ServerEvent::UserTranscriptFailed { item_id } => {
                 self.handle_transcript(&item_id, None, cx);
             }
+            ServerEvent::ResponseCreated => session.response = Response::Running,
             ServerEvent::ResponseDone => {
                 session.caption_is_echo = false;
+                session.response = Response::Idle;
                 if !session.held_calls.is_empty() {
                     session.follow_up_after_release = true;
                 } else if session.outputs_await_response {
@@ -819,15 +1153,23 @@ impl VoiceMode {
                             return;
                         }
                     }
+                    if session.response_owed {
+                        session.request_response();
+                    }
                 }
             }
             ServerEvent::Error(message) => {
                 if let Some(reason) = message.strip_prefix("closed: ") {
-                    let reason = format!("Voice mode lost its connection: {reason}");
-                    self.close(Some(reason.into()), cx);
+                    self.connection_lost(reason, cx);
+                    cx.notify();
                     return;
                 }
                 log::error!("voice mode: the server reported an error: {message}");
+                // Likely the rejection of the response just asked for, which
+                // would otherwise wait for a `response.done` that never comes.
+                if session.response == Response::Requested {
+                    session.response = Response::Idle;
+                }
                 session.last_error = Some(message);
             }
             ServerEvent::FunctionCall {
@@ -836,6 +1178,10 @@ impl VoiceMode {
                 arguments,
             } => self.handle_function_call(call_id, name, arguments, cx),
             ServerEvent::SpeechStopped { item_id } => {
+                let now = cx.background_executor().now();
+                session.user_speaking = false;
+                session.last_user_speech = now;
+                session.last_any_speech = now;
                 if session.trust_items.contains(&item_id) {
                     session.pending_trust_items.insert(item_id);
                 }
@@ -921,6 +1267,12 @@ impl VoiceMode {
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        let mut watched = std::mem::take(&mut session.watched);
+        watch_threads(&sessions, &mut watched, cx);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        session.watched = watched;
         let key = state_key(&sessions);
         if session.state != VoiceModeState::Live || session.sender.is_none() {
             return;
@@ -929,7 +1281,7 @@ impl VoiceMode {
             return;
         }
         session.state_key = key;
-        session.config.instructions = instructions(&sessions);
+        session.config.instructions = format!("{}{}", instructions(&sessions), session.recap);
         session.send(ClientEvent::SessionUpdate(session.config.clone()));
     }
 
@@ -1319,7 +1671,8 @@ impl VoiceMode {
                     sanitize(&format!("{error:#}"))
                 ),
             };
-            this.update(cx, |this, _| this.send_note(note)).log_err();
+            this.update(cx, |this, _| this.send_note(note, true))
+                .log_err();
         });
         if let Some(session) = self.session.as_mut() {
             session._sidecar_questions.push(question);
@@ -1484,6 +1837,122 @@ impl VoiceMode {
             this.update(cx, |_, cx| cx.notify()).ok();
         }));
     }
+}
+
+/// Connects, then feeds the connection's events to voice mode until it
+/// ends. A connect that takes too long counts as failed.
+fn connect(
+    provider: &Rc<dyn RealtimeVoice>,
+    config: SessionConfig,
+    cx: &mut Context<VoiceMode>,
+) -> Task<()> {
+    let connect = provider.connect(config, cx);
+    cx.spawn(async move |this, cx| {
+        let timeout = cx.background_executor().timer(CONNECT_TIMEOUT);
+        let failure = match futures::future::select(connect, timeout).await {
+            Either::Left((Ok(connection), _)) => Ok(connection),
+            Either::Left((Err(error), _)) => Err(format!("{error:#}")),
+            Either::Right(_) => Err(format!(
+                "no answer within {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            )),
+        };
+        let mut connection = match failure {
+            Ok(connection) => connection,
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    this.close(
+                        Some(format!("Voice mode couldn't connect: {error}").into()),
+                        cx,
+                    );
+                })
+                .log_err();
+                return;
+            }
+        };
+        let sender = connection.sender.clone();
+        let stored = this.update(cx, |this, _| {
+            if let Some(session) = this.session.as_mut() {
+                session.sender = Some(sender);
+            }
+        });
+        if stored.is_err() {
+            return;
+        }
+        while let Some(event) = connection.events.next().await {
+            if this
+                .update(cx, |this, cx| this.handle_event(event, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+/// Subscribes to every thread not yet watched, and forgets closed ones.
+fn watch_threads(
+    sessions: &[LiveSession],
+    watched: &mut HashMap<EntityId, WatchedThread>,
+    cx: &mut Context<VoiceMode>,
+) {
+    let mut open = HashSet::new();
+    for live in sessions {
+        let thread = live.thread_view.read(cx).thread.clone();
+        open.insert(thread.entity_id());
+        if watched.contains_key(&thread.entity_id()) {
+            continue;
+        }
+        let thread_view = live.thread_view.downgrade();
+        let subscription = cx.subscribe(&thread, move |this, thread, event, cx| {
+            this.on_thread_event(&thread, &thread_view, event, cx);
+        });
+        watched.insert(
+            thread.entity_id(),
+            WatchedThread {
+                milestones: Milestones::default(),
+                _subscription: subscription,
+            },
+        );
+    }
+    watched.retain(|thread_id, _| open.contains(thread_id));
+}
+
+/// The agent's last message, or the message at `index`.
+fn last_message(thread: &AcpThread, index: Option<usize>, cx: &App) -> Option<String> {
+    thread
+        .recent_narration(NARRATION_PEEK_LIMIT, cx)
+        .into_iter()
+        .rev()
+        .find(|narration| {
+            !narration.is_thought && index.is_none_or(|index| narration.entry_index == index)
+        })
+        .map(|narration| narration.text.to_string())
+}
+
+// ponytail: cuts at the first full stop, so "e.g." ends the sentence early.
+fn first_sentence(text: &str) -> &str {
+    let end = text
+        .find(['.', '!', '?', '\n'])
+        .map_or(text.len(), |index| index + 1);
+    text.get(..end).unwrap_or(text).trim()
+}
+
+fn recap(recent: &VecDeque<Turn>) -> String {
+    if recent.is_empty() {
+        return String::new();
+    }
+    let lines = recent
+        .iter()
+        .map(|turn| {
+            let speaker = if turn.by_echo { "Echo" } else { "Joshua" };
+            format!("{speaker}: {}", sanitize(&turn.text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\nThe connection dropped and was restored. The conversation so far ended with:\n{lines}"
+    )
 }
 
 fn follow_active_project(
@@ -3569,5 +4038,295 @@ mod tests {
                 .contains("- Fix booking (project): idle")
         );
         assert_eq!(updates[0].tools, tool_definitions());
+    }
+
+    fn after(setup: &mut Setup, duration: Duration) {
+        setup.cx.executor().advance_clock(duration);
+        setup.cx.run_until_parked();
+    }
+
+    fn is_open(setup: &Setup) -> bool {
+        state(setup).is_some()
+    }
+
+    fn tainted(setup: &Setup) -> bool {
+        setup.voice_mode.read_with(&setup.cx, |voice_mode, _| {
+            voice_mode
+                .session
+                .as_ref()
+                .is_some_and(|session| session.tainted)
+        })
+    }
+
+    fn has_toast(setup: &Setup) -> bool {
+        setup.workspace.read_with(&setup.cx, |workspace, _| {
+            workspace.has_notification(&NotificationId::unique::<VoiceModeToast>())
+        })
+    }
+
+    /// Opens a thread that answers its next prompt with `reply`, opens voice
+    /// mode, lets Joshua speak, and has the thread finish a turn.
+    fn finish_a_turn(setup: &mut Setup, reply: &str) {
+        use agent_client_protocol::schema::v1 as acp_v1;
+        let connection = acp_thread::StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new(reply.into()),
+        )]);
+        let thread_view = open_thread(setup, connection, "Fix booking");
+        open_live(setup);
+        joshua_says(setup, "how is it going");
+        thread_view.update_in(&mut setup.cx, |view, window, cx| {
+            view.send_voice_text("carry on".into(), window, cx);
+        });
+        setup.cx.run_until_parked();
+        after(setup, FEED_POLL);
+    }
+
+    #[gpui::test]
+    async fn a_finished_turn_is_spoken_at_milestones(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        finish_a_turn(&mut setup, "All done. The tests pass.");
+
+        let note = "[Fix booking finished: All done.]".to_string();
+        let sent = setup.realtime.sent();
+        let position = sent
+            .iter()
+            .position(|event| *event == ClientEvent::UserText(note.clone()))
+            .unwrap_or_else(|| panic!("the note was sent: {:?}", notes(&setup)));
+        assert_eq!(sent.get(position + 1), Some(&ClientEvent::ResponseCreate));
+        assert!(tainted(&setup), "the agent's words cost Joshua's trust");
+    }
+
+    #[gpui::test]
+    async fn quiet_keeps_finished_turns_in_context_only(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        setup.cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.voice_mode.get_or_insert_default().chattiness =
+                        Some(settings::VoiceChattiness::Quiet);
+                });
+            });
+        });
+        finish_a_turn(&mut setup, "All done. The tests pass.");
+
+        assert_eq!(
+            setup.realtime.sent().last(),
+            Some(&ClientEvent::UserText(
+                "[Fix booking finished: All done.]".into()
+            ))
+        );
+        assert!(tainted(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_note_during_an_active_response_waits_for_it_to_finish(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+        emit(&mut setup, ServerEvent::ResponseCreated);
+        let responses = |setup: &Setup| {
+            setup
+                .realtime
+                .sent()
+                .iter()
+                .filter(|event| **event == ClientEvent::ResponseCreate)
+                .count()
+        };
+
+        for note in ["[first]", "[second]"] {
+            setup.cx.update(|_, cx| VoiceMode::note(note, cx));
+            setup.cx.run_until_parked();
+        }
+        assert_eq!(notes(&setup), vec!["[first]", "[second]"]);
+        assert_eq!(responses(&setup), 0, "asked for while Echo is answering");
+
+        emit(&mut setup, ServerEvent::ResponseDone);
+        assert_eq!(responses(&setup), 1, "one response answers both notes");
+        assert_eq!(
+            setup.realtime.sent().last(),
+            Some(&ClientEvent::ResponseCreate)
+        );
+    }
+
+    #[gpui::test]
+    async fn idle_timeout_closes_when_nothing_is_running(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+
+        after(&mut setup, Duration::from_secs(299));
+        assert!(is_open(&setup));
+        after(&mut setup, Duration::from_secs(1));
+        assert!(!is_open(&setup));
+        assert!(!has_toast(&setup), "closing when idle is not an error");
+    }
+
+    #[gpui::test]
+    async fn a_running_session_keeps_it_open_until_thirty_minutes_without_user_speech(
+        cx: &mut TestAppContext,
+    ) {
+        let mut setup = setup(cx).await;
+        open_blocked_thread(&mut setup, "Fix booking");
+        open_live(&mut setup);
+
+        after(&mut setup, Duration::from_secs(300));
+        assert!(is_open(&setup), "a session is waiting");
+        after(&mut setup, RUNNING_IDLE_LIMIT - Duration::from_secs(301));
+        assert!(is_open(&setup));
+        after(&mut setup, Duration::from_secs(1));
+        assert!(!is_open(&setup));
+    }
+
+    #[gpui::test]
+    async fn one_drop_reconnects_with_the_recent_exchanges(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+        joshua_says(&mut setup, "what is the booking one doing");
+        emit(
+            &mut setup,
+            ServerEvent::AssistantTranscriptDelta("It is running ".into()),
+        );
+        emit(
+            &mut setup,
+            ServerEvent::AssistantTranscriptDelta("the migration.".into()),
+        );
+        emit(&mut setup, ServerEvent::ResponseDone);
+        assert!(!tainted(&setup));
+
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        assert_eq!(setup.realtime.connections(), 2);
+        let configs = setup.realtime.configs();
+        let instructions = &configs[1].instructions;
+        assert!(
+            instructions.contains("Joshua: what is the booking one doing"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("Echo: It is running the migration."),
+            "{instructions}"
+        );
+        assert_eq!(state(&setup), Some(VoiceModeState::Connecting));
+        assert!(tainted(&setup), "Echo's recalled words are not Joshua's");
+
+        emit(&mut setup, ServerEvent::SessionCreated);
+        assert_eq!(state(&setup), Some(VoiceModeState::Live));
+        assert_eq!(setup.microphones_opened.get(), 2);
+        setup.cx.update(|_, cx| VoiceMode::note("[after]", cx));
+        setup.cx.run_until_parked();
+        assert!(notes(&setup).contains(&"[after]".to_string()));
+        assert!(!has_toast(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_second_drop_within_thirty_seconds_closes_with_a_toast(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+        emit(&mut setup, ServerEvent::SessionCreated);
+        after(&mut setup, RECONNECT_WINDOW - Duration::from_secs(1));
+        assert!(is_open(&setup));
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        assert_eq!(setup.realtime.connections(), 2);
+        assert!(!is_open(&setup));
+        assert!(has_toast(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_drop_long_after_reconnecting_reconnects_again(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+        emit(&mut setup, ServerEvent::SessionCreated);
+        joshua_says(&mut setup, "still there");
+        after(&mut setup, RECONNECT_WINDOW);
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        assert_eq!(setup.realtime.connections(), 3);
+        assert!(is_open(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_reconnect_that_times_out_closes_with_a_toast(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+
+        setup.realtime.hang_next_connect();
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+        assert!(is_open(&setup));
+        after(&mut setup, CONNECT_TIMEOUT);
+
+        assert!(!is_open(&setup));
+        assert!(has_toast(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_drop_while_saying_goodbye_closes_without_reconnecting(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+        call(&mut setup, "c1", "end_voice_mode", json!({}));
+
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        assert_eq!(setup.realtime.connections(), 1);
+        assert!(!is_open(&setup));
+        assert!(!has_toast(&setup));
+    }
+
+    #[gpui::test]
+    async fn a_failed_reconnect_closes_with_a_toast(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        open_live(&mut setup);
+
+        setup.realtime.fail_next_connect("no network");
+        setup.realtime.drop_connection();
+        setup.cx.run_until_parked();
+
+        assert!(!is_open(&setup));
+        assert!(has_toast(&setup));
+    }
+
+    #[test]
+    fn a_message_after_a_minute_of_tool_calls_is_a_milestone() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut milestones = Milestones::default();
+        assert_eq!(milestones.on_entry(EntryKind::ToolCall, 0, at(0)), None);
+        assert_eq!(
+            milestones.on_entry(EntryKind::AssistantMessage, 1, at(30)),
+            None
+        );
+        assert_eq!(milestones.on_entry(EntryKind::ToolCall, 2, at(31)), None);
+        assert_eq!(
+            milestones.on_entry(EntryKind::AssistantMessage, 3, at(60)),
+            None
+        );
+        // Reported once the message is complete, when the next call starts.
+        assert_eq!(milestones.on_entry(EntryKind::ToolCall, 4, at(61)), Some(3));
+        assert_eq!(
+            milestones.on_entry(EntryKind::AssistantMessage, 5, at(62)),
+            None
+        );
+        assert_eq!(milestones.on_entry(EntryKind::ToolCall, 6, at(63)), None);
+
+        milestones.on_entry(EntryKind::AssistantMessage, 7, at(200));
+        milestones.on_entry(EntryKind::UserMessage, 8, at(201));
+        assert_eq!(milestones.on_entry(EntryKind::ToolCall, 9, at(202)), None);
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence() {
+        assert_eq!(first_sentence("All done. The tests pass."), "All done.");
+        assert_eq!(first_sentence("Fixed it\nDetails follow"), "Fixed it");
+        assert_eq!(first_sentence("No full stop"), "No full stop");
     }
 }

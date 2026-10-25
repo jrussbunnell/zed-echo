@@ -18,11 +18,9 @@ pub enum SessionEvent {
         session: SharedString,
         error: SharedString,
     },
-    SubagentFinished {
-        label: SharedString,
-        failed: bool,
-    },
-    SidecarAnswer(SharedString),
+    /// A failed subagent counts as a failure: spoken even at `quiet`, and
+    /// not held back by the gap between remarks.
+    SubagentFinished { label: SharedString, failed: bool },
     Milestone {
         session: SharedString,
         text: SharedString,
@@ -75,11 +73,6 @@ impl Feed {
                 true,
                 true,
             ),
-            SessionEvent::SidecarAnswer(answer) => (
-                format!("[sidecar answer: {}]", sanitize(&answer)),
-                true,
-                false,
-            ),
             SessionEvent::TurnFinished { session, summary } => (
                 format!("[{} finished: {}]", sanitize(&session), sanitize(&summary)),
                 at_least_milestones,
@@ -89,8 +82,8 @@ impl Feed {
                 let outcome = if failed { "failed" } else { "finished" };
                 (
                     format!("[subagent \"{}\" {outcome}]", sanitize(&label)),
-                    at_least_milestones,
-                    false,
+                    failed || at_least_milestones,
+                    failed,
                 )
             }
             SessionEvent::Milestone { session, text } => (
@@ -172,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_speaks_only_approvals_failures_and_sidecar_answers() {
+    fn quiet_speaks_only_approvals_and_failures() {
         let now = Instant::now();
         let mut feed = Feed::new(Chattiness::Quiet);
         feed.push(finished("a"), now);
@@ -191,8 +184,25 @@ mod tests {
         let later = now + MIN_REMARK_GAP;
         feed.push(failure(), later);
         assert!(polled(&mut feed, later).unwrap().speak);
-        feed.push(SessionEvent::SidecarAnswer("yes".into()), later);
-        assert!(polled(&mut feed, later + MIN_REMARK_GAP).unwrap().speak);
+        // Right after the failure: a failed subagent skips the gap too.
+        feed.push(
+            SessionEvent::SubagentFinished {
+                label: "Research alternatives".into(),
+                failed: true,
+            },
+            later,
+        );
+        let note = polled(&mut feed, later).unwrap();
+        assert!(note.speak);
+        assert_eq!(note.text, "[subagent \"Research alternatives\" failed]");
+        feed.push(
+            SessionEvent::SubagentFinished {
+                label: "Research alternatives".into(),
+                failed: false,
+            },
+            later,
+        );
+        assert!(!polled(&mut feed, later).unwrap().speak);
     }
 
     #[test]
