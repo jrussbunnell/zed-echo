@@ -1,0 +1,11 @@
+{
+  "event_id": "e0f2a5e9-1269-40cf-8aff-3357701ff163",
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "code": "not_found",
+    "message": "All 1 model(s) failed:\n- openai/gpt-4.1-nano: rpc error: code = NotFound desc = The model 'openai/gpt-4.1-nano' was retired on 2026-10-23 and is no longer available. See https://inworld.ai/models for available models.",
+    "param": null,
+    "event_id": null
+  }
+}

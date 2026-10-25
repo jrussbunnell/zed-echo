@@ -187,6 +187,7 @@ impl VsCodeSettings {
             auto_update: None,
             read_aloud: None,
             listen: None,
+            voice_mode: None,
             agent_panel_styling: None,
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,

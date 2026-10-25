@@ -2918,7 +2918,7 @@ impl ThreadView {
     }
 
     #[cfg(test)]
-    pub(super) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
+    pub(crate) fn set_read_aloud_for_test(&mut self, read_aloud: Entity<read_aloud::ReadAloud>) {
         self.read_aloud = Some(read_aloud);
     }
 

@@ -738,6 +738,23 @@
     // one doing the work.
     "sidecar": true
   },
+  // Real-time voice mode: a spoken conversation with the agent. Changes
+  // apply the next time voice mode opens.
+  "voice_mode": {
+    // "inworld" is the only provider; it needs INWORLD_API_KEY or the keychain.
+    "provider": "inworld",
+    // The language model that answers. Unset uses the built-in default.
+    "model": null,
+    // The provider's voice. Unset uses read_aloud's voice_id.
+    "voice": null,
+    // How much is said unprompted: "quiet", "milestones", or "commentary".
+    "chattiness": "milestones",
+    // How long silence is tolerated before the session ends.
+    "idle_timeout_seconds": 300,
+    // How quickly a pause counts as the end of your turn: "low", "medium",
+    // or "high". Higher answers sooner but may cut in on a pause.
+    "turn_eagerness": "high"
+  },
   // Custom styling for the agent panel's content types: "assistant_prose",
   // "thinking", "tool_output" (tool cards, terminal output labels, diff
   // text), "user_message", and "code_blocks" (fenced code in assistant

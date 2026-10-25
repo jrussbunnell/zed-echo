@@ -122,7 +122,7 @@ mod tests {
 }
 
 use crate::agent_panel::AgentPanel;
-use acp_thread::AcpThread;
+use crate::sidecar::Sidecar;
 use gpui::{
     Action as _, AnyWindowHandle, App, AppContext as _, Context, Entity, SharedString,
     Subscription, Window,
@@ -140,6 +140,17 @@ use util::ResultExt as _;
 /// exchange.
 const CONFIRMATION_WINDOW: Duration = Duration::from_secs(8);
 
+/// Lets tests start the wake listener without a microphone or an API key.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+pub struct TestListening {
+    pub wake: Arc<dyn listen::WakeSource>,
+    pub stt: Arc<dyn listen::SttProvider>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl gpui::Global for TestListening {}
+
 /// The wake listener, plus what it is waiting to hear back.
 pub struct VoiceSession {
     listener: Entity<Listener>,
@@ -153,7 +164,7 @@ pub struct VoiceSession {
     exchanges: Vec<(String, String)>,
     /// The session that answers questions, made on the first one that needs
     /// it and kept warm after.
-    sidecar: Option<Sidecar>,
+    sidecar: Option<Entity<Sidecar>>,
     _subscription: Subscription,
 }
 
@@ -166,6 +177,18 @@ impl AgentPanel {
     pub(crate) fn start_listening(&mut self, window: &Window, cx: &mut Context<Self>) {
         let settings = ListenSettings::get_global(cx).clone();
         if !settings.enabled {
+            return;
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(test_listening) = cx.try_global::<TestListening>().cloned() {
+            self.install_listener(
+                test_listening.stt,
+                test_listening.wake,
+                &settings,
+                window.window_handle(),
+                cx,
+            );
             return;
         }
 
@@ -210,30 +233,62 @@ impl AgentPanel {
                 };
                 let stt: Arc<dyn listen::SttProvider> =
                     Arc::new(listen::InworldStt::new(http_client, api_key));
-
-                let wake_word = settings.wake_word.clone();
-                let conversation = settings.conversation;
-                let conversation_window = settings.conversation_window;
-                let listener = cx.new(|cx| {
-                    let mut listener = Listener::new(stt, wake, cx);
-                    listener.set_wake_word(wake_word);
-                    listener.set_conversation(conversation, conversation_window);
-                    listener
-                });
-                let subscription = cx.subscribe(&listener, Self::handle_listen_event);
-
-                panel.voice = Some(VoiceSession {
-                    listener,
-                    awaiting_confirmation: None,
-                    window,
-                    exchanges: Vec::new(),
-                    sidecar: None,
-                    _subscription: subscription,
-                });
+                panel.install_listener(stt, wake, &settings, window, cx);
             })
             .log_err();
         })
         .detach();
+    }
+
+    fn install_listener(
+        &mut self,
+        stt: Arc<dyn listen::SttProvider>,
+        wake: Arc<dyn listen::WakeSource>,
+        settings: &ListenSettings,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        // Voice mode holds the microphone; it restarts listening on close.
+        #[cfg(target_os = "macos")]
+        if crate::voice_mode::VoiceMode::is_open(cx) {
+            return;
+        }
+        let wake_word = settings.wake_word.clone();
+        let conversation = settings.conversation;
+        let conversation_window = settings.conversation_window;
+        let listener = cx.new(|cx| {
+            let mut listener = Listener::new(stt, wake, cx);
+            listener.set_wake_word(wake_word);
+            listener.set_conversation(conversation, conversation_window);
+            listener
+        });
+        let subscription = cx.subscribe(&listener, Self::handle_listen_event);
+
+        self.voice = Some(VoiceSession {
+            listener,
+            awaiting_confirmation: None,
+            window,
+            exchanges: Vec::new(),
+            sidecar: None,
+            _subscription: subscription,
+        });
+    }
+
+    /// Releases the microphone for voice mode. The wake listener holds it
+    /// for as long as it lives, so it is dropped rather than paused.
+    pub(crate) fn stop_listening(&mut self) {
+        self.voice = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_listening(&self) -> bool {
+        self.voice.is_some()
+    }
+
+    /// Quiets every reader in this panel for voice mode, without latching a
+    /// stop, so narration of new messages resumes once it closes.
+    pub(crate) fn silence_all_narration(&self, cx: &mut Context<Self>) {
+        self.for_each_reader(cx, |read_aloud, cx| read_aloud.silence(cx));
     }
 
     fn handle_listen_event(
@@ -482,8 +537,15 @@ impl AgentPanel {
     /// Without this a voice command that failed would be silent, which to
     /// someone not looking at the screen is indistinguishable from one that
     /// was never heard.
-    fn say_to_the_user(&self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(crate) fn say_to_the_user(&self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
         let line = line.into();
+        // Two Echo voices must never talk over each other, so while voice
+        // mode is open the line goes to it and is said in its voice.
+        #[cfg(target_os = "macos")]
+        if crate::voice_mode::VoiceMode::is_open(cx) {
+            crate::voice_mode::VoiceMode::note(line, cx);
+            return;
+        }
         let reader = self
             .conversation_views()
             .iter()
@@ -748,102 +810,6 @@ mod route_tests {
     }
 }
 
-/// A second agent session, so a question does not cost the session doing the
-/// work.
-///
-/// The whole point is isolation: it never enters the thread list, its answers
-/// are spoken and dropped, and the working session never sees that it exists.
-pub struct Sidecar {
-    thread: Entity<AcpThread>,
-    /// Set once the opening instructions have been delivered, so they are not
-    /// repeated on every question.
-    briefed: bool,
-}
-
-/// What the sidecar is told before its first question.
-///
-/// It is a second pair of hands, not a lookup service: it can change things,
-/// and the exchange is meant to continue rather than end at one answer.
-///
-/// The hazard that buys is two sessions writing one working tree. Nothing
-/// here prevents that — the briefing steers around it by telling the sidecar
-/// what the other session is holding and to say so rather than fight over a
-/// file, and its tool calls still surface for approval before they run.
-pub fn sidecar_briefing(transcript: Option<&std::path::Path>) -> String {
-    let transcript = match transcript {
-        Some(path) => format!(
-            "\n\nThe session you are answering about writes its transcript to {}. \
-             Read it when the question is about what was already said or decided.",
-            path.display()
-        ),
-        None => String::new(),
-    };
-
-    format!(
-        "You work alongside another agent session in this project, for somebody \
-         listening rather than reading. They are talking to you by voice while \
-         that other session works. It is mid-task; you are not it.\n\n\
-         You can read, search, and change things, and the conversation \
-         continues — expect follow-ups, and expect to be asked to act on what \
-         you just said.\n\n\
-         Rules:\n\
-         - Answer in one or two spoken sentences. Your reply is read aloud.\n\
-         - Look before answering. If you did not check, say you did not.\n\
-         - The other session is editing files right now. Before you change one, \
-         say which, and prefer somewhere it is not working. If it is holding \
-         the file, say so instead of fighting over it.\n\
-         - No markdown, no code blocks, no paths read out in full — say \"the \
-         listener\" rather than \"crates/listen/src/listener.rs\".{transcript}"
-    )
-}
-
-#[cfg(test)]
-mod sidecar_tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn the_briefing_says_it_is_not_the_session_doing_the_work() {
-        let briefing = sidecar_briefing(None);
-        assert!(briefing.contains("you are not it"));
-    }
-
-    /// It is a second pair of hands, not a lookup service.
-    #[test]
-    fn the_briefing_lets_it_act_and_expects_the_exchange_to_continue() {
-        let briefing = sidecar_briefing(None);
-        assert!(briefing.contains("change things"));
-        assert!(briefing.contains("follow-ups"));
-        assert!(
-            !briefing.contains("Read only"),
-            "read-only was lifted deliberately"
-        );
-    }
-
-    /// Two sessions writing one tree is the cost of letting it act. Nothing
-    /// prevents it, so the briefing has to steer around it.
-    #[test]
-    fn the_briefing_warns_it_off_files_the_other_session_is_holding() {
-        let briefing = sidecar_briefing(None);
-        assert!(briefing.contains("editing files right now"));
-    }
-
-    /// Without the path the sidecar cannot answer "what did it decide
-    /// earlier?", which is half of what it exists for.
-    #[test]
-    fn the_briefing_carries_the_transcript_path_when_there_is_one() {
-        let briefing = sidecar_briefing(Some(Path::new("/tmp/session.jsonl")));
-        assert!(briefing.contains("/tmp/session.jsonl"));
-    }
-
-    #[test]
-    fn a_missing_transcript_leaves_the_briefing_otherwise_intact() {
-        let briefing = sidecar_briefing(None);
-        assert!(!briefing.contains("transcript to"));
-        assert!(briefing.contains("Answer in one or two spoken sentences"));
-    }
-}
-
 impl AgentPanel {
     /// Decides where something spoken should go, and sends it there.
     ///
@@ -871,10 +837,12 @@ impl AgentPanel {
             .as_ref()
             .map(|voice| voice.exchanges.clone())
             .unwrap_or_default();
-        let mid_sidecar = self
-            .voice
-            .as_ref()
-            .is_some_and(|voice| voice.sidecar.as_ref().is_some_and(|s| s.briefed));
+        let mid_sidecar = self.voice.as_ref().is_some_and(|voice| {
+            voice
+                .sidecar
+                .as_ref()
+                .is_some_and(|sidecar| sidecar.read(cx).is_briefed())
+        });
         let prompt = router_prompt(&utterance, &state, &exchanges, mid_sidecar);
 
         cx.spawn(async move |this, cx| {
@@ -979,118 +947,50 @@ impl AgentPanel {
         // silence reads as "it is looking" instead of "it did not hear me".
         self.say_to_the_user("Let me check.", cx);
 
-        let transcript = thread_view.read(cx).voice_candidate(false, cx).session_id;
-        let briefing = self.voice.as_ref().is_some_and(|voice| {
-            voice
-                .sidecar
-                .as_ref()
-                .is_some_and(|sidecar| sidecar.briefed)
-        });
-        let opening = if briefing {
-            question
-        } else {
-            format!(
-                "{}\n\n{question}",
-                sidecar_briefing(
-                    crate::subagent_notifications::transcript_path(&transcript).as_deref()
-                )
-            )
-        };
-
-        let Some(thread) = self.ensure_sidecar(cx) else {
+        let about = thread_view.read(cx).voice_candidate(false, cx).session_id;
+        let Some(sidecar) = self.ensure_sidecar(cx) else {
             log::error!("listen: no sidecar session, so the question goes to the agent");
             self.send_to_agent(utterance, thread_view, cx);
             return;
         };
+        let answer = sidecar.update(cx, |sidecar, cx| sidecar.ask(question, Some(about), cx));
 
         cx.spawn(async move |this, cx| {
-            let answered = thread
-                .update(cx, |thread, cx| {
-                    thread.send(
-                        vec![acp::ContentBlock::Text(acp::TextContent::new(opening))],
-                        cx,
-                    )
-                })
-                .await
-                .is_ok();
-
-            this.update(cx, |panel, cx| {
-                if let Some(voice) = panel.voice.as_mut()
-                    && let Some(sidecar) = voice.sidecar.as_mut()
-                {
-                    sidecar.briefed = true;
+            let answer = answer.await;
+            this.update(cx, |panel, cx| match answer {
+                Ok(answer) => {
+                    panel.remember_exchange(utterance, answer.clone());
+                    panel.say_to_the_user(answer, cx);
                 }
-                if !answered {
+                Err(error) => {
+                    log::error!("listen: the sidecar did not answer: {error:#}");
                     panel.say_to_the_user("I couldn't check that.", cx);
-                    return;
                 }
-                let Some(answer) = panel.last_sidecar_answer(cx) else {
-                    panel.say_to_the_user("I couldn't check that.", cx);
-                    return;
-                };
-                panel.remember_exchange(utterance, answer.clone());
-                panel.say_to_the_user(answer, cx);
             })
             .log_err();
         })
         .detach();
     }
 
-    /// The sidecar's session, made once and reused.
-    fn ensure_sidecar(&mut self, cx: &mut Context<Self>) -> Option<Entity<AcpThread>> {
-        if let Some(voice) = self.voice.as_ref()
-            && let Some(sidecar) = voice.sidecar.as_ref()
+    /// The sidecar, once its session is ready.
+    ///
+    /// Creating one needs a connection and a turn of the executor, so the
+    /// first question is answered by the agent while it warms up. Every
+    /// question after that has a session waiting. One that failed to start is
+    /// replaced, so a transient failure does not leave voice without one.
+    fn ensure_sidecar(&mut self, cx: &mut Context<Self>) -> Option<Entity<Sidecar>> {
+        if let Some(sidecar) = self.voice.as_ref()?.sidecar.as_ref()
+            && !sidecar.read(cx).has_failed()
         {
-            return Some(sidecar.thread.clone());
+            return sidecar.read(cx).is_ready().then(|| sidecar.clone());
         }
-        // Creating one needs a connection and a turn of the executor, so the
-        // first question is answered by the agent while it warms up. Every
-        // question after this one has a session waiting.
-        self.spawn_sidecar(cx);
-        None
-    }
 
-    fn spawn_sidecar(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.active_conversation_view().cloned() else {
-            return;
-        };
-        let Some(connection) = view.read(cx).connection() else {
-            return;
-        };
+        let connection = self.active_conversation_view()?.read(cx).connection()?;
         let project = self.project.clone();
-
-        cx.spawn(async move |this, cx| {
-            let created = cx
-                .update(|cx| {
-                    connection.new_session(project, util::path_list::PathList::default(), cx)
-                })
-                .await;
-            let Ok(thread) = created else {
-                log::error!("listen: could not start a sidecar session");
-                return;
-            };
-            this.update(cx, |panel, _| {
-                if let Some(voice) = panel.voice.as_mut() {
-                    voice.sidecar = Some(Sidecar {
-                        thread,
-                        briefed: false,
-                    });
-                }
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    /// The sidecar's most recent assistant message, which is its answer.
-    fn last_sidecar_answer(&self, cx: &App) -> Option<String> {
-        let thread = self.voice.as_ref()?.sidecar.as_ref()?.thread.read(cx);
-        thread.entries().iter().rev().find_map(|entry| {
-            let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry else {
-                return None;
-            };
-            let text = message.to_markdown(cx);
-            (!text.trim().is_empty()).then(|| text.trim().to_string())
-        })
+        let sidecar = cx.new(|cx| Sidecar::new(connection, project, cx));
+        if let Some(voice) = self.voice.as_mut() {
+            voice.sidecar = Some(sidecar);
+        }
+        None
     }
 }

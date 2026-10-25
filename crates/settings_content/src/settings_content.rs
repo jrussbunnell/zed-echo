@@ -219,6 +219,9 @@ pub struct SettingsContent {
     /// Configuration for listening for spoken commands.
     pub listen: Option<ListenSettingsContent>,
 
+    /// Configuration for real-time voice mode.
+    pub voice_mode: Option<VoiceModeSettingsContent>,
+
     /// Custom styling for content types rendered in the agent panel.
     pub agent_panel_styling: Option<AgentPanelStylingContent>,
 
@@ -423,7 +426,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,
         // Echo's own settings sections.
-        read_aloud, listen, agent_panel_styling,
+        read_aloud, listen, voice_mode, agent_panel_styling,
     },
     defaults: {},
 });
@@ -741,6 +744,88 @@ pub struct ListenSettingsContent {
     ///
     /// Default: true
     pub sidecar: Option<bool>,
+}
+
+/// Configuration for real-time voice mode. Changes apply the next time voice
+/// mode opens.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct VoiceModeSettingsContent {
+    /// Which real-time voice provider carries the conversation.
+    ///
+    /// Any value other than "inworld" disables voice mode with a notice
+    /// rather than silently falling back to Inworld.
+    ///
+    /// Default: inworld
+    pub provider: Option<String>,
+    /// The language model that answers, as the provider names it. Unset uses
+    /// the built-in default.
+    pub model: Option<String>,
+    /// The provider's voice to speak with. Unset uses `read_aloud.voice_id`.
+    pub voice: Option<String>,
+    /// How much the agent says unprompted while it works.
+    ///
+    /// Default: milestones
+    pub chattiness: Option<VoiceChattiness>,
+    /// How long voice mode stays open without anyone speaking before it ends
+    /// the session. Zero or negative values use the default.
+    ///
+    /// Default: 300
+    pub idle_timeout_seconds: Option<i64>,
+    /// How quickly the model decides you have finished speaking. Higher
+    /// answers sooner but is likelier to cut in on a pause.
+    ///
+    /// Default: high
+    pub turn_eagerness: Option<VoiceTurnEagerness>,
+}
+
+/// How much voice mode says unprompted.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceChattiness {
+    /// Speak only when spoken to or when something needs a decision.
+    Quiet,
+    /// Also speak when a piece of work finishes or fails.
+    #[default]
+    Milestones,
+    /// Also narrate what the agent is doing as it goes.
+    Commentary,
+}
+
+/// How quickly voice mode decides a spoken turn is over.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceTurnEagerness {
+    Low,
+    Medium,
+    #[default]
+    High,
 }
 
 /// How much of an assistant response read-aloud speaks.

@@ -1,0 +1,10 @@
+{
+  "event_id": "e1a8a1c5-a764-4c26-8b9f-18bc621cb81d",
+  "type": "response.function_call_arguments.done",
+  "response_id": "f3bdcb85-795a-4f6b-887c-e8ac9d2184b2",
+  "item_id": "38328022-a9ed-4700-a0a1-e1c91cafe414",
+  "output_index": 1,
+  "call_id": "call_549370",
+  "name": "ping",
+  "arguments": "{\"message\": \"hello\"}"
+}

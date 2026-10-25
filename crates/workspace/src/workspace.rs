@@ -1596,6 +1596,7 @@ pub struct Workspace {
     status_bar: Entity<StatusBar>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
+    voice_overlay: Option<AnyView>,
     titlebar_item: Option<AnyView>,
     titlebar_focus_handle: FocusHandle,
     region_focus_handles: RegionFocusHandles,
@@ -2101,6 +2102,7 @@ impl Workspace {
             status_bar,
             modal_layer,
             toast_layer,
+            voice_overlay: None,
             titlebar_item: None,
             titlebar_focus_handle: cx.focus_handle(),
             region_focus_handles: RegionFocusHandles::new(cx),
@@ -8671,6 +8673,17 @@ impl Workspace {
         });
     }
 
+    /// Voice mode's glow, caption and pill, drawn across the bottom edge.
+    pub fn set_voice_overlay(&mut self, overlay: Option<AnyView>, cx: &mut Context<Self>) {
+        self.voice_overlay = overlay;
+        cx.notify();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn voice_overlay(&self) -> Option<&AnyView> {
+        self.voice_overlay.as_ref()
+    }
+
     pub fn toggle_status_toast<V: ToastView>(&mut self, entity: Entity<V>, cx: &mut App) {
         self.toast_layer
             .update(cx, |toast_layer, cx| toast_layer.toggle_toast(cx, entity))
@@ -10176,7 +10189,12 @@ impl Render for Workspace {
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
-                    .child(self.toast_layer.clone()),
+                    .child(self.toast_layer.clone())
+                    // Only the overlay's own pill takes the mouse; the rest
+                    // of it has no handlers, so clicks pass through.
+                    .when_some(self.voice_overlay.clone(), |this, overlay| {
+                        this.child(div().absolute().bottom_0().left_0().w_full().child(overlay))
+                    }),
             )
     }
 }

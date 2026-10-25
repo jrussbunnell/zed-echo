@@ -4479,6 +4479,52 @@ impl AgentPanel {
         });
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn start_session_by_voice(
+        &mut self,
+        task: String,
+        agent: Option<crate::Agent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_thread(
+            agent,
+            None,
+            None,
+            None,
+            Some(AgentInitialContent::ContentBlock {
+                blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(task))],
+                auto_submit: true,
+            }),
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
+
+    /// The agent a spoken name refers to: its id, or a word of its display
+    /// name ("claude" for "Claude Code").
+    #[cfg(target_os = "macos")]
+    pub(crate) fn agent_named(&self, name: &str, cx: &App) -> Option<Agent> {
+        let name = name.trim().to_lowercase();
+        let store = self.project.read(cx).agent_server_store().read(cx);
+        let mut agents = vec![(Agent::NativeAgent, Agent::NativeAgent.label())];
+        agents.extend(store.external_agents().map(|id| {
+            let label = store.agent_display_name(id).unwrap_or_else(|| id.0.clone());
+            (Agent::from(id.clone()), label)
+        }));
+        #[cfg(any(test, feature = "test-support"))]
+        agents.push((Agent::Stub, Agent::Stub.label()));
+        agents.into_iter().find_map(|(agent, label)| {
+            let label = label.to_lowercase();
+            let matches = agent.id().0.to_lowercase() == name
+                || label == name
+                || label.split_whitespace().any(|word| word == name);
+            matches.then_some(agent)
+        })
+    }
+
     pub fn new_agent_thread_with_external_source_prompt(
         &mut self,
         external_source_prompt: Option<ExternalSourcePrompt>,

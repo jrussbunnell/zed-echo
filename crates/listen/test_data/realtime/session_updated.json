@@ -1,0 +1,73 @@
+{
+  "event_id": "5a500d1c-a063-459f-9a1f-1140c7c4d6d7",
+  "type": "session.updated",
+  "session": {
+    "type": "realtime",
+    "id": "beaming-colt-9670:94302e7b-778a-45c5-a8b3-855b21bbffba",
+    "object": "realtime.session",
+    "output_modalities": [
+      "audio",
+      "text"
+    ],
+    "instructions": "You are a concise voice assistant.",
+    "audio": {
+      "input": {
+        "format": {
+          "type": "audio/pcm",
+          "rate": 24000
+        },
+        "transcription": {
+          "model": "inworld/inworld-stt-1"
+        },
+        "noise_reduction": null,
+        "turn_detection": {
+          "type": "semantic_vad",
+          "eagerness": "medium",
+          "create_response": true,
+          "interrupt_response": true
+        }
+      },
+      "output": {
+        "format": {
+          "type": "audio/pcm",
+          "rate": 24000
+        },
+        "voice": "Clive",
+        "model": "inworld-tts-2-flash",
+        "speed": 1
+      }
+    },
+    "tools": [
+      {
+        "type": "function",
+        "name": "ping",
+        "description": "Ping",
+        "parameters": {
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "type": "object"
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "temperature": 1,
+    "max_output_tokens": "inf",
+    "truncation": "auto",
+    "prompt": null,
+    "tracing": null,
+    "model": "google/gemini-3.1-flash-lite",
+    "expires_at": 1792904743,
+    "include": null,
+    "providerData": {
+      "user_id": "beaming-colt-9670:94302e7b-778a-45c5-a8b3-855b21bbffba",
+      "stt": {},
+      "auto_tool_response": true
+    }
+  }
+}
