@@ -64,7 +64,7 @@ pub use sink::FakeSink;
 
 use futures::FutureExt as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Hsla, SharedString,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Hsla, SharedString,
     Subscription, Task,
 };
 use markdown::Markdown;
@@ -238,6 +238,21 @@ pub fn parse_hex_color(text: &str) -> Option<Hsla> {
         }
         .into(),
     )
+}
+
+struct NarrationSuppressed(bool);
+
+impl Global for NarrationSuppressed {}
+
+/// While voice mode is open, per-thread narration must stay silent so only one
+/// voice speaks. Dropped narration is not replayed when this is cleared.
+pub fn set_suppressed(suppressed: bool, cx: &mut App) {
+    cx.set_global(NarrationSuppressed(suppressed));
+}
+
+pub fn is_suppressed(cx: &App) -> bool {
+    cx.try_global::<NarrationSuppressed>()
+        .is_some_and(|suppressed| suppressed.0)
 }
 
 pub fn init(cx: &mut gpui::App) {
@@ -738,6 +753,9 @@ impl ReadAloud {
         message_complete: bool,
         cx: &mut Context<Self>,
     ) {
+        if is_suppressed(cx) {
+            return;
+        }
         Self::start_parsing([markdown], cx);
         let switched_entity = self.speaking.as_ref() != Some(markdown);
         if switched_entity {
@@ -1204,6 +1222,9 @@ impl ReadAloud {
     /// structured input and its title both arrive after the entry does, so
     /// this is called once they have stopped changing.
     pub fn narrate_tool_call(&mut self, facts: ToolCallFacts, cx: &mut Context<Self>) {
+        if is_suppressed(cx) {
+            return;
+        }
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
         }
@@ -1346,6 +1367,9 @@ impl ReadAloud {
     /// call this for a message that can no longer grow — a summary of half
     /// a message is worse than none.
     pub fn narrate_message(&mut self, blocks: Vec<Entity<Markdown>>, cx: &mut Context<Self>) {
+        if is_suppressed(cx) {
+            return;
+        }
         Self::start_parsing(&blocks, cx);
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user || blocks.is_empty() {
             return;
@@ -1643,6 +1667,7 @@ impl ReadAloud {
             || self.detail != NarrationDetail::Steps
             || self.stopped_by_user
             || self.step.is_none()
+            || is_suppressed(cx)
         {
             return;
         }
@@ -1947,6 +1972,9 @@ impl ReadAloud {
         message_chars: usize,
         cx: &mut Context<Self>,
     ) {
+        if is_suppressed(cx) {
+            return;
+        }
         Self::start_parsing(&blocks, cx);
         if !self.wants_wrap_up(message_chars) {
             return;
@@ -2103,6 +2131,9 @@ impl ReadAloud {
         blocks: Vec<Entity<Markdown>>,
         cx: &mut Context<Self>,
     ) {
+        if is_suppressed(cx) {
+            return;
+        }
         Self::start_parsing(&blocks, cx);
         self.stopped_by_user = false;
         let budget = WrapUpBudget::for_turn(span.tool_calls, span.elapsed);
@@ -2158,6 +2189,9 @@ impl ReadAloud {
     /// since the last catch-up", and nothing else so far. Explicit, so it
     /// lifts the stop latch exactly as [`Self::catch_up`] does.
     pub fn announce(&mut self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
+        if is_suppressed(cx) {
+            return;
+        }
         self.stopped_by_user = false;
         self.catch_up = None;
         let spoken = cx.new(|cx| Markdown::new(line.into(), None, None, cx));
@@ -2231,6 +2265,9 @@ impl ReadAloud {
     /// the wrap-up: a cohesive account of the whole turn rather than a
     /// re-run of its status lines.
     pub fn finish_turn(&mut self, blocks: Vec<Entity<Markdown>>, cx: &mut Context<Self>) {
+        if is_suppressed(cx) {
+            return;
+        }
         Self::start_parsing(&blocks, cx);
         if self.mode != ReadAloudMode::Narration || self.stopped_by_user {
             return;
@@ -2958,6 +2995,86 @@ mod tests {
             None,
             "one bad entry rejects the whole pair"
         );
+    }
+
+    #[gpui::test]
+    async fn suppressed_narration_is_dropped_not_queued(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown = cx.new(|cx| Markdown::new("Spoken text.\n".into(), None, None, cx));
+        cx.run_until_parked();
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            let sink = sink.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx)
+        });
+
+        cx.update(|cx| set_suppressed(true, cx));
+        assert!(cx.update(|cx| is_suppressed(cx)));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_mode(ReadAloudMode::Narration, cx);
+            read_aloud.announce("Status.", cx);
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+            read_aloud.narrate_message(vec![markdown.clone()], cx);
+            read_aloud.finish_turn(vec![markdown.clone()], cx);
+            read_aloud.speculate_wrap_up(vec![markdown.clone()], 500, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(sink.queued_chunks(), 0);
+        assert!(provider.spoken().is_empty());
+    }
+
+    #[gpui::test]
+    async fn clearing_suppression_does_not_replay_the_backlog(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let markdown = cx.new(|cx| Markdown::new("Spoken text.\n".into(), None, None, cx));
+        cx.run_until_parked();
+        let read_aloud = cx.new({
+            let provider = provider.clone();
+            |cx| ReadAloud::for_test(Arc::new(provider), Box::new(FakeSink::new()), cx)
+        });
+
+        cx.update(|cx| set_suppressed(true, cx));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.set_mode(ReadAloudMode::Narration, cx);
+            read_aloud.announce("Dropped.", cx);
+            read_aloud.narrate_message(vec![markdown.clone()], cx);
+        });
+        cx.update(|cx| set_suppressed(false, cx));
+        cx.run_until_parked();
+        assert!(provider.spoken().is_empty());
+
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.announce("Later.", cx));
+        cx.run_until_parked();
+        assert_eq!(provider.spoken(), vec!["Later.".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn a_reader_paused_by_hand_stays_paused_after_suppression(cx: &mut TestAppContext) {
+        let provider = FakeTts::new();
+        let sink = FakeSink::new();
+        let markdown =
+            cx.new(|cx| Markdown::new("First one. Second one.\n".into(), None, None, cx));
+        cx.run_until_parked();
+        let read_aloud = cx.new(|cx| ReadAloud::for_test(Arc::new(provider), Box::new(sink), cx));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.run_until_parked();
+        read_aloud.update(cx, |read_aloud, cx| read_aloud.toggle_pause(cx));
+
+        cx.update(|cx| set_suppressed(true, cx));
+        read_aloud.update(cx, |read_aloud, cx| {
+            read_aloud.enqueue_markdown(&markdown, false, cx);
+        });
+        cx.update(|cx| set_suppressed(false, cx));
+        cx.run_until_parked();
+
+        let paused = read_aloud.read_with(cx, |read_aloud, cx| {
+            read_aloud.playback_state(cx).map(|state| state.paused)
+        });
+        assert_eq!(paused, Some(true));
     }
 
     #[gpui::test]
