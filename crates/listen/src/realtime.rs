@@ -63,15 +63,23 @@ pub enum ClientEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerEvent {
     SessionCreated,
-    SpeechStarted,
-    SpeechStopped,
+    /// `item_id` names the user's utterance, which its transcript shares.
+    SpeechStarted {
+        item_id: String,
+    },
+    SpeechStopped {
+        item_id: String,
+    },
     AudioDelta {
         item_id: String,
         content_index: u32,
         samples: Vec<i16>,
     },
     AssistantTranscriptDelta(String),
-    UserTranscriptCompleted(String),
+    UserTranscriptCompleted {
+        item_id: String,
+        transcript: String,
+    },
     FunctionCall {
         call_id: String,
         name: String,
@@ -184,8 +192,12 @@ pub fn decode(frame: &str) -> Result<ServerEvent> {
     };
     Ok(match kind {
         "session.created" => ServerEvent::SessionCreated,
-        "input_audio_buffer.speech_started" => ServerEvent::SpeechStarted,
-        "input_audio_buffer.speech_stopped" => ServerEvent::SpeechStopped,
+        "input_audio_buffer.speech_started" => ServerEvent::SpeechStarted {
+            item_id: text("item_id")?,
+        },
+        "input_audio_buffer.speech_stopped" => ServerEvent::SpeechStopped {
+            item_id: text("item_id")?,
+        },
         "response.output_audio.delta" => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(text("delta")?)
@@ -210,7 +222,10 @@ pub fn decode(frame: &str) -> Result<ServerEvent> {
             ServerEvent::AssistantTranscriptDelta(text("delta")?)
         }
         "conversation.item.input_audio_transcription.completed" => {
-            ServerEvent::UserTranscriptCompleted(text("transcript")?)
+            ServerEvent::UserTranscriptCompleted {
+                item_id: text("item_id")?,
+                transcript: text("transcript")?,
+            }
         }
         // `arguments` is a JSON string, passed through undecoded.
         "response.function_call_arguments.done" => ServerEvent::FunctionCall {
@@ -275,14 +290,18 @@ mod tests {
             decode(SESSION_UPDATED).unwrap(),
             ServerEvent::Other
         ));
-        assert!(matches!(
+        assert_eq!(
             decode(SPEECH_STARTED).unwrap(),
-            ServerEvent::SpeechStarted
-        ));
-        assert!(matches!(
-            decode(r#"{"type":"input_audio_buffer.speech_stopped"}"#).unwrap(),
-            ServerEvent::SpeechStopped
-        ));
+            ServerEvent::SpeechStarted {
+                item_id: "7f9ce6ed-24a8-4439-9c69-58b4c2200325".into()
+            }
+        );
+        assert_eq!(
+            decode(r#"{"type":"input_audio_buffer.speech_stopped","item_id":"item_1"}"#).unwrap(),
+            ServerEvent::SpeechStopped {
+                item_id: "item_1".into()
+            }
+        );
         let ServerEvent::AudioDelta {
             item_id,
             content_index,
@@ -298,10 +317,13 @@ mod tests {
             panic!("not a transcript delta");
         };
         assert_eq!(text, "Hi.");
-        let ServerEvent::UserTranscriptCompleted(text) = decode(INPUT_TRANSCRIPT).unwrap() else {
-            panic!("not a user transcript");
-        };
-        assert_eq!(text, "What time is it?");
+        assert_eq!(
+            decode(INPUT_TRANSCRIPT).unwrap(),
+            ServerEvent::UserTranscriptCompleted {
+                item_id: "7f9ce6ed-24a8-4439-9c69-58b4c2200325".into(),
+                transcript: "What time is it?".into(),
+            }
+        );
         let ServerEvent::FunctionCall {
             call_id,
             name,
