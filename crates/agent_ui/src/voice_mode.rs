@@ -114,6 +114,9 @@ struct Session {
     /// The last error the server reported, so a close that follows it can
     /// say why.
     last_error: Option<String>,
+    /// Keeps the overlay on whichever project the bound window shows, since
+    /// a project that is not displayed does not render it.
+    _follow_active_project: Option<Subscription>,
     _connection: Task<()>,
     _microphone_pump: Option<Task<()>>,
     _caption_fade: Option<Task<()>>,
@@ -172,8 +175,10 @@ impl Session {
 /// The app-wide real-time voice conversation with Echo. There is one
 /// microphone, so there is one of these, held as a global.
 pub struct VoiceMode {
-    /// `None` connects to Inworld with the key read-aloud uses.
-    provider: Option<Rc<dyn RealtimeVoice>>,
+    /// Looks up the key read-aloud uses; injected so tests never touch the
+    /// keychain.
+    api_key: Box<dyn Fn(&mut App) -> Task<Result<String>>>,
+    provider: Box<dyn Fn(String) -> Rc<dyn RealtimeVoice>>,
     audio: VoiceAudio,
     session: Option<Session>,
     /// Looking up the API key, before anything has opened.
@@ -183,7 +188,8 @@ pub struct VoiceMode {
 
 impl VoiceMode {
     fn new(
-        provider: Option<Rc<dyn RealtimeVoice>>,
+        api_key: Box<dyn Fn(&mut App) -> Task<Result<String>>>,
+        provider: Box<dyn Fn(String) -> Rc<dyn RealtimeVoice>>,
         audio: VoiceAudio,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -201,6 +207,7 @@ impl VoiceMode {
             .ok();
         });
         Self {
+            api_key,
             provider,
             audio,
             session: None,
@@ -210,24 +217,35 @@ impl VoiceMode {
     }
 
     fn install(
-        provider: Option<Rc<dyn RealtimeVoice>>,
+        api_key: Box<dyn Fn(&mut App) -> Task<Result<String>>>,
+        provider: Box<dyn Fn(String) -> Rc<dyn RealtimeVoice>>,
         audio: VoiceAudio,
         cx: &mut App,
     ) -> Entity<Self> {
-        let voice_mode = cx.new(|cx| Self::new(provider, audio, cx));
+        let voice_mode = cx.new(|cx| Self::new(api_key, provider, audio, cx));
         cx.set_global(GlobalVoiceMode(voice_mode.clone()));
         voice_mode
     }
 
     #[cfg(test)]
     pub fn new_for_test(provider: Rc<dyn RealtimeVoice>, cx: &mut App) -> Entity<Self> {
-        Self::install(Some(provider), test_audio(Rc::default()), cx)
+        Self::install(
+            Box::new(|_| Task::ready(Ok("test-key".into()))),
+            Box::new(move |_| provider.clone()),
+            test_audio(Rc::default()),
+            cx,
+        )
     }
 
     fn global(cx: &mut App) -> Entity<Self> {
         match cx.try_global::<GlobalVoiceMode>() {
             Some(global) => global.0.clone(),
-            None => Self::install(None, VoiceAudio::system(), cx),
+            None => Self::install(
+                Box::new(|cx| read_aloud::resolve_api_key(cx)),
+                Box::new(|api_key| Rc::new(InworldRealtime::new(api_key))),
+                VoiceAudio::system(),
+                cx,
+            ),
         }
     }
 
@@ -274,7 +292,7 @@ impl VoiceMode {
         };
         match &self.session {
             Some(session) if session.window == window => self.close(None, cx),
-            Some(_) => self.move_to(window, workspace, cx),
+            Some(_) => self.bind(window, workspace, cx),
             None => self.begin_opening(window, workspace, cx),
         }
     }
@@ -308,34 +326,27 @@ impl VoiceMode {
             tools: Vec::new(),
             eagerness: settings.turn_eagerness,
         };
-        let api_key = self
-            .provider
-            .is_none()
-            .then(|| read_aloud::resolve_api_key(cx));
-
+        let api_key = (self.api_key)(cx);
         self.opening = Some(cx.spawn(async move |this, cx| {
-            let api_key = match api_key {
-                Some(api_key) => Some(api_key.await),
-                None => None,
-            };
+            let api_key = api_key.await;
             this.update(cx, |this, cx| {
                 this.opening = None;
-                let provider = match api_key {
-                    None => this.provider.clone(),
-                    Some(Ok(api_key)) => {
-                        Some(Rc::new(InworldRealtime::new(api_key)) as Rc<dyn RealtimeVoice>)
-                    }
-                    Some(Err(error)) => {
-                        show_toast(
-                            &workspace,
-                            format!("Voice mode needs an Inworld API key. {error}"),
-                            cx,
-                        );
-                        return;
-                    }
+                // The window may have closed, or switched project, while the
+                // keychain was asked; opening onto a dead window would leave
+                // the microphone live with no pill to show it.
+                let Some(workspace) = workspace_in(window, cx) else {
+                    return;
                 };
-                if let Some(provider) = provider {
-                    this.open(window, workspace, provider, config, cx);
+                match api_key {
+                    Ok(api_key) => {
+                        let provider = (this.provider)(api_key);
+                        this.open(window, workspace, provider, config, cx);
+                    }
+                    Err(error) => show_toast(
+                        &workspace,
+                        format!("Voice mode needs an Inworld API key. {error}"),
+                        cx,
+                    ),
                 }
             })
             .log_err();
@@ -416,6 +427,7 @@ impl VoiceMode {
             caption: None,
             caption_is_echo: false,
             last_error: None,
+            _follow_active_project: follow_active_project(window, cx),
             _connection: connection,
             _microphone_pump: None,
             _caption_fade: None,
@@ -423,7 +435,8 @@ impl VoiceMode {
         cx.notify();
     }
 
-    fn move_to(
+    /// Moves the overlay onto `workspace`, the active project of `window`.
+    fn bind(
         &mut self,
         window: AnyWindowHandle,
         workspace: Entity<Workspace>,
@@ -432,15 +445,20 @@ impl VoiceMode {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        if let Some(previous) = session.workspace.upgrade() {
+        if let Some(previous) = session.workspace.upgrade()
+            && previous != workspace
+        {
             previous.update(cx, |previous, cx| previous.set_voice_overlay(None, cx));
         }
         let overlay = session.overlay.clone();
         workspace.update(cx, |workspace, cx| {
             workspace.set_voice_overlay(Some(overlay.into()), cx);
         });
-        session.window = window;
         session.workspace = workspace.downgrade();
+        if session.window != window {
+            session.window = window;
+            session._follow_active_project = follow_active_project(window, cx);
+        }
         cx.notify();
     }
 
@@ -459,13 +477,16 @@ impl VoiceMode {
             Some(error) => SharedString::from(format!("{reason} ({error})")),
             None => reason,
         });
-        let workspace = session.workspace.upgrade();
+        let overlay_workspace = session.workspace.upgrade();
+        let active_workspace = workspace_in(session.window, cx);
         // Closes the socket and the microphone.
         drop(session);
 
-        match workspace {
+        if let Some(workspace) = &overlay_workspace {
+            workspace.update(cx, |workspace, cx| workspace.set_voice_overlay(None, cx));
+        }
+        match active_workspace.or(overlay_workspace) {
             Some(workspace) => workspace.update(cx, |workspace, cx| {
-                workspace.set_voice_overlay(None, cx);
                 if let Some(reason) = reason {
                     workspace.show_toast(
                         Toast::new(
@@ -653,6 +674,25 @@ impl VoiceMode {
     }
 }
 
+fn follow_active_project(
+    window: AnyWindowHandle,
+    cx: &mut Context<VoiceMode>,
+) -> Option<Subscription> {
+    let multi_workspace = window.downcast::<MultiWorkspace>()?.entity(cx).ok()?;
+    Some(
+        cx.observe(&multi_workspace, move |this, multi_workspace, cx| {
+            let active = multi_workspace.read(cx).workspace().clone();
+            let moved = this
+                .session
+                .as_ref()
+                .is_some_and(|session| session.workspace != active.downgrade());
+            if moved {
+                this.bind(window, active, cx);
+            }
+        }),
+    )
+}
+
 fn workspace_in(window: AnyWindowHandle, cx: &App) -> Option<Entity<Workspace>> {
     let multi_workspace = window.downcast::<MultiWorkspace>()?;
     multi_workspace
@@ -811,6 +851,8 @@ mod tests {
 
     struct Setup {
         cx: VisualTestContext,
+        fs: Arc<FakeFs>,
+        multi_workspace: gpui::WindowHandle<MultiWorkspace>,
         workspace: Entity<Workspace>,
         panel: Entity<AgentPanel>,
         realtime: FakeRealtime,
@@ -818,7 +860,7 @@ mod tests {
         microphones_opened: Rc<Cell<usize>>,
     }
 
-    async fn setup(provider: Option<FakeRealtime>, cx: &mut TestAppContext) -> Setup {
+    async fn setup(cx: &mut TestAppContext) -> Setup {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -837,6 +879,8 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        fs.insert_tree("/project_b", json!({ "file.txt": "" }))
+            .await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
         let multi_workspace =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -855,10 +899,7 @@ mod tests {
         let realtime = FakeRealtime::new();
         let microphones_opened = Rc::new(Cell::new(0));
         let voice_mode = cx.update(|_, cx| {
-            let voice_mode = match provider {
-                Some(provider) => VoiceMode::new_for_test(Rc::new(provider), cx),
-                None => VoiceMode::install(None, test_audio(Rc::default()), cx),
-            };
+            let voice_mode = VoiceMode::new_for_test(Rc::new(realtime.clone()), cx);
             voice_mode.update(cx, |voice_mode, _| {
                 voice_mode.audio = test_audio(microphones_opened.clone());
             });
@@ -866,6 +907,8 @@ mod tests {
         });
         Setup {
             cx,
+            fs,
+            multi_workspace,
             workspace,
             panel,
             realtime,
@@ -875,10 +918,11 @@ mod tests {
     }
 
     async fn setup_with_fake(cx: &mut TestAppContext) -> Setup {
-        let realtime = FakeRealtime::new();
-        let mut setup = setup(Some(realtime.clone()), cx).await;
-        setup.realtime = realtime;
-        setup
+        setup(cx).await
+    }
+
+    fn has_overlay(workspace: &Entity<Workspace>, cx: &TestAppContext) -> bool {
+        workspace.read_with(cx, |workspace, _| workspace.voice_overlay().is_some())
     }
 
     fn toggle(cx: &mut VisualTestContext) {
@@ -1053,11 +1097,11 @@ mod tests {
 
     #[gpui::test]
     async fn no_api_key_shows_a_toast_and_stays_closed(cx: &mut TestAppContext) {
-        if std::env::var("INWORLD_API_KEY").is_ok() {
-            eprintln!("skipped: INWORLD_API_KEY is set, so a real connection would be made");
-            return;
-        }
-        let mut setup = setup(None, cx).await;
+        let mut setup = setup(cx).await;
+        setup.voice_mode.update(&mut setup.cx, |voice_mode, _| {
+            voice_mode.api_key =
+                Box::new(|_| Task::ready(Err(anyhow::anyhow!("No Inworld API key found."))));
+        });
 
         toggle(&mut setup.cx);
 
@@ -1071,5 +1115,88 @@ mod tests {
         assert!(setup.workspace.read_with(&setup.cx, |workspace, _| {
             workspace.has_notification(&NotificationId::unique::<VoiceModeToast>())
         }));
+    }
+
+    #[gpui::test]
+    async fn the_pill_follows_a_project_switch_in_the_bound_window(cx: &mut TestAppContext) {
+        let mut setup = setup_with_fake(cx).await;
+        open_live(&mut setup);
+        let workspace_a = setup.workspace.clone();
+        assert!(has_overlay(&workspace_a, cx));
+
+        let project_b = Project::test(setup.fs.clone(), [Path::new("/project_b")], cx).await;
+        let workspace_b = setup
+            .multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_b, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            has_overlay(&workspace_b, cx),
+            "the newly shown project draws the pill"
+        );
+        assert!(
+            !has_overlay(&workspace_a, cx),
+            "the hidden project no longer holds it"
+        );
+        assert!(cx.update(|cx| VoiceMode::is_open(cx)));
+
+        let removed = setup
+            .multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.remove(
+                    vec![workspace_b.clone()],
+                    workspace::RemovalIntent::CloseProject,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .expect("closing the project succeeds");
+        assert!(removed);
+        cx.run_until_parked();
+
+        let active = setup
+            .multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert!(cx.update(|cx| VoiceMode::is_open(cx)));
+        assert!(
+            has_overlay(&active, cx),
+            "an open mode always has a pill on the shown project"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_window_closed_before_the_key_resolves_never_opens_the_mode(cx: &mut TestAppContext) {
+        let mut setup = setup(cx).await;
+        let (release_key, key_released) = futures::channel::oneshot::channel::<()>();
+        let gate = std::cell::Cell::new(Some(key_released));
+        setup.voice_mode.update(&mut setup.cx, |voice_mode, _| {
+            voice_mode.api_key = Box::new(move |cx| {
+                let released = gate.take();
+                cx.background_spawn(async move {
+                    if let Some(released) = released {
+                        released.await.ok();
+                    }
+                    Ok("test-key".to_string())
+                })
+            });
+        });
+
+        toggle(&mut setup.cx);
+        setup.cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        release_key.send(()).ok();
+        cx.run_until_parked();
+
+        assert!(!cx.update(|cx| VoiceMode::is_open(cx)));
+        assert!(!cx.update(|cx| read_aloud::is_suppressed(cx)));
+        assert!(setup.panel.read_with(cx, |panel, _| panel.is_listening()));
+        assert_eq!(setup.microphones_opened.get(), 0);
+        assert_eq!(setup.realtime.connections(), 0);
     }
 }
