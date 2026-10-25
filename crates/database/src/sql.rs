@@ -741,7 +741,7 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
                 // Dollar quoting: $tag$ ... $tag$.
                 let tag_end = characters[index + 1..]
                     .iter()
-                    .position(|candidate| !(candidate.is_alphanumeric() || *candidate == '_'))
+                    .position(|candidate| !(is_identifier_start(*candidate) || candidate.is_ascii_digit()))
                     .map(|offset| index + 1 + offset);
                 match tag_end {
                     Some(tag_end) if characters[tag_end] == '$' => {
@@ -762,12 +762,14 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
                 tokens.push(character.to_string());
                 index += 1;
             }
-            character if character.is_alphabetic() || character == '_' => {
+            character if is_identifier_start(character) => {
                 let start = index;
                 while index < characters.len()
                     // Both engines allow `$` after the first character, so
                     // `x$a$` is one identifier, not a dollar quote.
-                    && (characters[index].is_alphanumeric() || matches!(characters[index], '_' | '$'))
+                    && (is_identifier_start(characters[index])
+                        || characters[index].is_ascii_digit()
+                        || characters[index] == '$')
                 {
                     index += 1;
                 }
@@ -777,6 +779,13 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+/// Matches the engines' own lexers: an unquoted identifier may start with any
+/// non-ASCII character, not only a letter. Anything narrower lets `x€$a$`
+/// read as an identifier followed by a dollar quote.
+fn is_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_' || !character.is_ascii()
 }
 
 /// Extracts the role names from a `GRANT `role`@`host` TO ...` line.
@@ -913,6 +922,9 @@ mod tests {
         assert!(check("/* SELECT */ DELETE FROM seller").is_err());
         // `x$a$` is one identifier, not the start of a dollar quote.
         assert!(check("SELECT 1 AS x$a$; COMMIT; DROP TABLE t; SELECT $a$").is_err());
+        assert!(check("SELECT 1 AS x€$a$; COMMIT; DROP TABLE t; SELECT $a$").is_err());
+        assert!(check("SELECT 1 AS €$a$; COMMIT; DROP TABLE t; SELECT $a$").is_err());
+        assert!(check("SELECT $é$;$é$").is_ok());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SHOW TABLES").is_ok());
         assert!(check_read_only_statement(DatabaseKind::Mysql, "SELECT 'it\\'s;' # x").is_ok());
         assert!(
