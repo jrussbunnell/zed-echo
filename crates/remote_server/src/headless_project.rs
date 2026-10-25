@@ -65,6 +65,7 @@ pub struct HeadlessProject {
     pub breakpoint_store: Entity<BreakpointStore>,
     pub agent_server_store: Entity<AgentServerStore>,
     pub context_server_store: Entity<ContextServerStore>,
+    pub database_host: Entity<database::DatabaseHost>,
     pub settings_observer: Entity<SettingsObserver>,
     pub next_entry_id: Arc<AtomicUsize>,
     pub languages: Arc<LanguageRegistry>,
@@ -293,7 +294,10 @@ impl HeadlessProject {
             cx,
         );
 
+        let database_host = cx.new(|_| database::DatabaseHost::new(http_client.clone()));
+
         // local_machine -> ssh handlers
+        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &database_host);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &worktree_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &buffer_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &cx.entity());
@@ -307,6 +311,7 @@ impl HeadlessProject {
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &agent_server_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &context_server_store);
 
+        database::DatabaseHost::init(&session);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
@@ -424,6 +429,7 @@ impl HeadlessProject {
             breakpoint_store,
             agent_server_store,
             context_server_store,
+            database_host,
             languages,
             extensions,
             git_store,

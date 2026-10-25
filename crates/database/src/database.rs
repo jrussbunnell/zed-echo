@@ -3,6 +3,7 @@ mod compare;
 mod convex;
 mod engine;
 mod sql;
+mod store;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 pub use compare::{CompareOptions, CompareOutcome, CompareRow, CompareSide, FieldDiff, compare};
 pub use engine::{Engine, Request, Response};
+pub use store::{
+    ConnectionEntry, ConnectionState, DatabaseHost, DatabaseSettings, DatabaseStore,
+    DatabaseStoreEvent, FetchSource, MissingSecret, QueryHistoryEntry,
+};
 pub use settings::{
     DatabaseAgentAccess, DatabaseEnvironment, DatabaseKind, DatabaseWriteApproval,
 };

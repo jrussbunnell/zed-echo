@@ -30,6 +30,7 @@ client.workspace = true
 collections.workspace = true
 crashes.workspace = true
 dap_adapters.workspace = true
+database.workspace = true
 debug_adapter_extension.workspace = true
 env_logger.workspace = true
 extension.workspace = true

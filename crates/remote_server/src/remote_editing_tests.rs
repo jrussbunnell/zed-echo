@@ -84,6 +84,39 @@ use util::{
 };
 
 #[gpui::test]
+async fn test_database_requests_run_on_the_remote_host(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({ "project": {} })).await;
+    server_cx.update(gpui_tokio::init);
+    server_cx.executor().allow_parking();
+    cx.executor().allow_parking();
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    let client = project.read_with(cx, |project, cx| {
+        project
+            .remote_client()
+            .expect("remote project")
+            .read(cx)
+            .proto_client()
+    });
+    let request = database::Request::Collections {
+        connection: "ryse".to_string(),
+    };
+    let error = client
+        .request(proto::DatabaseRequest {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            payload: serde_json::to_string(&request).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    // The engine on the remote host answered: nothing is connected there.
+    assert!(error.to_string().contains("ryse is not connected"), "{error:#}");
+}
+
+#[gpui::test]
 async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
