@@ -355,7 +355,7 @@ impl Credentials {
 /// The keychain key to store credentials under when `credentials_url` is not
 /// set explicitly.
 ///
-/// Zed Echo is installed alongside stock Zed and signs in to the same server,
+/// Cue is installed alongside stock Zed and signs in to the same server,
 /// so returning `server_url` for both would give them one shared keychain
 /// entry — signing out of one silently signs out of the other. Only this fork's
 /// channel gets a distinct key; the shipping channels keep the upstream value
@@ -384,7 +384,7 @@ impl ClientCredentialsProvider {
 
     /// Returns the key used for credential storage in the system keychain.
     ///
-    /// Zed Echo is installed alongside stock Zed and signs in to the same
+    /// Cue is installed alongside stock Zed and signs in to the same
     /// server, so defaulting this to `server_url` would give both apps the same
     /// keychain entry — signing out of one silently signs out of the other.
     /// Only this fork's channel gets a distinct default; the shipping channels
@@ -2029,7 +2029,7 @@ mod tests {
     use settings::SettingsStore;
     use std::future;
 
-    /// Zed Echo and stock Zed are installed side by side and sign in to the
+    /// Cue and stock Zed are installed side by side and sign in to the
     /// same server. Sharing a keychain key means signing out of one signs out
     /// of the other, so the fork's channel must not collide with Stable — and
     /// Stable must keep the exact upstream value, or every existing install is
@@ -2056,7 +2056,7 @@ mod tests {
         );
 
         let dev = default_credentials_url(server_url, Some(ReleaseChannel::Dev));
-        assert_ne!(dev, stable, "Zed Echo must not clobber stock Zed's entry");
+        assert_ne!(dev, stable, "Cue must not clobber stock Zed's entry");
         assert!(
             dev.starts_with(server_url),
             "the key should still name the server it belongs to, got {dev}"

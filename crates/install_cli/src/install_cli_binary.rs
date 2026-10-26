@@ -25,11 +25,11 @@ const CANT_INSTALL_DOCS_URL: &str = "https://zed.dev/docs/macos#cant-install-cli
 /// commonly because the user is not an admin.
 async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
-    // This fork (Zed Echo) reuses the Dev release channel, so install the
-    // CLI as `zedecho` there instead of clobbering the real Zed's `zed`
+    // This fork (Cue) reuses the Dev release channel, so install the
+    // CLI as `zedcue` there instead of clobbering the real Zed's `zed`
     // symlink.
     let link_name = match cx.update(|cx| ReleaseChannel::global(cx)) {
-        ReleaseChannel::Dev => "zedecho",
+        ReleaseChannel::Dev => "zedcue",
         _ => "zed",
     };
     let bin_dir_path = Path::new("/usr/local/bin");

@@ -1,4 +1,4 @@
-# Zed Echo's own test run.
+# Cue's own test run.
 #
 # Every upstream workflow gates its jobs on
 # `github.repository_owner == 'zed-industries'`, so on this fork they are

@@ -44,7 +44,7 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Echo",
+        ReleaseChannel::Dev => "Zed-Cue",
         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
         ReleaseChannel::Preview => "Zed-Editor-Preview",
         ReleaseChannel::Stable => "Zed-Editor-Stable",
@@ -205,7 +205,7 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Echo",
+            ReleaseChannel::Dev => "Cue",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
@@ -227,7 +227,7 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.jrb.ZedEcho",
+            ReleaseChannel::Dev => "dev.jrb.ZedCue",
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
             ReleaseChannel::Stable => "dev.zed.Zed",
@@ -305,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_channel_is_zed_echo() {
-        assert_eq!(ReleaseChannel::Dev.display_name(), "Echo");
-        assert_eq!(ReleaseChannel::Dev.app_id(), "dev.jrb.ZedEcho");
+    fn dev_channel_is_cue() {
+        assert_eq!(ReleaseChannel::Dev.display_name(), "Cue");
+        assert_eq!(ReleaseChannel::Dev.app_id(), "dev.jrb.ZedCue");
     }
 
     #[test]

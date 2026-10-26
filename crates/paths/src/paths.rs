@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "ZedEcho";
+pub const APP_NAME: &str = "ZedCue";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -606,8 +606,8 @@ mod tests {
 
     #[test]
     fn app_name_is_forked() {
-        assert_eq!(APP_NAME, "ZedEcho");
-        assert_eq!(APP_NAME_LOWERCASE, "zedecho");
+        assert_eq!(APP_NAME, "ZedCue");
+        assert_eq!(APP_NAME_LOWERCASE, "zedcue");
     }
 
     #[test]
@@ -615,11 +615,11 @@ mod tests {
         let config = config_dir();
         let data = data_dir();
         assert!(
-            config.ends_with("zedecho"),
+            config.ends_with("zedcue"),
             "config_dir must not be shared with the real Zed, got {config:?}"
         );
         assert!(
-            data.ends_with("ZedEcho"),
+            data.ends_with("ZedCue"),
             "data_dir must not be shared with the real Zed, got {data:?}"
         );
     }
