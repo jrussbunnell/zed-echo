@@ -128,6 +128,11 @@ pub fn fuzzy_match_positions(query: &str, candidate: &str) -> Option<Vec<usize>>
     None
 }
 
+/// Matches against the title the row renders, so the offsets index that string.
+fn title_match_positions(query: &str, thread: &ThreadMetadata) -> Option<Vec<usize>> {
+    fuzzy_match_positions(query, &thread.display_title())
+}
+
 pub enum ThreadsArchiveViewEvent {
     Close,
     Activate { thread: ThreadMetadata },
@@ -300,12 +305,7 @@ impl ThreadsArchiveView {
 
         for session in sessions {
             let highlight_positions = if !query.is_empty() {
-                let title = session
-                    .title
-                    .as_ref()
-                    .map(|t| t.as_ref())
-                    .unwrap_or(DEFAULT_THREAD_TITLE);
-                if let Some(positions) = fuzzy_match_positions(&query, title) {
+                if let Some(positions) = title_match_positions(&query, &session) {
                     positions
                 } else {
                     // If title didn't match, also try matching the project name
@@ -1649,6 +1649,7 @@ impl PickerDelegate for ProjectPickerDelegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_metadata_store::WorktreePaths;
 
     #[test]
     fn test_fuzzy_match_positions_returns_byte_indices() {
@@ -1665,6 +1666,33 @@ mod tests {
                 "position {pos} is not a valid UTF-8 boundary in {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_title_match_positions_index_the_renamed_title() {
+        let thread = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            archived: true,
+            session_id: None,
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some("Investigate the flaky migration test".into()),
+            title_override: Some("Flaky test".into()),
+            updated_at: Utc::now(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+        };
+
+        let positions = title_match_positions("migration", &thread);
+
+        // The row renders `display_title()`, so offsets into the original title
+        // run past the end of the renamed one and panic in `HighlightedLabel`.
+        assert_eq!(positions, None);
+        let positions = title_match_positions("test", &thread).expect("renamed title matches");
+        let rendered = thread.display_title();
+        assert!(positions.iter().all(|&position| rendered.is_char_boundary(position)));
+        assert_eq!(positions, vec![6, 7, 8, 9]);
     }
 
     #[test]
