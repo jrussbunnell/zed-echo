@@ -1174,8 +1174,6 @@ impl ContextServerStore {
         })
     }
 
-    /// Merges context server settings from all visible worktrees so that servers defined
-    /// in any project folder in a multi-root workspace are picked up.
     /// Adds or (with `None`) removes a server Echo provides itself.
     pub fn set_builtin_server(
         &mut self,
@@ -1217,12 +1215,30 @@ impl ContextServerStore {
         settings
     }
 
+    /// Merges context server settings from all visible worktrees so that servers defined
+    /// in any project folder in a multi-root workspace are picked up. With no visible
+    /// worktrees, falls back to user settings.
     fn resolve_all_context_server_settings(
         worktree_store: &Entity<WorktreeStore>,
         cx: &App,
     ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
         let mut merged = HashMap::default();
-        for worktree in worktree_store.read(cx).visible_worktrees(cx) {
+        let mut visible_worktrees = worktree_store.read(cx).visible_worktrees(cx).peekable();
+        if visible_worktrees.peek().is_none() {
+            // Without this, user servers are missing until the first worktree is added,
+            // and never appear in a window that has no folder.
+            for (id, settings) in &ProjectSettings::get(None, cx).context_servers {
+                merged.insert(
+                    id.clone(),
+                    ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: settings.clone(),
+                    },
+                );
+            }
+            return merged;
+        }
+        for worktree in visible_worktrees {
             let worktree_id = worktree.read(cx).id();
             let location = settings::SettingsLocation {
                 worktree_id,

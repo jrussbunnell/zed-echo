@@ -34,6 +34,8 @@ pub(crate) use skill_creator::{
 #[cfg(test)]
 pub(crate) use skills_setup::displayed_skills;
 pub(crate) use skills_setup::render_skills_setup_page;
+#[cfg(test)]
+pub(crate) use skills_setup::{copy_skill_share_link, trash_skill};
 pub(crate) use theme_studio::{
     default_collapsed_groups as theme_studio_default_collapsed_groups, render_theme_studio_page,
 };

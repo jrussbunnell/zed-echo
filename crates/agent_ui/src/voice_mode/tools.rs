@@ -1,5 +1,5 @@
 use crate::voice_dispatch::{VoiceCandidate, pick_voice_target};
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use gpui::SharedString;
 use listen::ToolDefinition;
 use serde_json::json;

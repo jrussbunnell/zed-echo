@@ -1309,9 +1309,8 @@ impl AgentDiff {
         });
     }
 
-    /// The thread whose edits this workspace's review actions currently act on.
     #[cfg(test)]
-    pub fn active_thread(
+    pub(crate) fn reviewed_thread(
         workspace: &WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Option<Entity<AcpThread>> {
@@ -1491,6 +1490,7 @@ impl AgentDiff {
             | AcpThreadEvent::TokenUsageUpdated(_)
             | AcpThreadEvent::NoticesUpdated
             | AcpThreadEvent::SubagentSpawned(_)
+            | AcpThreadEvent::SubagentAssociationUpdated
             | AcpThreadEvent::EntriesRemoved(_)
             | AcpThreadEvent::ToolAuthorizationRequested(_)
             | AcpThreadEvent::ToolAuthorizationReceived(_)

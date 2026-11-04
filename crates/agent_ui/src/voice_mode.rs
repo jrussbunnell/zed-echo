@@ -7,7 +7,7 @@ use crate::narration_peek::current_activity;
 use crate::sidecar::Sidecar;
 use crate::voice_dispatch::{ConfirmationAnswer, answer_to_confirmation};
 use acp_thread::{AcpThread, AcpThreadEvent, AgentThreadEntry, ThreadStatus};
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use anyhow::Result;
 use collections::HashMap;
 use feed::{Feed, SessionEvent};
@@ -2946,7 +2946,7 @@ mod tests {
         setup: &mut Setup,
         title: &str,
     ) -> (Entity<ThreadView>, acp_thread::StubAgentConnection) {
-        use agent_client_protocol::schema::v1 as acp_v1;
+        use agent_client_protocol::v1::schema as acp_v1;
         let tool_call_id = acp::ToolCallId::new("migrate");
         let connection = acp_thread::StubAgentConnection::new().with_permission_requests(
             collections::HashMap::from_iter([(
@@ -4036,7 +4036,7 @@ mod tests {
     async fn a_stuck_sidecar_question_times_out_and_the_next_one_still_runs(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v1 as acp_v1;
+        use agent_client_protocol::v1::schema as acp_v1;
         let mut setup = setup(cx).await;
         let connection = acp_thread::StubAgentConnection::new();
         open_thread(&mut setup, connection.clone(), "Fix booking");
@@ -4313,7 +4313,7 @@ mod tests {
 
     #[gpui::test]
     async fn ask_sidecar_returns_at_once_and_the_answer_arrives_as_a_note(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v1 as acp_v1;
+        use agent_client_protocol::v1::schema as acp_v1;
         let mut setup = setup(cx).await;
         let connection = acp_thread::StubAgentConnection::new();
         open_thread(&mut setup, connection.clone(), "Fix booking");
@@ -4574,7 +4574,7 @@ mod tests {
     /// Opens a thread that answers its next prompt with `reply`, opens voice
     /// mode, lets Joshua speak, and has the thread finish a turn.
     fn finish_a_turn(setup: &mut Setup, reply: &str) {
-        use agent_client_protocol::schema::v1 as acp_v1;
+        use agent_client_protocol::v1::schema as acp_v1;
         let connection = acp_thread::StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
             acp_v1::ContentChunk::new(reply.into()),

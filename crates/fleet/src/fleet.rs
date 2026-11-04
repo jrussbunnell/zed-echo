@@ -83,7 +83,7 @@ impl<'de> Deserialize<'de> for FleetState {
     }
 }
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v1::schema as acp;
 use claude_home::{AgentMeta, JobState, RosterWorker, Task as TaskItem, TeamConfig};
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task as GpuiTask};
 use std::path::{Path, PathBuf};

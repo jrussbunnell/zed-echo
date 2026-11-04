@@ -5,7 +5,7 @@
 //! are spoken and dropped, and the working session never sees that it exists.
 
 use acp_thread::{AcpThread, AgentConnection};
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
@@ -308,7 +308,7 @@ mod sidecar_tests {
 mod tests {
     use super::*;
     use acp_thread::{AgentThreadEntry, StubAgentConnection};
-    use agent_client_protocol::schema::v1 as acp_v1;
+    use agent_client_protocol::v1::schema as acp_v1;
     use fs::FakeFs;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use project::Project;
