@@ -11105,8 +11105,12 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
-        let is_narration =
-            |ix: &usize| matches!(entries.get(*ix), Some(AgentThreadEntry::AssistantMessage(_)));
+        let is_narration = |ix: &usize| {
+            matches!(
+                entries.get(*ix),
+                Some(AgentThreadEntry::AssistantMessage(_))
+            )
+        };
         let target_ix = if forward {
             (current_ix + 1..entries.len()).find(is_narration)
         } else {
@@ -11183,7 +11187,11 @@ impl ThreadView {
                     .size(IconSize::XSmall)
                     .color(Color::Muted),
             )
-            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             .tooltip(Tooltip::text("Show Tool Calls"))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_narration_only(cx)))
             .into_any()
@@ -14437,14 +14445,17 @@ impl ThreadView {
                     )
                     .child(tool_icon),
             )
-            .when_some(Self::running_tool_call_elapsed(tool_call), |this, elapsed| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .text_color(cx.theme().colors().text_muted)
-                        .child(elapsed),
-                )
-            })
+            .when_some(
+                Self::running_tool_call_elapsed(tool_call),
+                |this, elapsed| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_color(cx.theme().colors().text_muted)
+                            .child(elapsed),
+                    )
+                },
+            )
             .child(if has_location {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))
@@ -15330,13 +15341,18 @@ impl ThreadView {
                             .flatten();
                         buttons
                             .child(
-                                IconButton::new(format!("peek-subagent-{}", entry_ix), IconName::Eye)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Peek Narration"))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                IconButton::new(
+                                    format!("peek-subagent-{}", entry_ix),
+                                    IconName::Eye,
+                                )
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Peek Narration"))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
                                         this.peek_narration(thread.clone(), window, cx);
-                                    })),
+                                    },
+                                )),
                             )
                             .when_some(report, |buttons, report| {
                                 buttons.child(
@@ -15347,11 +15363,13 @@ impl ThreadView {
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Copy Report"))
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            report.clone(),
-                                        ));
-                                    }),
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                report.clone(),
+                                            ));
+                                        },
+                                    ),
                                 )
                             })
                     })
@@ -16997,12 +17015,16 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
-            .on_action(cx.listener(|this, _: &crate::ScrollOutputToPreviousNarration, _, cx| {
-                this.scroll_to_narration(false, cx);
-            }))
-            .on_action(cx.listener(|this, _: &crate::ScrollOutputToNextNarration, _, cx| {
-                this.scroll_to_narration(true, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::ScrollOutputToPreviousNarration, _, cx| {
+                    this.scroll_to_narration(false, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ScrollOutputToNextNarration, _, cx| {
+                    this.scroll_to_narration(true, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::ToggleNarrationOnly, _, cx| {
                 this.toggle_narration_only(cx);
             }))

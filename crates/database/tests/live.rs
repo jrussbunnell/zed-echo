@@ -367,10 +367,26 @@ async fn test_postgres() {
     // `x$a$` is one identifier to Postgres; a lexer that reads `$a$` as a
     // dollar quote would hide the COMMIT and DROP that follow.
     let engine = engine();
-    connect(&engine, "admin", spec(DatabaseKind::Postgres, 15432, "postgres"), "echo").await;
-    query(&engine, "admin", "CREATE TABLE IF NOT EXISTS canary (id int)", false).await.unwrap();
+    connect(
+        &engine,
+        "admin",
+        spec(DatabaseKind::Postgres, 15432, "postgres"),
+        "echo",
+    )
+    .await;
+    query(
+        &engine,
+        "admin",
+        "CREATE TABLE IF NOT EXISTS canary (id int)",
+        false,
+    )
+    .await
+    .unwrap();
     let escape = "SELECT 1 AS x$a$; COMMIT; DROP TABLE canary; SELECT $a$";
-    assert!(query(&engine, "admin", escape, true).await.is_err(), "{escape} ran read-only");
+    assert!(
+        query(&engine, "admin", escape, true).await.is_err(),
+        "{escape} ran read-only"
+    );
     query(&engine, "admin", "SELECT COUNT(*) FROM canary", false)
         .await
         .expect("the canary table survives");
@@ -638,13 +654,19 @@ fn fake_relay() -> String {
             reader.read_exact(&mut body).unwrap();
             let body = String::from_utf8(body).unwrap();
             let (status, response) = if !secret_ok {
-                ("403 Forbidden", r#"{"error":"Invalid relay secret"}"#.to_string())
+                (
+                    "403 Forbidden",
+                    r#"{"error":"Invalid relay secret"}"#.to_string(),
+                )
             } else if request_line.starts_with("GET /catalog/tables") {
                 ("200 OK", r#"{"tables":[{"database":"catalog","table":"listings","engine":"ReplacingMergeTree"}]}"#.to_string())
             } else if request_line.starts_with("GET /catalog/describe-table") {
                 ("200 OK", r#"{"columns":[{"name":"id","type":"UInt64"},{"name":"city","type":"Nullable(String)"}]}"#.to_string())
             } else if body.contains("boom") {
-                ("400 Bad Request", r#"{"error":"Unknown identifier 'boom'"}"#.to_string())
+                (
+                    "400 Bad Request",
+                    r#"{"error":"Unknown identifier 'boom'"}"#.to_string(),
+                )
             } else {
                 ("200 OK", r#"{"meta":[{"name":"id","type":"UInt64"},{"name":"city","type":"String"}],"rows":[{"id":"1","city":"Austin"},{"id":"2"}],"rowCount":2}"#.to_string())
             };
@@ -667,26 +689,55 @@ async fn test_clickhouse_relay() {
     let engine = engine();
     let url = fake_relay();
     assert!(matches!(
-        connect(&engine, "bartr", http_spec(DatabaseKind::ClickhouseRelay, &url, None), "s3cret").await,
+        connect(
+            &engine,
+            "bartr",
+            http_spec(DatabaseKind::ClickhouseRelay, &url, None),
+            "s3cret"
+        )
+        .await,
         Capability::ReadOnly { .. }
     ));
-    let rows = query(&engine, "bartr", "SELECT id, city FROM catalog.listings", false).await.unwrap();
+    let rows = query(
+        &engine,
+        "bartr",
+        "SELECT id, city FROM catalog.listings",
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(rows.columns.len(), 2);
-    assert_eq!(rows.rows[0], vec![Value::Text("1".into()), Value::Text("Austin".into())]);
+    assert_eq!(
+        rows.rows[0],
+        vec![Value::Text("1".into()), Value::Text("Austin".into())]
+    );
     assert_eq!(rows.rows[1][1], Value::Missing);
-    let error = query(&engine, "bartr", "SELECT boom", false).await.unwrap_err();
-    assert!(error.to_string().contains("Unknown identifier 'boom'"), "{error}");
+    let error = query(&engine, "bartr", "SELECT boom", false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Unknown identifier 'boom'"),
+        "{error}"
+    );
 
     let Response::Collections(collections) = engine
-        .handle(Request::Collections { connection: "bartr".into() })
+        .handle(Request::Collections {
+            connection: "bartr".into(),
+        })
         .await
         .unwrap()
     else {
         panic!()
     };
-    assert_eq!(collections[0].reference, CollectionRef::new(Some("catalog"), "listings"));
+    assert_eq!(
+        collections[0].reference,
+        CollectionRef::new(Some("catalog"), "listings")
+    );
     let Response::Schema(schema) = engine
-        .handle(Request::Describe { connection: "bartr".into(), collection: collections[0].reference.clone() })
+        .handle(Request::Describe {
+            connection: "bartr".into(),
+            collection: collections[0].reference.clone(),
+        })
         .await
         .unwrap()
     else {
@@ -695,12 +746,20 @@ async fn test_clickhouse_relay() {
     assert_eq!(schema.fields.len(), 2);
     assert!(schema.fields[1].nullable);
     assert_eq!(schema.writable, Some(false));
-    assert!(apply(&engine, "bartr", ChangeSet {
-        collection: collections[0].reference.clone(),
-        changes: vec![Change::Delete { key: vec![("id".into(), Value::Int(1))] }],
-    })
-    .await
-    .is_err());
+    assert!(
+        apply(
+            &engine,
+            "bartr",
+            ChangeSet {
+                collection: collections[0].reference.clone(),
+                changes: vec![Change::Delete {
+                    key: vec![("id".into(), Value::Int(1))]
+                }],
+            }
+        )
+        .await
+        .is_err()
+    );
 
     let wrong_secret = engine
         .handle(Request::Connect {
@@ -710,5 +769,8 @@ async fn test_clickhouse_relay() {
         })
         .await
         .unwrap_err();
-    assert!(wrong_secret.to_string().contains("Invalid relay secret"), "{wrong_secret}");
+    assert!(
+        wrong_secret.to_string().contains("Invalid relay secret"),
+        "{wrong_secret}"
+    );
 }

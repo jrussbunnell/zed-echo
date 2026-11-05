@@ -1456,7 +1456,9 @@ pub struct DatabaseConnectionContent {
     pub history: Option<bool>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseKind {
     Mysql,
@@ -1468,7 +1470,9 @@ pub enum DatabaseKind {
     Convex,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseEnvironment {
     Local,
@@ -1476,7 +1480,9 @@ pub enum DatabaseEnvironment {
     Prod,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseAgentAccess {
     /// Agents cannot see the connection.
@@ -1487,7 +1493,9 @@ pub enum DatabaseAgentAccess {
     Allow,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseWriteApproval {
     /// Echo shows the exact statement or patch and asks before running it.

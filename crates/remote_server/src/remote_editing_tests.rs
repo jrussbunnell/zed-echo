@@ -89,7 +89,8 @@ async fn test_database_requests_run_on_the_remote_host(
     server_cx: &mut TestAppContext,
 ) {
     let fs = FakeFs::new(server_cx.executor());
-    fs.insert_tree(path!("/code"), json!({ "project": {} })).await;
+    fs.insert_tree(path!("/code"), json!({ "project": {} }))
+        .await;
     server_cx.update(gpui_tokio::init);
     server_cx.executor().allow_parking();
     cx.executor().allow_parking();
@@ -113,7 +114,10 @@ async fn test_database_requests_run_on_the_remote_host(
         .await
         .unwrap_err();
     // The engine on the remote host answered: nothing is connected there.
-    assert!(error.to_string().contains("ryse is not connected"), "{error:#}");
+    assert!(
+        error.to_string().contains("ryse is not connected"),
+        "{error:#}"
+    );
 }
 
 #[gpui::test]

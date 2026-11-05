@@ -474,7 +474,10 @@ impl Source for SqlSource {
                     "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
                     "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
                 ),
-                _ => ("SET SESSION TRANSACTION READ ONLY", "SET SESSION TRANSACTION READ WRITE"),
+                _ => (
+                    "SET SESSION TRANSACTION READ ONLY",
+                    "SET SESSION TRANSACTION READ WRITE",
+                ),
             };
             self.statement(session_read_only).await?;
             let result = match self.statement(self.begin_read_only()).await {
@@ -741,7 +744,9 @@ fn top_level_tokens(kind: DatabaseKind, text: &str) -> Vec<String> {
                 // Dollar quoting: $tag$ ... $tag$.
                 let tag_end = characters[index + 1..]
                     .iter()
-                    .position(|candidate| !(is_identifier_start(*candidate) || candidate.is_ascii_digit()))
+                    .position(|candidate| {
+                        !(is_identifier_start(*candidate) || candidate.is_ascii_digit())
+                    })
                     .map(|offset| index + 1 + offset);
                 match tag_end {
                     Some(tag_end) if characters[tag_end] == '$' => {

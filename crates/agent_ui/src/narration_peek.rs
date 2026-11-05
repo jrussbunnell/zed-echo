@@ -66,7 +66,15 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 pub fn current_activity(thread: &AcpThread, cx: &App) -> Option<SharedString> {
     if let Some(tool_call) = thread.current_tool_call() {
         let label = tool_call.label.read(cx).source();
-        return Some(label.lines().next().unwrap_or_default().trim().to_string().into());
+        return Some(
+            label
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+                .into(),
+        );
     }
     (thread.status() == ThreadStatus::Generating).then(|| "Thinking…".into())
 }
@@ -86,16 +94,15 @@ impl Render for NarrationPeek {
         let thread = self.thread.read(cx);
         let title = thread.title().unwrap_or_else(|| "Agent".into());
         let narration = thread.recent_narration(NARRATION_LIMIT, cx);
-        let activity = current_activity(thread, cx).map(|activity| {
-            match thread.current_tool_call() {
+        let activity =
+            current_activity(thread, cx).map(|activity| match thread.current_tool_call() {
                 Some(tool_call) => format!(
                     "{activity} · {}",
                     format_elapsed(tool_call.started_at.elapsed())
                 )
                 .into(),
                 None => activity,
-            }
-        });
+            });
 
         let items = narration.into_iter().enumerate().map(|(ix, item)| {
             v_flex()
@@ -146,7 +153,11 @@ impl Render for NarrationPeek {
                         Section::new().child(
                             h_flex()
                                 .gap_1()
-                                .child(Label::new("Now:").size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    Label::new("Now:")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
                                 .child(
                                     Label::new(activity.unwrap_or_else(|| "Idle".into()))
                                         .size(LabelSize::Small)

@@ -224,11 +224,13 @@ impl AudioSink for RodioSink {
             }
             Err(error) => log::error!("read_aloud: sink chunk queue poisoned: {error}"),
         }
-        self.player.borrow().append(rodio::buffer::SamplesBuffer::new(
-            channels,
-            sample_rate,
-            pcm.samples,
-        ));
+        self.player
+            .borrow()
+            .append(rodio::buffer::SamplesBuffer::new(
+                channels,
+                sample_rate,
+                pcm.samples,
+            ));
     }
 
     fn clear(&self) {

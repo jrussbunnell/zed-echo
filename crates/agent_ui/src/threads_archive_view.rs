@@ -1691,7 +1691,11 @@ mod tests {
         assert_eq!(positions, None);
         let positions = title_match_positions("test", &thread).expect("renamed title matches");
         let rendered = thread.display_title();
-        assert!(positions.iter().all(|&position| rendered.is_char_boundary(position)));
+        assert!(
+            positions
+                .iter()
+                .all(|&position| rendered.is_char_boundary(position))
+        );
         assert_eq!(positions, vec![6, 7, 8, 9]);
     }
 

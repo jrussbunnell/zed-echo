@@ -15706,7 +15706,10 @@ mod tests {
             );
             assert_eq!(
                 texts(thread.recent_narration(2, cx)),
-                vec![(false, "Found it".to_string()), (true, "Now fix it".to_string())]
+                vec![
+                    (false, "Found it".to_string()),
+                    (true, "Now fix it".to_string())
+                ]
             );
         });
     }

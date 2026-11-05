@@ -9959,7 +9959,12 @@ exit 7
         );
         send(
             "session-1",
-            delegation("toolu_1:reply", "agent-1", "session-1", "Here are the options"),
+            delegation(
+                "toolu_1:reply",
+                "agent-1",
+                "session-1",
+                "Here are the options",
+            ),
         );
         // In hand-back mode the report comes as both views of one message.
         send(
